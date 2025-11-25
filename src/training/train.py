@@ -52,6 +52,7 @@ def build_dataloaders(
             augmentation=data_cfg.get("augmentation", "strong"),
             strong_aug=data_cfg.get("strong_aug", True),
         ),
+        focus_court=data_cfg.get("focus_court", "full"),
     )
     val_dataset = VideoDataset(
         samples=val_samples,
@@ -61,9 +62,14 @@ def build_dataloaders(
         frame_step=data_cfg.get("frame_step", 1),
         sampling=data_cfg.get("sampling", "uniform"),
         transform=get_val_transforms(data_cfg.get("frame_size", 224)),
+        focus_court=data_cfg.get("focus_court", "full"),
     )
 
     num_workers = config["training"]["num_workers"]
+
+    # Compute class weights upfront (used for loss and optional sampler).
+    train_counts = compute_class_counts(train_samples, class_to_idx)
+    class_weights = torch.tensor(compute_class_weights(train_counts), dtype=torch.float)
 
     # Optional weighted sampler to emphasize under-represented or difficult classes.
     sampler = None
@@ -95,9 +101,6 @@ def build_dataloaders(
         pin_memory=False,
         persistent_workers=num_workers > 0,
     )
-    train_counts = compute_class_counts(train_samples, class_to_idx)
-    class_weights = torch.tensor(compute_class_weights(train_counts), dtype=torch.float)
-
     return train_loader, val_loader, classes, class_weights
 
 
@@ -170,6 +173,7 @@ def train(config: Dict[str, Any]) -> None:
     device = get_device(config["training"]["device"])
     set_seed(config.get("seed", 42))
 
+    print(f"Using court focus: {config['data'].get('focus_court', 'full')}")
     train_loader, val_loader, classes, class_weights = build_dataloaders(config)
     model = VideoClassifier(
         num_classes=len(classes),

@@ -71,6 +71,7 @@ class VideoDataset(Dataset):
         frame_step: int = 1,
         sampling: str = "uniform",
         transform: Optional[Callable] = None,
+        focus_court: str = "full",
     ) -> None:
         self.samples = list(samples)
         self.class_to_idx = class_to_idx
@@ -81,6 +82,9 @@ class VideoDataset(Dataset):
         if self.sampling not in {"uniform", "rand_uniform", "strided"}:
             raise ValueError(f"Unsupported sampling mode: {sampling}")
         self.transform = transform or _default_transform(frame_size)
+        if focus_court not in {"full", "far", "near"}:
+            raise ValueError(f"Unsupported focus_court: {focus_court}")
+        self.focus_court = focus_court
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -107,7 +111,7 @@ class VideoDataset(Dataset):
                 break
             if frame_idx % self.frame_step == 0:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame_rgb)
+                frames.append(self._apply_focus_crop(frame_rgb))
             frame_idx += 1
         cap.release()
 
@@ -146,3 +150,14 @@ class VideoDataset(Dataset):
 
         indices = [min(i, num_available - 1) for i in indices]
         return indices
+
+    def _apply_focus_crop(self, frame: np.ndarray, ratio: float = 0.58) -> np.ndarray:
+        """Crop far/near court before any resize or augmentation."""
+        if self.focus_court == "full":
+            return frame
+        h, w, _ = frame.shape
+        cutoff = int(h * ratio)
+        if self.focus_court == "far":
+            return frame[:cutoff, :, :]
+        # near court
+        return frame[h - cutoff :, :, :]

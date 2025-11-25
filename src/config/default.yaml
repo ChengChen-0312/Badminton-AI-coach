@@ -8,6 +8,8 @@ data:
   frame_step: 1
   sampling: "uniform"
   augmentation: "strong"
+  strong_aug: true
+  focus_court: "full"
 
 training:
   batch_size: 4

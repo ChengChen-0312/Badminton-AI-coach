@@ -77,7 +77,10 @@ def _build_backbone(name: str, pretrained: bool) -> Tuple[nn.Module, int, bool, 
         try:
             from torchvision.models.video import X3D_M_Weights, X3D_S_Weights, x3d_m, x3d_s
         except Exception as e:  # pragma: no cover - optional dependency
-            raise ValueError("x3d models require a newer torchvision build.") from e
+            # Fallback to r3d_34 if x3d is unavailable.
+            fallback = "r3d_34"
+            print(f"x3d models unavailable in this torchvision build, falling back to {fallback}.")
+            return _build_backbone(fallback, pretrained)
         if name == "x3d_s":
             weights = X3D_S_Weights.DEFAULT if pretrained else None
             backbone = x3d_s(weights=weights)

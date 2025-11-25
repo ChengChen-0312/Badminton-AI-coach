@@ -9,6 +9,7 @@ data:
   sampling: "rand_uniform"
   augmentation: "strong"
   strong_aug: false
+  focus_court: "far"
 
 training:
   batch_size: 4
@@ -29,7 +30,7 @@ training:
   boost_factor: 1.5
 
 model:
-  backbone: "x3d_m"
+  backbone: "r3d_34"
   pretrained: true
 
 logging:
