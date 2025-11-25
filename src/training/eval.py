@@ -8,7 +8,7 @@ from torch import nn
 
 from src.models.video_classifier import VideoClassifier
 from src.training.train import build_dataloaders, load_config
-from src.training.utils import get_device, load_checkpoint
+from src.training.utils import get_device, load_checkpoint, move_to_device
 
 
 def evaluate_model(
@@ -16,6 +16,7 @@ def evaluate_model(
     dataloader,
     device: torch.device,
     classes: List[str],
+    use_channels_last: bool,
 ) -> Tuple[float, float, Dict[str, float], List[int], List[int]]:
     criterion = nn.CrossEntropyLoss()
     model.eval()
@@ -30,8 +31,13 @@ def evaluate_model(
 
     with torch.no_grad():
         for videos, labels, _, _ in dataloader:
-            videos = videos.to(device)
-            labels = labels.to(device)
+            videos, labels = move_to_device(
+                videos,
+                labels,
+                device,
+                use_channels_last=use_channels_last,
+                is_3d=model.is_3d,
+            )
             outputs = model(videos)
             loss = criterion(outputs, labels)
 
@@ -68,12 +74,19 @@ def run_eval(config_path: str | Path, checkpoint_path: str | Path) -> Dict[str, 
         num_classes=len(classes),
         backbone_name=config["model"]["backbone"],
         pretrained=False,
+        use_channels_last=config["training"].get("use_channels_last", False),
     ).to(device)
 
     checkpoint = load_checkpoint(model, Path(checkpoint_path), device)
     print(f"Loaded checkpoint from {checkpoint_path}, epoch={checkpoint.get('epoch')}, val_acc={checkpoint.get('val_acc')}")
 
-    val_loss, val_acc, per_class_acc, preds, labels = evaluate_model(model, val_loader, device, classes)
+    val_loss, val_acc, per_class_acc, preds, labels = evaluate_model(
+        model,
+        val_loader,
+        device,
+        classes,
+        use_channels_last=config["training"].get("use_channels_last", False),
+    )
     print(f"Validation accuracy: {val_acc:.3f}, loss: {val_loss:.4f}")
     for cls, acc in per_class_acc.items():
         print(f"  {cls}: {acc:.3f}")

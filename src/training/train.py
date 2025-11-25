@@ -14,7 +14,7 @@ from src.data.dataset import VideoDataset, discover_video_files
 from src.data.split import train_val_split
 from src.data.transforms import get_train_transforms, get_val_transforms
 from src.models.video_classifier import VideoClassifier
-from src.training.utils import get_device, save_checkpoint, set_seed
+from src.training.utils import get_device, move_to_device, save_checkpoint, set_seed
 
 
 def load_config(config_path: str | Path) -> Dict[str, Any]:
@@ -56,19 +56,22 @@ def build_dataloaders(
         transform=get_val_transforms(data_cfg.get("frame_size", 224)),
     )
 
+    num_workers = config["training"]["num_workers"]
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
-        num_workers=config["training"]["num_workers"],
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=False,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
-        num_workers=config["training"]["num_workers"],
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=False,
+        persistent_workers=num_workers > 0,
     )
     return train_loader, val_loader, classes
 
@@ -78,6 +81,7 @@ def _validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    use_channels_last: bool,
 ) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
@@ -86,8 +90,13 @@ def _validate(
 
     with torch.no_grad():
         for videos, labels, _, _ in dataloader:
-            videos = videos.to(device)
-            labels = labels.to(device)
+            videos, labels = move_to_device(
+                videos,
+                labels,
+                device,
+                use_channels_last=use_channels_last,
+                is_3d=model.is_3d,
+            )
             outputs = model(videos)
             loss = criterion(outputs, labels)
 
@@ -109,6 +118,7 @@ def train(config: Dict[str, Any]) -> None:
         num_classes=len(classes),
         backbone_name=config["model"]["backbone"],
         pretrained=config["model"].get("pretrained", True),
+        use_channels_last=config["training"].get("use_channels_last", False),
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -133,8 +143,13 @@ def train(config: Dict[str, Any]) -> None:
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}", leave=False)
         for step, (videos, labels, _, _) in enumerate(progress, start=1):
-            videos = videos.to(device)
-            labels = labels.to(device)
+            videos, labels = move_to_device(
+                videos,
+                labels,
+                device,
+                use_channels_last=config["training"].get("use_channels_last", False),
+                is_3d=model.is_3d,
+            )
 
             optimizer.zero_grad()
             outputs = model(videos)
@@ -154,7 +169,13 @@ def train(config: Dict[str, Any]) -> None:
         train_loss = running_loss / max(total, 1)
         train_acc = running_correct / max(total, 1)
 
-        val_loss, val_acc = _validate(model, val_loader, criterion, device)
+        val_loss, val_acc = _validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_channels_last=config["training"].get("use_channels_last", False),
+        )
 
         print(
             f"Epoch {epoch}: "

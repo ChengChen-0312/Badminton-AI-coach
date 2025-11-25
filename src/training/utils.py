@@ -44,6 +44,32 @@ def load_checkpoint(
 
 
 def get_device(device_name: str) -> torch.device:
-    if device_name == "cuda" and not torch.cuda.is_available():
+    """Prefer MPS when available; otherwise fall back gracefully."""
+    if device_name == "cpu":
         return torch.device("cpu")
-    return torch.device(device_name)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available() and device_name == "cuda":
+        return torch.device("cuda")
+    # default fallback
+    return torch.device("cpu")
+
+
+def move_to_device(
+    videos: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+    use_channels_last: bool = False,
+    is_3d: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    videos = videos.to(device, non_blocking=True)
+    labels = labels.to(device, non_blocking=True)
+
+    if use_channels_last:
+        if is_3d and hasattr(torch, "channels_last_3d"):
+            # Convert to (B, C, T, H, W) and channels_last_3d for better MPS perf.
+            videos = videos.permute(0, 2, 1, 3, 4).contiguous(memory_format=torch.channels_last_3d)
+        elif not is_3d:
+            # Keep layout (B, T, C, H, W); channels_last will be applied after flattening in forward.
+            videos = videos.contiguous()
+    return videos, labels
