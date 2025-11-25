@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from src.geometry.homography import CourtHomography
-from src.geometry.region_definitions import DEFAULT_REGIONS
+from src.geometry.region_definitions import DEFAULT_GRID9
 from src.spatial_logic.events import infer_event_from_trajectory
 from src.spatial_logic.landing_detector import BallState, extract_ball_track, infer_landing
 from src.spatial_logic.hitter_detector import HitterInfo, infer_hitter_for_stroke
@@ -22,6 +22,7 @@ class StrokeSummary:
     landing_frame: Optional[int]
     contact_frame: Optional[int] = None
     landing_predicted: bool = False
+    contact_region: Optional[str] = None
     classifier_label: Optional[str] = None
     event_type: Optional[str] = None
     hitter_track_id: Optional[int] = None
@@ -65,13 +66,9 @@ def summarise_strokes_from_analysis(
         track = [BallState(frame_idx=0, x=0.5, y=0.5)]
 
     H = build_homography_from_analysis(analysis_result)
-    regions = DEFAULT_REGIONS
+    regions = DEFAULT_GRID9
 
-    landing = infer_landing(
-        frame_results=frame_results,
-        homography=H,
-        region_classifier=regions,
-    )
+    landing = infer_landing(frame_results=frame_results, homography=H, region_classifier=regions)
 
     hitter_role = "far"
     event = infer_event_from_trajectory(track, landing, hitter_role=hitter_role)
@@ -101,6 +98,19 @@ def summarise_strokes_from_analysis(
             players_at_contact=players_at_contact,
             max_distance=hitter_distance_max,
         )
+        # Map hitter position to region if homography available
+        if hitter_info and H is not None and players_at_contact:
+            hitter = next((p for p in players_at_contact if p.track_id == hitter_info.hitter_track_id), None)
+            if hitter and hitter.bboxes:
+                hb = hitter.bboxes[-1]
+                hx, hy = (hb[0] + hb[2]) / 2.0, (hb[1] + hb[3]) / 2.0
+                hx_c, hy_c = H.to_court((hx, hy))
+                if hasattr(regions, "classify_region"):
+                    hitter_region = regions.classify_region(hx_c, hy_c)
+                else:
+                    hitter_region = regions.classify_y(hy_c)
+                if hitter_region:
+                    landing.contact_region = hitter_region
         if hitter_info:
             final.hitter_role = hitter_info.hitter_role
 
@@ -113,6 +123,7 @@ def summarise_strokes_from_analysis(
         landing_frame=landing.frame_idx if landing is not None else None,
         contact_frame=landing.contact_frame_idx if landing is not None else None,
         landing_predicted=landing.predicted if landing is not None else False,
+        contact_region=landing.contact_region if landing is not None else None,
         classifier_label=final.classifier_label,
         event_type=final.event_type,
         hitter_track_id=hitter_info.hitter_track_id if hitter_info else None,

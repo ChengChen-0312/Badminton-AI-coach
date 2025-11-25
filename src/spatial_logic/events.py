@@ -38,13 +38,11 @@ def infer_event_from_trajectory(
     dy_total = ys[-1] - ys[0]
 
     stroke_type = "unknown"
-    if landing_region == "front":
+    region_name = landing_region.lower() if landing_region else None
+    if region_name and "front" in region_name:
         stroke_type = "net_shot"
-    elif landing_region == "back":
-        if len(ys) > 1 and ys[0] < ys[-1]:
-            stroke_type = "clear"
-        else:
-            stroke_type = "lift"
+    elif region_name and "back" in region_name:
+        stroke_type = "clear" if (len(ys) > 1 and ys[0] < ys[-1]) else "lift"
     else:
         if abs(dy_total) < 10:
             stroke_type = "drive"

@@ -25,6 +25,7 @@ class LandingPoint:
     court_x: Optional[float] = None
     court_y: Optional[float] = None
     region: Optional[str] = None
+    contact_region: Optional[str] = None
 
 
 class HomographyMapper(Protocol):
@@ -196,7 +197,17 @@ def infer_landing(
         cx, cy = homography.to_court((lp.img_x, lp.img_y))
         lp.court_x = float(cx)
         lp.court_y = float(cy)
-        if region_classifier is not None and lp.court_y is not None:
-            lp.region = region_classifier.classify_y(lp.court_y)
+        if region_classifier is not None:
+            if hasattr(region_classifier, "classify_region"):
+                lp.region = region_classifier.classify_region(cx, cy)
+            elif lp.court_y is not None:
+                lp.region = region_classifier.classify_y(lp.court_y)
+
+        if lp.contact_x is not None and lp.contact_y is not None and region_classifier is not None:
+            ccx, ccy = homography.to_court((lp.contact_x, lp.contact_y))
+            if hasattr(region_classifier, "classify_region"):
+                lp.contact_region = region_classifier.classify_region(ccx, ccy)
+            else:
+                lp.contact_region = region_classifier.classify_y(ccy)
 
     return lp
