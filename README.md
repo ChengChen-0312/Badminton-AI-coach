@@ -62,6 +62,9 @@ output:
 - `src/spatial_logic/hitter_detector.py`: picks the closest player to the ball at contact_frame (role + track_id + distance).
 - `src/pipeline/extract_strokes.py`: stroke summaries now include `hitter_track_id` and `hitter_distance`, combining classifier label, event type, hitter, and landing info.
 
+### v3.5 – Match Report Generation
+- `src/pipeline/report_generator.py`: generate match reports in Markdown, JSON, and CSV. Summaries include hitter (near/far + track_id), stroke type, landing region, contact/landing frames, and confidence. Summary stats included in Markdown.
+
 ## Quickstart (Stroke Training)
 ```bash
 pip install -r requirements.txt
