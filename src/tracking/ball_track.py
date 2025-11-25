@@ -14,6 +14,8 @@ class BallTrackState:
     frame_idx: int
     bbox: np.ndarray  # [x1, y1, x2, y2]
     score: float
+    cx: float
+    cy: float
 
 
 class SingleBallTracker:
@@ -72,11 +74,15 @@ class SingleBallTracker:
         self.prev_bbox = smoothed
         self.prev_score = best_det.score
         self.time_since_update = 0
+        cx = float((smoothed[0] + smoothed[2]) / 2.0)
+        cy = float((smoothed[1] + smoothed[3]) / 2.0)
 
         return BallTrackState(
             frame_idx=frame_idx,
             bbox=smoothed,
             score=best_det.score,
+            cx=cx,
+            cy=cy,
         )
 
     def predict_only(self) -> Optional[BallTrackState]:
@@ -88,4 +94,6 @@ class SingleBallTracker:
             self.prev_bbox = None
             self.prev_score = 0.0
             return None
-        return BallTrackState(frame_idx=-1, bbox=self.prev_bbox, score=self.prev_score)
+        cx = float((self.prev_bbox[0] + self.prev_bbox[2]) / 2.0)
+        cy = float((self.prev_bbox[1] + self.prev_bbox[3]) / 2.0)
+        return BallTrackState(frame_idx=-1, bbox=self.prev_bbox, score=self.prev_score, cx=cx, cy=cy)

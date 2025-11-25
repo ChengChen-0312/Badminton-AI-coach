@@ -6,19 +6,20 @@ device:
   classifier_device: "mps"
 
 vision:
-  yolo_imgsz: 384
-  yolo_conf: 0.5
-  use_court_roi: true
+  yolo_imgsz: 512
+  yolo_conf: 0.25
+  use_court_roi: false
   court_roi_margin: 0.05
   yolo_model: "yolov8n.pt"
   ball_model: "yolov8n.pt"
+  ball_allow_all_if_empty: true
 
 tracking:
-  detect_stride: 3
+  detect_stride: 1
   max_age: 10
-  ball_max_age: 5
+  ball_max_age: 8
   iou_thresh: 0.3
 
 realtime:
   target_fps: 30
-  batch_size: 4
+  batch_size: 2

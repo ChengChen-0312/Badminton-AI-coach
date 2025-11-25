@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -13,6 +13,7 @@ from src.tracking.ball_track import BallTrackState, SingleBallTracker
 from src.tracking.bytetrack import SimpleByteTrack, Track
 from src.tracking.id_assign import assign_player_roles
 from src.vision.ball_detector import BallDetector
+from src.vision.court_detector import CourtDetector
 from src.vision.detectors import PlayerDetector
 
 
@@ -29,6 +30,7 @@ class AnalyseResult:
     video_path: str
     fps: float
     frame_results: List[FrameResult]
+    court_corners: Optional[List[List[float]]] = None
 
 
 def analyse_video(
@@ -51,6 +53,7 @@ def analyse_video(
     yolo_conf = vision_cfg.get("yolo_conf", 0.25)
     use_court_roi = vision_cfg.get("use_court_roi", False)
     court_margin = vision_cfg.get("court_roi_margin", 0.0)
+    court_corners: Optional[List[List[float]]] = None
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -68,6 +71,7 @@ def analyse_video(
         device=yolo_device,
         conf=yolo_conf,
         imgsz=yolo_imgsz,
+        allow_all_when_empty=vision_cfg.get("ball_allow_all_if_empty", False),
     )
 
     player_tracker = SimpleByteTrack(
@@ -79,26 +83,62 @@ def analyse_video(
         ema_alpha=0.6,
         max_age=tracking_cfg.get("ball_max_age", 5),
     )
+    court_detector = CourtDetector() if use_court_roi else None
 
     frame_idx = 0
     frame_results: List[FrameResult] = []
 
-    # optional ROI from first frame
+    # optional ROI from first frame; also capture default full-frame corners
     court_roi = None
+    default_corners = None
     if use_court_roi:
         ok, first_bgr = cap.read()
         if ok:
             h0, w0 = first_bgr.shape[:2]
-            # simple full-frame ROI with margin; replace with court detector if needed
-            x1 = int(w0 * court_margin)
-            y1 = int(h0 * court_margin)
-            x2 = int(w0 * (1 - court_margin))
-            y2 = int(h0 * (1 - court_margin))
-            court_roi = (x1, y1, x2, y2)
+            first_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
+            # Default full-frame corners: LB, RB, RT, LT
+            default_corners = [
+                [0.0, float(h0 - 1)],
+                [float(w0 - 1), float(h0 - 1)],
+                [float(w0 - 1), 0.0],
+                [0.0, 0.0],
+            ]
+            if court_detector is not None:
+                lines = court_detector.detect_court(first_rgb)
+                if lines is not None and lines.corners is not None:
+                    court_corners = lines.corners.tolist()
+                    xs = lines.corners[:, 0]
+                    ys = lines.corners[:, 1]
+                    x1 = max(0, int(xs.min() * (1 - court_margin)))
+                    y1 = max(0, int(ys.min() * (1 - court_margin)))
+                    x2 = min(w0, int(xs.max() * (1 + court_margin)))
+                    y2 = min(h0, int(ys.max() * (1 + court_margin)))
+                    court_roi = (x1, y1, x2, y2)
+            if court_roi is None:
+                x1 = int(w0 * court_margin)
+                y1 = int(h0 * court_margin)
+                x2 = int(w0 * (1 - court_margin))
+                y2 = int(h0 * (1 - court_margin))
+                court_roi = (x1, y1, x2, y2)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    else:
+        # No ROI, use full-frame corners for downstream homography if needed
+        cap_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        ok, first_bgr = cap.read()
+        if ok:
+            h0, w0 = first_bgr.shape[:2]
+            default_corners = [
+                [0.0, float(h0 - 1)],
+                [float(w0 - 1), float(h0 - 1)],
+                [float(w0 - 1), 0.0],
+                [0.0, 0.0],
+            ]
+        if cap_pos is not None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, cap_pos)
 
     batch_frames: list[np.ndarray] = []
     batch_indices: list[int] = []
+    last_ball_state: BallTrackState | None = None
 
     while True:
         ok, frame_bgr = cap.read()
@@ -124,6 +164,26 @@ def analyse_video(
                 for fi, pdets, bdets in zip(batch_indices, player_dets_batch, ball_dets_batch):
                     player_tracks = player_tracker.update(pdets, frame_idx=fi)
                     ball_state = ball_tracker.update(fi, bdets)
+                    if ball_state is None:
+                        pred = ball_tracker.predict_only()
+                        if pred is not None:
+                            ball_state = BallTrackState(
+                                frame_idx=fi,
+                                bbox=pred.bbox,
+                                score=pred.score,
+                                cx=pred.cx,
+                                cy=pred.cy,
+                            )
+                    if ball_state is None and last_ball_state is not None:
+                        ball_state = BallTrackState(
+                            frame_idx=fi,
+                            bbox=last_ball_state.bbox,
+                            score=last_ball_state.score,
+                            cx=last_ball_state.cx,
+                            cy=last_ball_state.cy,
+                        )
+                    if ball_state is not None:
+                        last_ball_state = ball_state
                     roles = assign_player_roles(player_tracks, frame_height=h)
                     frame_results.append(
                         FrameResult(
@@ -137,7 +197,26 @@ def analyse_video(
                 batch_indices.clear()
         else:
             player_tracks = player_tracker.predict_only()
-            ball_state = ball_tracker.predict_only()
+            pred = ball_tracker.predict_only()
+            ball_state = None
+            if pred is not None:
+                ball_state = BallTrackState(
+                    frame_idx=frame_idx,
+                    bbox=pred.bbox,
+                    score=pred.score,
+                    cx=pred.cx,
+                    cy=pred.cy,
+                )
+            elif last_ball_state is not None:
+                ball_state = BallTrackState(
+                    frame_idx=frame_idx,
+                    bbox=last_ball_state.bbox,
+                    score=last_ball_state.score,
+                    cx=last_ball_state.cx,
+                    cy=last_ball_state.cy,
+                )
+            if ball_state is not None:
+                last_ball_state = ball_state
             roles = assign_player_roles(player_tracks, frame_height=h)
             frame_results.append(
                 FrameResult(
@@ -158,6 +237,26 @@ def analyse_video(
         for fi, pdets, bdets in zip(batch_indices, player_dets_batch, ball_dets_batch):
             player_tracks = player_tracker.update(pdets, frame_idx=fi)
             ball_state = ball_tracker.update(fi, bdets)
+            if ball_state is None:
+                pred = ball_tracker.predict_only()
+                if pred is not None:
+                    ball_state = BallTrackState(
+                        frame_idx=fi,
+                        bbox=pred.bbox,
+                        score=pred.score,
+                        cx=pred.cx,
+                        cy=pred.cy,
+                    )
+            if ball_state is None and last_ball_state is not None:
+                ball_state = BallTrackState(
+                    frame_idx=fi,
+                    bbox=last_ball_state.bbox,
+                    score=last_ball_state.score,
+                    cx=last_ball_state.cx,
+                    cy=last_ball_state.cy,
+                )
+            if ball_state is not None:
+                last_ball_state = ball_state
             roles = assign_player_roles(player_tracks, frame_height=h)
             frame_results.append(
                 FrameResult(
@@ -172,4 +271,5 @@ def analyse_video(
         video_path=str(video_path),
         fps=fps,
         frame_results=frame_results,
+        court_corners=court_corners if court_corners is not None else default_corners,
     )

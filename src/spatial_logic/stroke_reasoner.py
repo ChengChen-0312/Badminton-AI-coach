@@ -1,37 +1,81 @@
-"""High-level stroke reasoning."""
-
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
-from .events import EventDetector
-from .region_logic import court_zone
-from .temporal_logic import smooth_events
+from .events import StrokeEvent
 
 
-class StrokeReasoner:
-    def __init__(self) -> None:
-        self.event_detector = EventDetector()
+@dataclass
+class FinalStroke:
+    type: str
+    classifier_label: Optional[str] = None
+    event_type: Optional[str] = None
+    confidence: float = 0.5
+    hitter_role: Optional[str] = None
+    landing_region: Optional[str] = None
 
-    def infer(self, player_pose_seq, ball_traj: Sequence[Tuple[float, float]]) -> Dict[str, Any]:
-        """Return detected events and coarse stroke labels."""
-        hit_indices = smooth_events(self.event_detector.detect_hit(player_pose_seq, ball_traj))
-        stroke_labels: List[str] = []
-        zones: List[str] = []
-        for idx in hit_indices:
-            if idx < len(ball_traj):
-                x, y = ball_traj[idx]
-            else:
-                x, y = 0.5, 0.5
-            zone = court_zone(x, y)
-            zones.append(zone)
-            stroke_labels.append(self._zone_to_stroke(zone))
-        return {"hits": hit_indices, "zones": zones, "strokes": stroke_labels}
 
-    @staticmethod
-    def _zone_to_stroke(zone: str) -> str:
-        if zone == "front":
-            return "net_shot"
-        if zone == "mid":
-            return "drive"
-        return "clear"
+def combine_classifier_and_event(
+    classifier_label: Optional[str],
+    event: StrokeEvent,
+) -> FinalStroke:
+    """
+    Simple fusion:
+    - If classifier and event agree -> high confidence.
+    - If classifier only -> use it with medium confidence.
+    - If event only -> use it with medium-low confidence.
+    - If mismatch -> prefer classifier but lower confidence.
+    """
+    event_type = event.type if event is not None else None
+    hitter_role = event.hitter_role if event is not None else None
+    landing_region = event.landing_region if event is not None else None
+
+    if classifier_label and event_type:
+        if classifier_label.lower().endswith(event_type):
+            return FinalStroke(
+                type=classifier_label,
+                classifier_label=classifier_label,
+                event_type=event_type,
+                confidence=0.9,
+                hitter_role=hitter_role,
+                landing_region=landing_region,
+            )
+        else:
+            return FinalStroke(
+                type=classifier_label,
+                classifier_label=classifier_label,
+                event_type=event_type,
+                confidence=0.65,
+                hitter_role=hitter_role,
+                landing_region=landing_region,
+            )
+
+    if classifier_label and not event_type:
+        return FinalStroke(
+            type=classifier_label,
+            classifier_label=classifier_label,
+            event_type=None,
+            confidence=0.7,
+            hitter_role=hitter_role,
+            landing_region=landing_region,
+        )
+
+    if event_type and not classifier_label:
+        return FinalStroke(
+            type=event_type,
+            classifier_label=None,
+            event_type=event_type,
+            confidence=0.6,
+            hitter_role=hitter_role,
+            landing_region=landing_region,
+        )
+
+    return FinalStroke(
+        type="unknown",
+        classifier_label=classifier_label,
+        event_type=event_type,
+        confidence=0.3,
+        hitter_role=hitter_role,
+        landing_region=landing_region,
+    )

@@ -22,6 +22,7 @@ class BallDetector:
         device: str = "cpu",
         conf: float = 0.25,
         allowed_class_names: Sequence[str] | None = None,
+        allow_all_when_empty: bool = False,
         imgsz: int = 640,
     ) -> None:
         self.det = YoloDetector(model_path=model_path, device=device, conf=conf, imgsz=imgsz)
@@ -30,14 +31,27 @@ class BallDetector:
             if allowed_class_names is not None
             else ["shuttlecock", "badminton", "sports ball", "ball"]
         )
+        self.allow_all_when_empty = allow_all_when_empty
 
     def detect_balls(self, frame: np.ndarray) -> List[Detection]:
         raw = self.det.detect(frame)
-        return filter_by_class_name(raw, self.allowed_class_names)
+        filtered = filter_by_class_name(raw, self.allowed_class_names)
+        if not filtered and self.allow_all_when_empty:
+            return raw
+        return filtered
 
     def detect(self, frames):
         """Alias to allow batch or single-frame detection."""
         raw = self.det.detect(frames)
         if isinstance(raw, list):
-            return [filter_by_class_name(r, self.allowed_class_names) for r in raw]
-        return filter_by_class_name(raw, self.allowed_class_names)
+            out = []
+            for r in raw:
+                filtered = filter_by_class_name(r, self.allowed_class_names)
+                if not filtered and self.allow_all_when_empty:
+                    filtered = r
+                out.append(filtered)
+            return out
+        filtered = filter_by_class_name(raw, self.allowed_class_names)
+        if not filtered and self.allow_all_when_empty:
+            return raw
+        return filtered
