@@ -4,12 +4,12 @@ End-to-end badminton analytics and coaching system. Includes stroke classificati
 
 ## Project Layout
 - `src/data`, `src/models`, `src/training`, `src/config`: stroke-classification stack.
-- `src/vision`: YOLO/pose/court/shuttle detection wrappers.
-- `src/tracking`: player/shuttle tracking (ByteTrack/Kalman) and ID assignment.
-- `src/geometry`: homography, coordinate mapping, region definitions, metrics.
-- `src/spatial_logic`: relations, events, temporal reasoning, stroke reasoning.
-- `src/pipeline`: unified analysis, stroke extraction, overlay rendering, reporting.
-- `scripts`: training/eval plus `analyse_match.py`, `export_court_map.py`.
+- `src/vision` **(finished)**: YOLO-based detection (Ultralytics YOLOv8), ball detector with class filtering, optional MediaPipe pose, simple court detector (Canny+Hough fallback).
+- `src/tracking` **(finished)**: ByteTrack-style multi-object tracker, single-ball tracker with smoothing, role assignment (near/far) heuristics.
+- `src/geometry` **(finished)**: homography, coordinate mapping, region definitions, metrics.
+- `src/spatial_logic` **(finished)**: relations, events (velocity-drop hit detector), temporal smoothing/segment slicing, stroke_reasoner (zone→stroke heuristic).
+- `src/pipeline` **(finished)**: unified analysis (ball traj + reasoning), stroke extraction, overlay rendering (players/ball), report generator (JSON).
+- `scripts` **(finished)**: training/eval plus `analyse_match.py`, `export_court_map.py`, `test_realtime_fps.py` (FPS benchmark for realtime pipeline).
 - `archive/`: dataset (folder-per-class videos, untouched).
 
 ## Stroke Classification (V2 / V2.1)

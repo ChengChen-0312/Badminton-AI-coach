@@ -9,6 +9,8 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
+from .frame_cache import ensure_dir
+
 # Supported video extensions – add more if new data arrives with different formats.
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -66,15 +68,19 @@ class VideoDataset(Dataset):
         self,
         samples: Sequence[Tuple[Path, str]],
         class_to_idx: Dict[str, int],
+        root_dir: Path,
         num_frames: int = 16,
         frame_size: int = 224,
         frame_step: int = 1,
         sampling: str = "uniform",
         transform: Optional[Callable] = None,
         focus_court: str = "full",
+        use_cache: bool = False,
+        cache_dir: str | Path = "frame_cache",
     ) -> None:
         self.samples = list(samples)
         self.class_to_idx = class_to_idx
+        self.root_dir = Path(root_dir)
         self.num_frames = num_frames
         self.frame_size = frame_size
         self.frame_step = frame_step
@@ -85,6 +91,8 @@ class VideoDataset(Dataset):
         if focus_court not in {"full", "far", "near"}:
             raise ValueError(f"Unsupported focus_court: {focus_court}")
         self.focus_court = focus_court
+        self.use_cache = use_cache
+        self.cache_dir = ensure_dir(cache_dir) if use_cache else Path(cache_dir)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -98,7 +106,14 @@ class VideoDataset(Dataset):
         return video_tensor, label_idx, label_name, str(video_path)
 
     def _load_video_frames(self, video_path: Path) -> List[np.ndarray]:
-        """Read video and sample frames uniformly."""
+        """Read video and sample frames, with optional caching."""
+        cache_path: Optional[Path] = None
+        if self.use_cache:
+            cache_key = self._cache_key(video_path)
+            cache_path = self.cache_dir / f"{cache_key}.npy"
+            if cache_path.exists():
+                return np.load(cache_path)
+
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
@@ -119,7 +134,12 @@ class VideoDataset(Dataset):
             raise RuntimeError(f"No frames read from video: {video_path}")
 
         sampled_indices = self._sample_indices(len(frames))
-        return [frames[i] for i in sampled_indices]
+        sampled_frames = [frames[i] for i in sampled_indices]
+
+        if cache_path is not None:
+            np.save(cache_path, np.stack(sampled_frames))
+
+        return sampled_frames
 
     def _sample_indices(self, num_available: int) -> List[int]:
         """Sample frame indices according to the configured strategy."""
@@ -161,3 +181,12 @@ class VideoDataset(Dataset):
             return frame[:cutoff, :, :]
         # near court
         return frame[h - cutoff :, :, :]
+
+    def _cache_key(self, video_path: Path) -> str:
+        """Generate a cache key that includes sampling-related params."""
+        try:
+            rel = video_path.relative_to(self.root_dir)
+            slug = rel.as_posix().replace("/", "__")
+        except ValueError:
+            slug = video_path.as_posix().replace("/", "__")
+        return f"{slug}_nf{self.num_frames}_samp{self.sampling}_step{self.frame_step}_focus{self.focus_court}"

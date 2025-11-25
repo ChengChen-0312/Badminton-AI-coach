@@ -1,0 +1,24 @@
+video:
+  root_dir: "archive"
+
+device:
+  yolo_device: "cpu"       # YOLO often runs faster/more stable on CPU for Mac + ultralytics
+  classifier_device: "mps"
+
+vision:
+  yolo_imgsz: 384
+  yolo_conf: 0.5
+  use_court_roi: true
+  court_roi_margin: 0.05
+  yolo_model: "yolov8n.pt"
+  ball_model: "yolov8n.pt"
+
+tracking:
+  detect_stride: 3
+  max_age: 10
+  ball_max_age: 5
+  iou_thresh: 0.3
+
+realtime:
+  target_fps: 30
+  batch_size: 4

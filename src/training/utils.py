@@ -18,6 +18,15 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def set_num_threads(num: int = 4) -> None:
+    """Limit CPU threads to reduce contention and dataloader overhead."""
+    import os
+
+    torch.set_num_threads(num)
+    os.environ["OMP_NUM_THREADS"] = str(num)
+    os.environ["MKL_NUM_THREADS"] = str(num)
+
+
 def accuracy(outputs: torch.Tensor, targets: torch.Tensor) -> float:
     preds = outputs.argmax(dim=1)
     correct = (preds == targets).sum().item()

@@ -14,3 +14,13 @@ def smooth_events(events: Sequence[int], window: int = 3) -> List[int]:
         if not smoothed or idx - smoothed[-1] > window:
             smoothed.append(idx)
     return smoothed
+
+
+def slice_segments(events: Sequence[int], total_len: int, pad: int = 2) -> List[tuple[int, int]]:
+    """Create segments around events (for stroke extraction)."""
+    segments = []
+    for e in events:
+        start = max(0, e - pad)
+        end = min(total_len, e + pad)
+        segments.append((start, end))
+    return segments

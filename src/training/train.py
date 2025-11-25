@@ -15,7 +15,13 @@ from src.data.dataset import VideoDataset, discover_video_files
 from src.data.split import compute_class_counts, compute_class_weights, train_val_split
 from src.data.transforms import get_train_transforms, get_val_transforms
 from src.models.video_classifier import VideoClassifier
-from src.training.utils import get_device, move_to_device, save_checkpoint, set_seed
+from src.training.utils import (
+    get_device,
+    move_to_device,
+    save_checkpoint,
+    set_num_threads,
+    set_seed,
+)
 
 
 def load_config(config_path: str | Path) -> Dict[str, Any]:
@@ -43,6 +49,7 @@ def build_dataloaders(
     train_dataset = VideoDataset(
         samples=train_samples,
         class_to_idx=class_to_idx,
+        root_dir=root_dir,
         num_frames=data_cfg.get("num_frames", 16),
         frame_size=data_cfg.get("frame_size", 224),
         frame_step=data_cfg.get("frame_step", 1),
@@ -53,23 +60,29 @@ def build_dataloaders(
             strong_aug=data_cfg.get("strong_aug", True),
         ),
         focus_court=data_cfg.get("focus_court", "full"),
+        use_cache=data_cfg.get("use_cache", False),
+        cache_dir=data_cfg.get("cache_dir", "frame_cache"),
     )
     val_dataset = VideoDataset(
         samples=val_samples,
         class_to_idx=class_to_idx,
+        root_dir=root_dir,
         num_frames=data_cfg.get("num_frames", 16),
         frame_size=data_cfg.get("frame_size", 224),
         frame_step=data_cfg.get("frame_step", 1),
         sampling=data_cfg.get("sampling", "uniform"),
         transform=get_val_transforms(data_cfg.get("frame_size", 224)),
         focus_court=data_cfg.get("focus_court", "full"),
+        use_cache=data_cfg.get("use_cache", False),
+        cache_dir=data_cfg.get("cache_dir", "frame_cache"),
     )
 
-    num_workers = config["training"]["num_workers"]
-
-    # Compute class weights upfront (used for loss and optional sampler).
     train_counts = compute_class_counts(train_samples, class_to_idx)
     class_weights = torch.tensor(compute_class_weights(train_counts), dtype=torch.float)
+
+    num_workers = config["training"]["num_workers"]
+    prefetch_factor = config["training"].get("prefetch_factor", 2)
+    persistent_workers = config["training"].get("persistent_workers", num_workers > 0)
 
     # Optional weighted sampler to emphasize under-represented or difficult classes.
     sampler = None
@@ -84,22 +97,26 @@ def build_dataloaders(
             sample_weights.append(weight)
         sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    train_loader = DataLoader(
-        train_dataset,
+    common_loader_kwargs = dict(
         batch_size=config["training"]["batch_size"],
-        shuffle=sampler is None,
-        sampler=sampler,
         num_workers=num_workers,
         pin_memory=False,
-        persistent_workers=num_workers > 0,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=sampler is None,
+        sampler=sampler,
+        drop_last=True,
+        **common_loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config["training"]["batch_size"],
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=num_workers > 0,
+        drop_last=False,
+        **common_loader_kwargs,
     )
     return train_loader, val_loader, classes, class_weights
 
@@ -172,6 +189,7 @@ def _build_scheduler(
 def train(config: Dict[str, Any]) -> None:
     device = get_device(config["training"]["device"])
     set_seed(config.get("seed", 42))
+    set_num_threads(config["training"].get("num_workers", 4))
 
     print(f"Using court focus: {config['data'].get('focus_court', 'full')}")
     train_loader, val_loader, classes, class_weights = build_dataloaders(config)
