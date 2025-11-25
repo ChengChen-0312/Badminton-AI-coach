@@ -1,0 +1,20 @@
+vision:
+  yolo_model: "yolov8n.pt"
+  court_model: "court_segmenter.pt"
+  pose_model: "yolo-pose-s"
+  device: "mps"
+
+tracking:
+  player: "bytetrack"
+  ball: "kalman"
+
+geometry:
+  homography: true
+
+spatial_logic:
+  zones: ["front", "mid", "back"]
+  detect_events: true
+
+output:
+  save_overlay: true
+  save_report: true
