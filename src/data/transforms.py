@@ -5,9 +5,10 @@ from torchvision import transforms as T
 from .dataset import IMAGENET_MEAN, IMAGENET_STD
 
 
-def get_train_transforms(frame_size: int = 224, augmentation: str = "strong") -> T.Compose:
+def get_train_transforms(frame_size: int = 224, augmentation: str = "strong", strong_aug: bool = True) -> T.Compose:
     """Augmentations for training frames."""
-    if augmentation == "strong":
+    if strong_aug:
+        # Stronger jitter/crop for larger data regimes.
         return T.Compose(
             [
                 T.ToPILImage(),
@@ -19,13 +20,14 @@ def get_train_transforms(frame_size: int = 224, augmentation: str = "strong") ->
                 T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ]
         )
-    # Fallback to light augmentations
+    # Mild augmentations to preserve subtle cues (e.g., backhand vs forehand).
     return T.Compose(
         [
             T.ToPILImage(),
-            T.Resize(int(frame_size * 1.15)),
-            T.RandomCrop(frame_size),
-            T.RandomHorizontalFlip(),
+            T.RandomResizedCrop(frame_size, scale=(0.8, 1.0)),
+            T.RandomHorizontalFlip(p=0.4),
+            T.RandomRotation(degrees=6),
+            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
             T.ToTensor(),
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]

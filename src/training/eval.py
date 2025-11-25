@@ -139,6 +139,18 @@ def run_eval(config_path: str | Path, checkpoint_path: str | Path) -> Dict[str, 
     df.to_csv(csv_path, index=False)
     print(f"Saved predictions CSV to {csv_path}")
 
+    # Report most confused pairs (top off-diagonal counts).
+    flat_confusions = []
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i == j:
+                continue
+            flat_confusions.append((cm[i, j], classes[i], classes[j]))
+    flat_confusions.sort(reverse=True, key=lambda x: x[0])
+    top_pairs = [f"{src}->{dst}: {cnt}" for cnt, src, dst in flat_confusions[:3] if cnt > 0]
+    if top_pairs:
+        print("Most confused pairs: " + ", ".join(top_pairs))
+
     return {
         "val_loss": val_loss,
         "val_acc": val_acc,

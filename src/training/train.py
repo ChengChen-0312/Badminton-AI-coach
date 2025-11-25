@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 import yaml
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from tqdm import tqdm
 
@@ -50,6 +50,7 @@ def build_dataloaders(
         transform=get_train_transforms(
             data_cfg.get("frame_size", 224),
             augmentation=data_cfg.get("augmentation", "strong"),
+            strong_aug=data_cfg.get("strong_aug", True),
         ),
     )
     val_dataset = VideoDataset(
@@ -63,10 +64,25 @@ def build_dataloaders(
     )
 
     num_workers = config["training"]["num_workers"]
+
+    # Optional weighted sampler to emphasize under-represented or difficult classes.
+    sampler = None
+    if config["training"].get("sampler", "none") == "weighted":
+        sample_weights = []
+        boost_class = config["training"].get("boost_class")
+        boost_factor = config["training"].get("boost_factor", 1.0)
+        for _, label_name in train_samples:
+            weight = class_weights[class_to_idx[label_name]].item()
+            if boost_class and label_name == boost_class:
+                weight *= boost_factor
+            sample_weights.append(weight)
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=False,
         persistent_workers=num_workers > 0,
@@ -91,11 +107,14 @@ def _validate(
     criterion: nn.Module,
     device: torch.device,
     use_channels_last: bool,
-) -> Tuple[float, float]:
+    classes: List[str],
+) -> Tuple[float, float, Dict[str, float]]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    per_class_correct = {cls: 0 for cls in classes}
+    per_class_total = {cls: 0 for cls in classes}
 
     with torch.no_grad():
         for videos, labels, _, _ in dataloader:
@@ -110,12 +129,20 @@ def _validate(
             loss = criterion(outputs, labels)
 
             total_loss += loss.item() * labels.size(0)
-            total_correct += (outputs.argmax(1) == labels).sum().item()
+            preds = outputs.argmax(1)
+            total_correct += (preds == labels).sum().item()
             total_samples += labels.size(0)
+            for pred, target in zip(preds.tolist(), labels.tolist()):
+                class_name = classes[target]
+                per_class_total[class_name] += 1
+                per_class_correct[class_name] += int(pred == target)
 
     avg_loss = total_loss / max(total_samples, 1)
     avg_acc = total_correct / max(total_samples, 1)
-    return avg_loss, avg_acc
+    per_class_acc = {
+        cls: (per_class_correct[cls] / per_class_total[cls] if per_class_total[cls] > 0 else 0.0) for cls in classes
+    }
+    return avg_loss, avg_acc, per_class_acc
 
 
 def _build_scheduler(
@@ -152,8 +179,9 @@ def train(config: Dict[str, Any]) -> None:
     ).to(device)
 
     class_weights = class_weights.to(device)
+    weight_tensor = class_weights if config["training"].get("class_weighting", "auto") == "auto" else None
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
+        weight=weight_tensor,
         label_smoothing=config["training"].get("label_smoothing", 0.0),
     )
     optimizer = torch.optim.Adam(
@@ -231,12 +259,13 @@ def train(config: Dict[str, Any]) -> None:
         train_loss = running_loss / max(total, 1)
         train_acc = running_correct / max(total, 1)
 
-        val_loss, val_acc = _validate(
+        val_loss, val_acc, val_per_class = _validate(
             model,
             val_loader,
             criterion,
             device,
             use_channels_last=config["training"].get("use_channels_last", False),
+            classes=classes,
         )
 
         print(
@@ -244,6 +273,9 @@ def train(config: Dict[str, Any]) -> None:
             f"train_loss={train_loss:.4f}, train_acc={train_acc:.3f}, "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.3f}"
         )
+        # Quick per-class summary to monitor weak classes.
+        per_class_str = ", ".join(f"{cls}:{acc:.2f}" for cls, acc in val_per_class.items())
+        print(f"Val per-class acc -> {per_class_str}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc

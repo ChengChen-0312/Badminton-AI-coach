@@ -1,0 +1,37 @@
+seed: 42
+
+data:
+  root_dir: "archive"
+  num_frames: 16
+  frame_size: 224
+  train_val_split: 0.8
+  frame_step: 1
+  sampling: "rand_uniform"
+  augmentation: "strong"
+  strong_aug: false
+
+training:
+  batch_size: 4
+  num_epochs: 30
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  num_workers: 4
+  device: "mps"
+  use_channels_last: true
+  scheduler: "onecycle"
+  use_amp: true
+  grad_clip: 1.0
+  label_smoothing: 0.05
+  early_stopping_patience: 8
+  class_weighting: "auto"
+  sampler: "weighted"
+  boost_class: "backhand_drive"
+  boost_factor: 1.5
+
+model:
+  backbone: "x3d_m"
+  pretrained: true
+
+logging:
+  log_interval: 5
+  output_dir: "runs/v2_highcap"
