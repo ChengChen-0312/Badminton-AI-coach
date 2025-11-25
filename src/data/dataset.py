@@ -69,6 +69,7 @@ class VideoDataset(Dataset):
         num_frames: int = 16,
         frame_size: int = 224,
         frame_step: int = 1,
+        sampling: str = "uniform",
         transform: Optional[Callable] = None,
     ) -> None:
         self.samples = list(samples)
@@ -76,6 +77,9 @@ class VideoDataset(Dataset):
         self.num_frames = num_frames
         self.frame_size = frame_size
         self.frame_step = frame_step
+        self.sampling = sampling
+        if self.sampling not in {"uniform", "rand_uniform", "strided"}:
+            raise ValueError(f"Unsupported sampling mode: {sampling}")
         self.transform = transform or _default_transform(frame_size)
 
     def __len__(self) -> int:
@@ -114,11 +118,31 @@ class VideoDataset(Dataset):
         return [frames[i] for i in sampled_indices]
 
     def _sample_indices(self, num_available: int) -> List[int]:
-        """Uniformly sample frame indices to reach num_frames length."""
+        """Sample frame indices according to the configured strategy."""
         if num_available == 1:
             return [0 for _ in range(self.num_frames)]
 
-        positions = np.linspace(0, num_available - 1, self.num_frames)
-        indices = [int(round(p)) for p in positions]
+        if self.sampling == "uniform":
+            positions = np.linspace(0, num_available - 1, self.num_frames)
+            indices = [int(round(p)) for p in positions]
+        elif self.sampling == "rand_uniform":
+            stride = num_available / self.num_frames
+            indices = []
+            for i in range(self.num_frames):
+                start = int(i * stride)
+                end = int(min((i + 1) * stride, num_available))
+                if start >= end:
+                    end = min(start + 1, num_available)
+                idx = np.random.randint(start, end) if end - start > 0 else start
+                indices.append(idx)
+        elif self.sampling == "strided":
+            indices = list(range(0, num_available, self.frame_step))
+            if len(indices) < self.num_frames:
+                # pad by repeating last index
+                indices.extend([indices[-1]] * (self.num_frames - len(indices)))
+            indices = indices[: self.num_frames]
+        else:
+            raise ValueError(f"Unsupported sampling mode: {self.sampling}")
+
         indices = [min(i, num_available - 1) for i in indices]
         return indices

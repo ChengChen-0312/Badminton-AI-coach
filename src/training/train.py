@@ -8,10 +8,11 @@ import torch
 import yaml
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from tqdm import tqdm
 
 from src.data.dataset import VideoDataset, discover_video_files
-from src.data.split import train_val_split
+from src.data.split import compute_class_counts, compute_class_weights, train_val_split
 from src.data.transforms import get_train_transforms, get_val_transforms
 from src.models.video_classifier import VideoClassifier
 from src.training.utils import get_device, move_to_device, save_checkpoint, set_seed
@@ -25,7 +26,7 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
 def build_dataloaders(
     config: Dict[str, Any],
     class_names: List[str] | None = None,
-) -> Tuple[DataLoader, DataLoader, List[str]]:
+) -> Tuple[DataLoader, DataLoader, List[str], torch.Tensor]:
     data_cfg = config["data"]
     root_dir = Path(data_cfg["root_dir"])
 
@@ -45,7 +46,11 @@ def build_dataloaders(
         num_frames=data_cfg.get("num_frames", 16),
         frame_size=data_cfg.get("frame_size", 224),
         frame_step=data_cfg.get("frame_step", 1),
-        transform=get_train_transforms(data_cfg.get("frame_size", 224)),
+        sampling=data_cfg.get("sampling", "uniform"),
+        transform=get_train_transforms(
+            data_cfg.get("frame_size", 224),
+            augmentation=data_cfg.get("augmentation", "strong"),
+        ),
     )
     val_dataset = VideoDataset(
         samples=val_samples,
@@ -53,6 +58,7 @@ def build_dataloaders(
         num_frames=data_cfg.get("num_frames", 16),
         frame_size=data_cfg.get("frame_size", 224),
         frame_step=data_cfg.get("frame_step", 1),
+        sampling=data_cfg.get("sampling", "uniform"),
         transform=get_val_transforms(data_cfg.get("frame_size", 224)),
     )
 
@@ -73,7 +79,10 @@ def build_dataloaders(
         pin_memory=False,
         persistent_workers=num_workers > 0,
     )
-    return train_loader, val_loader, classes
+    train_counts = compute_class_counts(train_samples, class_to_idx)
+    class_weights = torch.tensor(compute_class_weights(train_counts), dtype=torch.float)
+
+    return train_loader, val_loader, classes, class_weights
 
 
 def _validate(
@@ -109,11 +118,32 @@ def _validate(
     return avg_loss, avg_acc
 
 
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_name: str,
+    training_cfg: Dict[str, Any],
+    steps_per_epoch: int,
+) -> torch.optim.lr_scheduler._LRScheduler | None:
+    scheduler_name = (scheduler_name or "none").lower()
+    if scheduler_name == "cosine":
+        return CosineAnnealingLR(optimizer, T_max=training_cfg["num_epochs"])
+    if scheduler_name == "onecycle":
+        if steps_per_epoch == 0:
+            return None
+        return OneCycleLR(
+            optimizer,
+            max_lr=training_cfg["learning_rate"],
+            steps_per_epoch=steps_per_epoch,
+            epochs=training_cfg["num_epochs"],
+        )
+    return None
+
+
 def train(config: Dict[str, Any]) -> None:
     device = get_device(config["training"]["device"])
     set_seed(config.get("seed", 42))
 
-    train_loader, val_loader, classes = build_dataloaders(config)
+    train_loader, val_loader, classes, class_weights = build_dataloaders(config)
     model = VideoClassifier(
         num_classes=len(classes),
         backbone_name=config["model"]["backbone"],
@@ -121,7 +151,11 @@ def train(config: Dict[str, Any]) -> None:
         use_channels_last=config["training"].get("use_channels_last", False),
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=config["training"].get("label_smoothing", 0.0),
+    )
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config["training"]["learning_rate"],
@@ -134,6 +168,19 @@ def train(config: Dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_acc = 0.0
+    best_val_loss = float("inf")
+    patience = config["training"].get("early_stopping_patience", 5)
+    patience_counter = 0
+
+    use_amp = config["training"].get("use_amp", False)
+    scaler = torch.amp.GradScaler(device.type) if use_amp else None
+    scheduler = _build_scheduler(
+        optimizer,
+        scheduler_name=config["training"].get("scheduler", "none"),
+        training_cfg=config["training"],
+        steps_per_epoch=len(train_loader),
+    )
+    grad_clip = config["training"].get("grad_clip", 0.0)
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -152,10 +199,22 @@ def train(config: Dict[str, Any]) -> None:
             )
 
             optimizer.zero_grad()
-            outputs = model(videos)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                outputs = model(videos)
+                loss = criterion(outputs, labels)
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if grad_clip and grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
 
             running_loss += loss.item() * labels.size(0)
             running_correct += (outputs.argmax(1) == labels).sum().item()
@@ -165,6 +224,9 @@ def train(config: Dict[str, Any]) -> None:
                 train_loss = running_loss / max(total, 1)
                 train_acc = running_correct / max(total, 1)
                 progress.set_postfix({"train_loss": f"{train_loss:.4f}", "train_acc": f"{train_acc:.3f}"})
+
+            if scheduler and isinstance(scheduler, OneCycleLR):
+                scheduler.step()
 
         train_loss = running_loss / max(total, 1)
         train_acc = running_correct / max(total, 1)
@@ -192,12 +254,26 @@ def train(config: Dict[str, Any]) -> None:
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_acc": val_acc,
+                    "val_loss": val_loss,
                     "classes": classes,
                     "config": config,
                 },
                 checkpoint_path,
             )
             print(f"Saved new best checkpoint to {checkpoint_path}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if scheduler and not isinstance(scheduler, OneCycleLR):
+            scheduler.step()
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {epoch} epochs.")
+            break
 
 
 def _parse_args() -> argparse.Namespace:
