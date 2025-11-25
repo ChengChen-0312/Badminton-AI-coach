@@ -7,7 +7,9 @@ from src.geometry.homography import CourtHomography
 from src.geometry.region_definitions import DEFAULT_REGIONS
 from src.spatial_logic.events import infer_event_from_trajectory
 from src.spatial_logic.landing_detector import BallState, extract_ball_track, infer_landing
+from src.spatial_logic.hitter_detector import HitterInfo, infer_hitter_for_stroke
 from src.spatial_logic.stroke_reasoner import FinalStroke, combine_classifier_and_event
+from src.tracking.player_track import PlayerState
 
 
 @dataclass
@@ -22,6 +24,8 @@ class StrokeSummary:
     landing_predicted: bool = False
     classifier_label: Optional[str] = None
     event_type: Optional[str] = None
+    hitter_track_id: Optional[int] = None
+    hitter_distance: Optional[float] = None
 
 
 def build_homography_from_analysis(analysis_result: Any) -> Optional[CourtHomography]:
@@ -39,6 +43,8 @@ def build_homography_from_analysis(analysis_result: Any) -> Optional[CourtHomogr
 def summarise_strokes_from_analysis(
     analysis_result: Any,
     classifier_labels: Optional[Sequence[str]] = None,
+    hitter_distance_max: float = 200.0,
+    enable_hitter_inference: bool = True,
 ) -> List[StrokeSummary]:
     """
     High-level entry:
@@ -73,6 +79,31 @@ def summarise_strokes_from_analysis(
     clf_label = classifier_labels[0] if classifier_labels else None
     final: FinalStroke = combine_classifier_and_event(clf_label, event)
 
+    hitter_info: Optional[HitterInfo] = None
+    if enable_hitter_inference and landing is not None and landing.contact_frame_idx is not None:
+        # find players at contact frame
+        players_at_contact: List[PlayerState] = []
+        if frame_results:
+            for fr in frame_results:
+                idx = getattr(fr, "frame_idx", None) or (fr.get("frame_idx") if isinstance(fr, dict) else None)
+                if idx == landing.contact_frame_idx:
+                    ps = getattr(fr, "player_states", None) or (fr.get("player_states") if isinstance(fr, dict) else None)
+                    if ps:
+                        players_at_contact = ps
+                    break
+        ball_pos = (
+            landing.contact_x if landing.contact_x is not None else landing.img_x,
+            landing.contact_y if landing.contact_y is not None else landing.img_y,
+        )
+        hitter_info = infer_hitter_for_stroke(
+            contact_frame=landing.contact_frame_idx,
+            ball_pos=ball_pos,
+            players_at_contact=players_at_contact,
+            max_distance=hitter_distance_max,
+        )
+        if hitter_info:
+            final.hitter_role = hitter_info.hitter_role
+
     summary = StrokeSummary(
         frame_range=(event.start_frame, event.end_frame),
         final_type=final.type,
@@ -84,6 +115,8 @@ def summarise_strokes_from_analysis(
         landing_predicted=landing.predicted if landing is not None else False,
         classifier_label=final.classifier_label,
         event_type=final.event_type,
+        hitter_track_id=hitter_info.hitter_track_id if hitter_info else None,
+        hitter_distance=hitter_info.distance if hitter_info else None,
     )
     return [summary]
 

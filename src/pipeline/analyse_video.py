@@ -12,6 +12,7 @@ import numpy as np
 from src.tracking.ball_track import BallTrackState, SingleBallTracker
 from src.tracking.bytetrack import SimpleByteTrack, Track
 from src.tracking.id_assign import assign_player_roles
+from src.tracking.player_track import PlayerState, PlayerTracker
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.detectors import PlayerDetector
@@ -21,6 +22,7 @@ from src.vision.detectors import PlayerDetector
 class FrameResult:
     frame_idx: int
     players: List[Track]
+    player_states: List[PlayerState]
     player_roles: Dict[int, str]
     ball: BallTrackState | None
 
@@ -31,6 +33,7 @@ class AnalyseResult:
     fps: float
     frame_results: List[FrameResult]
     court_corners: Optional[List[List[float]]] = None
+    player_tracks: Optional[List[PlayerState]] = None
 
 
 def analyse_video(
@@ -83,6 +86,7 @@ def analyse_video(
         ema_alpha=0.6,
         max_age=tracking_cfg.get("ball_max_age", 5),
     )
+    identity_tracker = PlayerTracker(max_iou_mismatch=tracking_cfg.get("iou_thresh", 0.3))
     court_detector = CourtDetector() if use_court_roi else None
 
     frame_idx = 0
@@ -185,10 +189,14 @@ def analyse_video(
                     if ball_state is not None:
                         last_ball_state = ball_state
                     roles = assign_player_roles(player_tracks, frame_height=h)
+                    # update identity tracker with current player boxes
+                    identity_tracker.update(fi, [tuple(t.bbox) for t in player_tracks])
+                    player_states = identity_tracker.get_players_at(fi)
                     frame_results.append(
                         FrameResult(
                             frame_idx=fi,
                             players=player_tracks,
+                            player_states=player_states,
                             player_roles=roles,
                             ball=ball_state,
                         )
@@ -218,10 +226,13 @@ def analyse_video(
             if ball_state is not None:
                 last_ball_state = ball_state
             roles = assign_player_roles(player_tracks, frame_height=h)
+            identity_tracker.update(frame_idx, [tuple(t.bbox) for t in player_tracks])
+            player_states = identity_tracker.get_players_at(frame_idx)
             frame_results.append(
                 FrameResult(
                     frame_idx=frame_idx,
                     players=player_tracks,
+                    player_states=player_states,
                     player_roles=roles,
                     ball=ball_state,
                 )
@@ -258,10 +269,13 @@ def analyse_video(
             if ball_state is not None:
                 last_ball_state = ball_state
             roles = assign_player_roles(player_tracks, frame_height=h)
+            identity_tracker.update(fi, [tuple(t.bbox) for t in player_tracks])
+            player_states = identity_tracker.get_players_at(fi)
             frame_results.append(
                 FrameResult(
                     frame_idx=fi,
                     players=player_tracks,
+                    player_states=player_states,
                     player_roles=roles,
                     ball=ball_state,
                 )
@@ -272,4 +286,5 @@ def analyse_video(
         fps=fps,
         frame_results=frame_results,
         court_corners=court_corners if court_corners is not None else default_corners,
+        player_tracks=identity_tracker.players,
     )

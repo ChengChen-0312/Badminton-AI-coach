@@ -56,6 +56,12 @@ output:
 - `src/spatial_logic/stroke_reasoner.py`: fuse classifier labels with spatial events into a final stroke type and confidence.
 - `src/pipeline/extract_strokes.py`: turn `analyse_video` outputs into stroke summaries (frame range, type, landing region) for reporting.
 
+### v3.4 – Hitter Identity (Who Hits the Shuttle?)
+- `src/tracking/player_track.py`: maintains two long-lived player tracks, assigns near/far roles via IoU + vertical position.
+- `src/pipeline/analyse_video.py`: integrates PlayerTracker so each FrameResult carries player_states; AnalyseResult exposes player_tracks.
+- `src/spatial_logic/hitter_detector.py`: picks the closest player to the ball at contact_frame (role + track_id + distance).
+- `src/pipeline/extract_strokes.py`: stroke summaries now include `hitter_track_id` and `hitter_distance`, combining classifier label, event type, hitter, and landing info.
+
 ## Quickstart (Stroke Training)
 ```bash
 pip install -r requirements.txt

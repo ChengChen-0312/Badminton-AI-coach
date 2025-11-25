@@ -23,3 +23,7 @@ tracking:
 realtime:
   target_fps: 30
   batch_size: 2
+
+spatial_logic:
+  enable_hitter_inference: true
+  hitter_distance_max: 200.0
