@@ -104,3 +104,192 @@ python -m src.training.eval --config src/config/default.yaml --checkpoint runs/s
 - Court-focus: set `data.focus_court: far` to prioritize far-side player.
 - x3d backbones need newer torchvision; if unavailable, code falls back to `r3d_34`.
 - Vision/tracking/geometry/pipeline files are scaffolds for code agents to fill with real models and logic.
+
+# 开发日志 / 操作手册（v1.0 → v3.7）
+
+## v1.0 – 基础视频分类管线
+- 改动：folder-per-class 自动发现；固定帧采样+224×224+ImageNet 归一化；train/val 分离增强；模型 2D ResNet18（逐帧+时序平均）或 3D r3d_18，动态类别输出；训练/评估保存最佳模型。
+- 命令：
+  ```bash
+  python scripts/train_strokes.py --config src/config/default.yaml
+  python -m src.training.eval --config src/config/default.yaml \
+    --checkpoint runs/stroke_baseline/best_model.pt
+  ```
+- 结果：训练/评估可跑通，输出整体/类别精度。
+
+## v2.0 – 准确率提升 & MPS 优化
+- 改动：新增 mc3_18, r3d_34, x3d_s/x3d_m；采样 uniform/rand_uniform/strided；增强 HFlip/Rotation/ColorJitter/RRCrop；class weights + weighted sampler；Cosine/OneCycle LR，AMP/grad clip/label smoothing/早停；MPS pin_memory=False + channels_last；配置 default.yaml / v2_highcap.yaml；CLI train_strokes_v2.py。
+- 命令：
+  ```bash
+  python scripts/train_strokes_v2.py --config src/config/v2_highcap.yaml
+  python -m src.training.eval --config src/config/v2_highcap.yaml \
+    --checkpoint runs/v2_high_accuracy/best_model.pt
+  ```
+- 结果：高容量配置可显著提升准确率（x3d 需新版 torchvision）。
+
+## v2.1 – Court focus & 增强开关
+- 改动：data.focus_court full/far/near 预裁剪；data.strong_aug 轻/重增强；v2_highcap_stable 下调分辨率、关闭 class weights/weighted sampler/LS。
+- 验证：切换配置即可观察裁剪/增强效果。
+
+## v2.2 – 性能调优（DataLoader/MPS）
+- 改动：persistent_workers、prefetch_factor、num_workers 适配 macOS；pin_memory=False；set_num_threads；channels_last。
+- 结果：迭代耗时下降（瓶颈仍在视频解码）。
+
+## v2.3 – 缓存方案（建议型）
+- 提出 frame cache 减少 mp4 解码开销（未默认开启，可按需用）。
+
+## v3.0 – 视觉+跟踪架构雏形
+- 目录：vision（YOLO 检测/pose stub/court detector）、tracking（简化 ByteTrack、ball tracker）、geometry、spatial_logic、pipeline。
+- analyse_video 原型：检测+跟踪+ near/far 角色分配；README blueprint 描述整体体系。
+
+## v3.1 – 实时化（detect_stride/ROI/批量 YOLO）
+- 改动：detect_stride=3 关键帧检测，非关键帧 tracker 预测；YOLO batch imgsz=384，CPU 推理，court ROI 裁剪；配置 v3_realtime.yaml。
+- 验证：`python scripts/test_realtime_fps.py`，64 帧短视频可生成 frame_results，显示 FPS。
+
+## v3.2 – 落点与空间逻辑初版
+- 改动：landing_detector 轨迹平滑+缺失窗口推落点（支持 homography/区域分类）；geometry/homography+region_definitions 前/中/后；events 启发式 clear/lift/net_shot/drive/smash；stroke_reasoner 融合分类标签与事件；extract_strokes 生成 summaries。
+- 验证示例：
+  ```bash
+  python - <<'PY'
+  from src.pipeline.analyse_video import analyse_video
+  from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+  import yaml
+  cfg = yaml.safe_load(open('src/config/v3_realtime.yaml'))
+  res = analyse_video('archive/forehand_drive/048.mp4', config=cfg)
+  summaries = summarise_strokes_from_analysis(res, classifier_labels=['forehand_drive'])
+  print(stroke_summaries_to_dicts(summaries))
+  PY
+  ```
+
+## v3.3 – 报告与可视化
+- 改动：report_generator Markdown/JSON/CSV + tactical summary；heatmap 绿色底白线红点，无方框；timeline 角色散点；visualization 开关。
+- 验证：
+  ```bash
+  python - <<'PY'
+  from src.pipeline.analyse_video import analyse_video
+  from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+  from src.pipeline.report_generator import generate_match_report
+  import yaml
+  cfg = yaml.safe_load(open('src/config/v3_realtime.yaml'))
+  res = analyse_video('archive/backhand_drive/004.mp4', config=cfg)
+  summaries = stroke_summaries_to_dicts(
+      summarise_strokes_from_analysis(res, classifier_labels=['backhand_drive'])
+  )
+  paths = generate_match_report('demo_v37', summaries, 'reports',
+    enable_heatmap=cfg.get('visualization',{}).get('enable_heatmap',True),
+    enable_timeline=cfg.get('visualization',{}).get('enable_timeline',True),
+    heatmap_bins=cfg.get('visualization',{}).get('heatmap_bins',32))
+  print(paths)
+  PY
+  ```
+
+## v3.4 – 击球者身份
+- 改动：player_track 稳定 near/far；hitter_detector 球-人距离判定；summaries 增 hitter_track_id/hitter_distance/contact_frame。
+- 验证：summaries 中含 hitter_role/hitter_distance 字段。
+
+## v3.5 – Match Report
+- 改动：report_generator 增击球者、落点、事件、置信度等明细；Markdown/JSON/CSV 输出。
+
+## v3.6 – 战术统计
+- 改动：analysis/tactical_stats offense/defense/neutral，control_index，per-player 分布；report_generator 嵌入 “Tactical Insights”。
+
+## v3.7 – 可视化完善
+- 改动：heatmap 浅绿地板白线红点，去方框；可选热度栅格；timeline 角色散点；report_generator 嵌入最新 heatmap/timeline。
+- 验证：demo_v37_report 生成 PNG；analyse_video + summarise + report 可产出可视化。
+
+---
+
+# MLX 教师/学生蒸馏（基于 v3.7 后清理）
+
+## 清理与后端
+- 仅保留 MLXTeacher（Qwen3-VL-30B）/ MLXStudent（Qwen3-VL-4B）；删除 HF/HTTP/student_7b 相关分支与脚本。
+- action_feedback 仅支持 teacher_mlx / student_mlx。
+
+## 生成标签（全量 835 视频）
+```bash
+python scripts/generate_teacher_labels_mlx.py \
+  --videos-glob "archive/**/*.mp4" \
+  --output data/distill/teacher_labels.jsonl \
+  --config src/config/v3_realtime.yaml \
+  --teacher-model-path /Users/chencheng/llm/qwen3-30b
+```
+- 结果：teacher_labels.jsonl 共 835 条。
+
+## 转换数据
+```bash
+python scripts/prepare_distill_dataset.py \
+  --input data/distill/teacher_labels.jsonl \
+  --output data/distill/distill_data_chat.jsonl
+
+python scripts/prepare_mlx_data.py  # 生成 data/mlx_train/train(751)/valid(84).jsonl，格式 {"text": "..."}
+```
+
+## LoRA 训练（4B 基座示例）
+```bash
+python -m mlx_lm lora \
+  --model /Users/chencheng/llm/qwen3-4b \
+  --train \
+  --data data/mlx_train \
+  --batch-size 1 \
+  --num-layers 16 \
+  --iters 500 \
+  --learning-rate 5e-5 \
+  --steps-per-eval 50 \
+  --adapter-path outputs/lora_adapters
+```
+- 结果：Val loss ~0.14–0.20；生成 outputs/lora_adapters/adapters.safetensors。
+
+## Fuse（LLM-only）
+```bash
+python -m mlx_lm fuse \
+  --model /Users/chencheng/llm/qwen3-4b \
+  --adapter-path outputs/lora_adapters \
+  --save-path outputs/fused_student_model
+```
+- 提示：fuse 结果不含 vision_tower，不能直接在 VLM 管线加载；可用于纯文本。
+
+## 教师/学生对比示例
+```bash
+python - <<'PY'
+import yaml
+from src.ai_score.action_feedback import ActionFeedback
+from src.pipeline.analyse_video import analyse_video
+from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+
+video = "archive/forehand_net_shot/099.mp4"
+cfg = yaml.safe_load(open("src/config/v3_ai_score.yaml"))
+analysis = analyse_video(video, config=cfg)
+s_dicts = stroke_summaries_to_dicts(
+    summarise_strokes_from_analysis(
+        analysis,
+        enable_hitter_inference=True,
+        hitter_distance_max=cfg.get("spatial_logic", {}).get("hitter_distance_max", 200.0),
+    )
+)
+
+# Teacher 30B
+teacher = ActionFeedback(mode="teacher_mlx", teacher_mlx_path="/Users/chencheng/llm/qwen3-30b")
+print("---- Teacher 30B ----")
+for s in s_dicts:
+    desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+    print(desc)
+    print(teacher.score_motion(desc))
+
+# Student 4B (基座 VLM)
+student = ActionFeedback(mode="student_mlx", student_mlx_path="/Users/chencheng/llm/qwen3-4b")
+print("---- Student 4B (base VLM) ----")
+for s in s_dicts:
+    desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+    print(desc)
+    print(student.score_motion(desc))
+PY
+```
+- 示例输出：
+  - 教师 30B：score≈55，指出击球点过低/偏后，建议更高点位发力。
+  - 学生 4B 基座：score≈75，通用建议（站姿/随挥/落点控制）。
+  - fused_student_model 为 LLM-only，不含 vision_tower，当前 pipeline 不可直接加载；可用于纯文本模式或等待 VLM LoRA 支持。
+
+## 训练/推理配置提示
+- MPS：device=mps，pin_memory=False，可选 channels_last。
+- 性能：LoRA 训练峰值内存 ~4.3 GB（M4 Max，batch=1，layers=16，iters=500）。
+- 提升：增加 iters（800–1000）、调 LR（1e-4）、增 layers；保持 batch=1 以稳内存。
