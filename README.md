@@ -76,6 +76,30 @@ python scripts/train_strokes_v2.py --config src/config/v2_highcap.yaml
 python -m src.training.eval --config src/config/default.yaml --checkpoint runs/stroke_baseline/best_model.pt
 ```
 
+## MLX Teacher/Student Distillation (Cleaned)
+- Active backends: `teacher_mlx` (Qwen3-VL-30B) and `student_mlx` (Qwen3-VL-4B). All legacy HF/HTTP backends have been removed.
+- Generate labels from all videos:
+  ```bash
+  python scripts/generate_teacher_labels_mlx.py --videos-glob "archive/**/*.mp4" \
+    --output data/distill/teacher_labels.jsonl --config src/config/v3_realtime.yaml \
+    --teacher-model-path /Users/chencheng/llm/qwen3-30b
+  ```
+- Prepare chat + MLX text data:
+  ```bash
+  python scripts/prepare_distill_dataset.py \
+    --input data/distill/teacher_labels.jsonl \
+    --output data/distill/distill_data_chat.jsonl
+  python scripts/prepare_mlx_data.py  # builds data/mlx_train/{train,valid}.jsonl
+  ```
+- Train LoRA (example, tweak iters/LR/layers as needed):
+  ```bash
+  python -m mlx_lm lora --model /Users/chencheng/llm/qwen3-4b --train --data data/mlx_train \
+    --batch-size 1 --num-layers 16 --iters 500 --learning-rate 5e-5 \
+    --steps-per-eval 50 --adapter-path outputs/lora_adapters
+  python -m mlx_lm fuse --model /Users/chencheng/llm/qwen3-4b \
+    --adapter-path outputs/lora_adapters --save-path outputs/fused_student_model
+  ```
+
 ## Notes
 - Court-focus: set `data.focus_court: far` to prioritize far-side player.
 - x3d backbones need newer torchvision; if unavailable, code falls back to `r3d_34`.
