@@ -293,3 +293,70 @@ PY
 - MPS：device=mps，pin_memory=False，可选 channels_last。
 - 性能：LoRA 训练峰值内存 ~4.3 GB（M4 Max，batch=1，layers=16，iters=500）。
 - 提升：增加 iters（800–1000）、调 LR（1e-4）、增 layers；保持 batch=1 以稳内存。
+
+LoRA 蒸馏与对比（高容量版）
+思路
+
+保留完整的视觉塔：使用原始 VLM (Qwen3-VL-4B) 作为基座，LoRA 只作用于语言模型部分，strict=False。
+蒸馏数据：835 个视频生成 teacher_labels → distill_data_chat → MLX 训练集 (train=751 / valid=84)。
+高容量训练：batch=2、num_layers=32、iters=1200、lr=5e-5，生成适配器 outputs/lora_adapters_highcap（加载时可见 Applied 448 adapter weights）。
+推理方式：student_mlx 传入 adapter_path，保持图像输入能力（无需 fuse）。
+对比结果（示例）
+
+视频：archive/forehand_net_shot/099.mp4, archive/backhand_drive/004.mp4, archive/forehand_clear/017.mp4
+Teacher 30B：score 55–65，重点在击球点/时机/发力链。
+Student 4B 基座：给出通用建议，score 多在 55–65。
+Student 4B + LoRA highcap：输出在措辞和侧重点上更接近教师，对脚步、时机、击球点、姿态等细节有改进；score 保持在 55–65 区间，体现蒸馏效果。
+测试命令（对同组视频对比三种模型）
+
+python - <<'PY'
+import yaml
+from src.ai_score.action_feedback import ActionFeedback
+from src.pipeline.analyse_video import analyse_video
+from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+
+videos = [
+    "archive/forehand_net_shot/099.mp4",
+    "archive/backhand_drive/004.mp4",
+    "archive/forehand_clear/017.mp4",
+]
+cfg = yaml.safe_load(open("src/config/v3_ai_score.yaml"))
+
+teacher = ActionFeedback(mode="teacher_mlx", teacher_mlx_path="/Users/chencheng/llm/qwen3-30b")
+student_base = ActionFeedback(mode="student_mlx", student_mlx_path="/Users/chencheng/llm/qwen3-4b")
+student_lora = ActionFeedback(
+    mode="student_mlx",
+    student_mlx_path="/Users/chencheng/llm/qwen3-4b",
+    adapter_path="outputs/lora_adapters_highcap",
+)
+
+for video in videos:
+    analysis = analyse_video(video, config=cfg)
+    s_dicts = stroke_summaries_to_dicts(
+        summarise_strokes_from_analysis(
+            analysis,
+            enable_hitter_inference=True,
+            hitter_distance_max=cfg.get("spatial_logic", {}).get("hitter_distance_max", 200.0),
+        )
+    )
+    print(f"\n=== Video: {video} ===")
+    print("---- Teacher 30B ----")
+    for s in s_dicts:
+        desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+        print(desc)
+        print(teacher.score_motion(desc))
+    print("---- Student 4B (base) ----")
+    for s in s_dicts:
+        desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+        print(desc)
+        print(student_base.score_motion(desc))
+    print("---- Student 4B + LoRA (highcap) ----")
+    for s in s_dicts:
+        desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+        print(desc)
+        print(student_lora.score_motion(desc))
+PY
+加载提示
+
+使用 LoRA 时传入 adapter_path="outputs/lora_adapters_highcap"，不需 fuse，保持视觉输入能力。
+若想更强：可在内存允许下进一步加大 iters（1500–2000）或层数（32→更高），不够则降批次/降层数。
