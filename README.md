@@ -295,6 +295,9 @@ PY
 - 提升：增加 iters（800–1000）、调 LR（1e-4）、增 layers；保持 batch=1 以稳内存。
 
 LoRA 蒸馏与对比（高容量版）
+注意：蒸馏参数为：
+python -m mlx_lm lora --model /Users/chencheng/llm/qwen3-4b --train --data data/mlx_train --batch-size 2 --num-layers 32 --iters 1200 --learning-rate 5e-5 --steps-per-eval 50 --adapter-path outputs/lora_adapters_highcap
+
 思路
 
 保留完整的视觉塔：使用原始 VLM (Qwen3-VL-4B) 作为基座，LoRA 只作用于语言模型部分，strict=False。
