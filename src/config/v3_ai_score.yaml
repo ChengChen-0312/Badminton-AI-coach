@@ -1,15 +1,11 @@
-video:
-  root_dir: "archive"
-
 device:
-  yolo_device: "cpu"       # YOLO often runs faster/more stable on CPU for Mac + ultralytics
+  yolo_device: "cpu"
   classifier_device: "mps"
 
 vision:
   yolo_imgsz: 512
   yolo_conf: 0.25
   use_court_roi: false
-  court_roi_margin: 0.05
   yolo_model: "yolov8n.pt"
   ball_model: "yolov8n.pt"
   ball_allow_all_if_empty: true
@@ -32,3 +28,7 @@ visualization:
   enable_heatmap: true
   enable_timeline: true
   heatmap_bins: 32
+
+ai_score:
+  mode: "student"       # student | teacher32b | teacher78b
+  teacher_api: "http://localhost:8000/v1/inference"

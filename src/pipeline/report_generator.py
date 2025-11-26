@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.analysis.tactical_stats import summarize_tactics
+from src.analysis.heatmap import create_landing_heatmap
+from src.analysis.timeline import create_stroke_timeline
 
 
 def generate_markdown_report(
@@ -13,6 +15,8 @@ def generate_markdown_report(
     stroke_summaries: List[Dict[str, Any]],
     output_path: str,
     tactical_summary: Optional[Dict[str, Any]] = None,
+    heatmap_path: Optional[str] = None,
+    timeline_path: Optional[str] = None,
 ) -> str:
     """Generate a Markdown tactical match report."""
     lines: List[str] = []
@@ -73,6 +77,16 @@ def generate_markdown_report(
                     )
                 lines.append("")
 
+    # Visualizations
+    if heatmap_path or timeline_path:
+        lines.append("---\n")
+        lines.append("## 🎨 Visualizations\n")
+        if heatmap_path:
+            lines.append(f"![Heatmap]({Path(heatmap_path).name})")
+        if timeline_path:
+            lines.append(f"![Timeline]({Path(timeline_path).name})")
+        lines.append("")
+
     lines.append("---\n")
     lines.append("## 📝 Stroke-by-Stroke Details\n")
 
@@ -118,18 +132,45 @@ def generate_match_report(
     match_name: str,
     stroke_summaries: List[Dict[str, Any]],
     out_dir: str,
+    enable_heatmap: bool = True,
+    enable_timeline: bool = True,
+    heatmap_bins: int = 32,
 ) -> Dict[str, Any]:
-    """Generate Markdown + JSON + CSV reports (with tactical summary)."""
+    """Generate Markdown + JSON + CSV reports (with tactical summary and visualizations)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     md_path = out / f"{match_name}_report.md"
     json_path = out / f"{match_name}_report.json"
     csv_path = out / f"{match_name}_report.csv"
+    heatmap_path = out / f"{match_name}_heatmap.png"
+    timeline_path = out / f"{match_name}_timeline.png"
 
     tactical_summary = summarize_tactics(stroke_summaries)
 
-    generate_markdown_report(match_name, stroke_summaries, str(md_path), tactical_summary)
+    # Visualizations
+    heatmap_file = None
+    timeline_file = None
+    if enable_heatmap:
+        heatmap_file = create_landing_heatmap(
+            stroke_summaries,
+            str(heatmap_path),
+            bins=heatmap_bins,
+        )
+    if enable_timeline:
+        timeline_file = create_stroke_timeline(
+            stroke_summaries,
+            str(timeline_path),
+        )
+
+    generate_markdown_report(
+        match_name,
+        stroke_summaries,
+        str(md_path),
+        tactical_summary,
+        heatmap_file,
+        timeline_file,
+    )
     generate_json_report(stroke_summaries, str(json_path))
     generate_csv_report(stroke_summaries, str(csv_path))
 
@@ -138,9 +179,11 @@ def generate_match_report(
         "json": str(json_path),
         "csv": str(csv_path),
         "tactical_summary": tactical_summary,
+        "heatmap": heatmap_file,
+        "timeline": timeline_file,
     }
 
-    # Optionally include inline content for quick viewing
+    # Optional inline content
     try:
         result["markdown_content"] = Path(md_path).read_text(encoding="utf-8")
     except Exception:
@@ -183,7 +226,6 @@ def generate_report(
             lines = []
             lines.append(f"# 🏸 Match Report — {match_name}\n")
             lines.append(f"Total strokes: **{len(stroke_summaries)}**\n")
-            # lightweight summary (no tactical insights to keep stdout concise)
             for i, s in enumerate(stroke_summaries):
                 lines.append(f"### Stroke {i + 1}")
                 lines.append(f"- Predicted Type: **{s.get('final_type')}**")

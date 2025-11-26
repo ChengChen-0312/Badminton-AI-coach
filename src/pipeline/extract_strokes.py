@@ -17,9 +17,13 @@ class StrokeSummary:
     frame_range: tuple[int, int]
     final_type: str
     confidence: float
-    hitter_role: Optional[str]
-    landing_region: Optional[str]
-    landing_frame: Optional[int]
+    hitter_role: Optional[str] = None
+    landing_region: Optional[str] = None
+    landing_x: Optional[float] = None
+    landing_y: Optional[float] = None
+    contact_x: Optional[float] = None
+    contact_y: Optional[float] = None
+    landing_frame: Optional[int] = None
     contact_frame: Optional[int] = None
     landing_predicted: bool = False
     contact_region: Optional[str] = None
@@ -120,6 +124,10 @@ def summarise_strokes_from_analysis(
         confidence=final.confidence,
         hitter_role=final.hitter_role,
         landing_region=final.landing_region,
+        landing_x=landing.court_x if landing is not None else None,
+        landing_y=landing.court_y if landing is not None else None,
+        contact_x=landing.contact_x if landing is not None else None,
+        contact_y=landing.contact_y if landing is not None else None,
         landing_frame=landing.frame_idx if landing is not None else None,
         contact_frame=landing.contact_frame_idx if landing is not None else None,
         landing_predicted=landing.predicted if landing is not None else False,
