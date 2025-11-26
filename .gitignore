@@ -207,3 +207,14 @@ marimo/_lsp/
 __marimo__/
 *.pt
 runs/
+
+# Model weights - too large for GitHub
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.bin
+outputs/fused_student_model/
+outputs/lora_adapters/
+runs/
+yolov8n.pt
