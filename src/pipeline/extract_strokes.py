@@ -9,6 +9,7 @@ from src.spatial_logic.events import infer_event_from_trajectory
 from src.spatial_logic.landing_detector import BallState, extract_ball_track, infer_landing
 from src.spatial_logic.hitter_detector import HitterInfo, infer_hitter_for_stroke
 from src.spatial_logic.stroke_reasoner import FinalStroke, combine_classifier_and_event
+from src.spatial_logic.pose_features import extract_pose_features
 from src.tracking.player_track import PlayerState
 
 
@@ -31,6 +32,8 @@ class StrokeSummary:
     event_type: Optional[str] = None
     hitter_track_id: Optional[int] = None
     hitter_distance: Optional[float] = None
+    pose_landmarks: Optional[Dict] = None
+    pose_features: Optional[Dict] = None
 
 
 def build_homography_from_analysis(analysis_result: Any) -> Optional[CourtHomography]:
@@ -50,6 +53,7 @@ def summarise_strokes_from_analysis(
     classifier_labels: Optional[Sequence[str]] = None,
     hitter_distance_max: float = 200.0,
     enable_hitter_inference: bool = True,
+    pose_window: int = 3,
 ) -> List[StrokeSummary]:
     """
     High-level entry:
@@ -118,6 +122,33 @@ def summarise_strokes_from_analysis(
         if hitter_info:
             final.hitter_role = hitter_info.hitter_role
 
+    # Pose info at contact frame (if available on analysis_result)
+    def _find_nearest_pose(pose_results: Dict[int, Dict], contact_frame: int, window: int) -> Optional[Dict]:
+        best = None
+        best_dist = 1e9
+        for f_idx, pose in pose_results.items():
+            dist = abs(f_idx - contact_frame)
+            if dist <= window and dist < best_dist:
+                best_dist = dist
+                best = pose
+        return best
+
+    pose_landmarks = None
+    pose_features = None
+    contact_idx = landing.contact_frame_idx if landing is not None else None
+    pose_results = None
+    if hasattr(analysis_result, "pose_results"):
+        pose_results = getattr(analysis_result, "pose_results")
+    elif isinstance(analysis_result, dict):
+        pose_results = analysis_result.get("pose_results")
+    if pose_results and contact_idx is not None:
+        if contact_idx in pose_results:
+            pose_landmarks = pose_results[contact_idx]
+        else:
+            pose_landmarks = _find_nearest_pose(pose_results, contact_idx, pose_window)
+        if pose_landmarks is not None:
+            pose_features = extract_pose_features(pose_landmarks)
+
     summary = StrokeSummary(
         frame_range=(event.start_frame, event.end_frame),
         final_type=final.type,
@@ -136,6 +167,8 @@ def summarise_strokes_from_analysis(
         event_type=final.event_type,
         hitter_track_id=hitter_info.hitter_track_id if hitter_info else None,
         hitter_distance=hitter_info.distance if hitter_info else None,
+        pose_landmarks=pose_landmarks,
+        pose_features=pose_features,
     )
     return [summary]
 

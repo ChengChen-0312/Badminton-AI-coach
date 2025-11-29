@@ -32,3 +32,10 @@ visualization:
   enable_heatmap: true
   enable_timeline: true
   heatmap_bins: 32
+
+pose:
+  enable: true
+  backend: mediapipe
+  stride: 2      # 可调
+  window: 3      # contact 帧±3 帧内找最近 pose
+

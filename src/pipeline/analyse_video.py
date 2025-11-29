@@ -16,6 +16,7 @@ from src.tracking.player_track import PlayerState, PlayerTracker
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.detectors import PlayerDetector
+from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
 
 
 @dataclass
@@ -34,6 +35,7 @@ class AnalyseResult:
     frame_results: List[FrameResult]
     court_corners: Optional[List[List[float]]] = None
     player_tracks: Optional[List[PlayerState]] = None
+    pose_results: Optional[Dict[int, Dict]] = None
 
 
 def analyse_video(
@@ -47,6 +49,7 @@ def analyse_video(
     vision_cfg = cfg.get("vision", {})
     tracking_cfg = cfg.get("tracking", {})
     realtime_cfg = cfg.get("realtime", {})
+    pose_cfg = cfg.get("pose", {})
 
     detect_stride = tracking_cfg.get("detect_stride", 1)
     batch_size = realtime_cfg.get("batch_size", 1)
@@ -89,8 +92,22 @@ def analyse_video(
     identity_tracker = PlayerTracker(max_iou_mismatch=tracking_cfg.get("iou_thresh", 0.3))
     court_detector = CourtDetector() if use_court_roi else None
 
+    # Pose settings
+    enable_pose = pose_cfg.get("enable", False)
+    pose_stride = pose_cfg.get("stride", 2)
+    pose_backend = pose_cfg.get("backend", "mediapipe")
+    pose_estimator: PoseEstimator | None = None
+    if enable_pose:
+        try:
+            pose_estimator = PoseEstimator()  # currently only mediapipe backend
+        except Exception as exc:  # pragma: no cover
+            print(f"[WARN] PoseEstimator init failed: {exc}")
+            pose_estimator = None
+            enable_pose = False
+
     frame_idx = 0
     frame_results: List[FrameResult] = []
+    pose_results: Dict[int, Dict] = {}
 
     # optional ROI from first frame; also capture default full-frame corners
     court_roi = None
@@ -165,7 +182,7 @@ def analyse_video(
             if len(batch_frames) >= batch_size:
                 player_dets_batch = player_det.detect(batch_frames)
                 ball_dets_batch = ball_det.detect(batch_frames)
-                for fi, pdets, bdets in zip(batch_indices, player_dets_batch, ball_dets_batch):
+                for fi, pdets, bdets, fproc in zip(batch_indices, player_dets_batch, ball_dets_batch, batch_frames):
                     player_tracks = player_tracker.update(pdets, frame_idx=fi)
                     ball_state = ball_tracker.update(fi, bdets)
                     if ball_state is None:
@@ -192,6 +209,15 @@ def analyse_video(
                     # update identity tracker with current player boxes
                     identity_tracker.update(fi, [tuple(t.bbox) for t in player_tracks])
                     player_states = identity_tracker.get_players_at(fi)
+                    # Pose inference (sparse by stride)
+                    if enable_pose and pose_estimator is not None and (fi % pose_stride == 0):
+                        try:
+                            poses: List[PoseKeypoints] = pose_estimator.estimate(fproc)
+                            if poses:
+                                # store first person for now
+                                pose_results[fi] = {"points": poses[0].points.tolist()}
+                        except Exception as exc:  # pragma: no cover
+                            print(f"[WARN] Pose inference failed at frame {fi}: {exc}")
                     frame_results.append(
                         FrameResult(
                             frame_idx=fi,
@@ -228,6 +254,13 @@ def analyse_video(
             roles = assign_player_roles(player_tracks, frame_height=h)
             identity_tracker.update(frame_idx, [tuple(t.bbox) for t in player_tracks])
             player_states = identity_tracker.get_players_at(frame_idx)
+            if enable_pose and pose_estimator is not None and (frame_idx % pose_stride == 0):
+                try:
+                    poses: List[PoseKeypoints] = pose_estimator.estimate(frame_proc)
+                    if poses:
+                        pose_results[frame_idx] = {"points": poses[0].points.tolist()}
+                except Exception as exc:  # pragma: no cover
+                    print(f"[WARN] Pose inference failed at frame {frame_idx}: {exc}")
             frame_results.append(
                 FrameResult(
                     frame_idx=frame_idx,
@@ -287,4 +320,5 @@ def analyse_video(
         frame_results=frame_results,
         court_corners=court_corners if court_corners is not None else default_corners,
         player_tracks=identity_tracker.players,
+        pose_results=pose_results if enable_pose else None,
     )

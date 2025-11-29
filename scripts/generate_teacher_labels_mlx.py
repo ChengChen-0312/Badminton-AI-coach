@@ -30,10 +30,11 @@ if str(REPO_ROOT) not in sys.path:
 from src.pipeline.analyse_video import analyse_video
 from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
 from src.ai_score.action_feedback import ActionFeedback
+from src.spatial_logic.pose_quality import pose_features_to_prompt
 
 
 def build_prompt_from_summary(summary: dict) -> str:
-    """Convert a stroke summary into a coaching prompt."""
+    """Convert a stroke summary into a coaching prompt, including pose hints if available."""
     final_type = summary.get("final_type", "unknown")
     hitter_role = summary.get("hitter_role", "unknown")
     landing_region = summary.get("landing_region", "unknown")
@@ -41,6 +42,9 @@ def build_prompt_from_summary(summary: dict) -> str:
     frame_range = summary.get("frame_range", (0, 0))
     contact_frame = summary.get("contact_frame", None)
     landing_frame = summary.get("landing_frame", None)
+    pose_landmarks = summary.get("pose_landmarks")
+
+    pose_text = pose_features_to_prompt(pose_landmarks)
 
     prompt = f"""
 You are a professional badminton coach.
@@ -53,6 +57,9 @@ Stroke info:
 - Stroke frame range: {frame_range}
 - Contact frame (approx.): {contact_frame}
 - Landing frame (approx.): {landing_frame}
+
+Pose/biomechanics (if available):
+{pose_text}
 
 Tasks:
 1) Give an overall score from 0 to 100 for this stroke (higher = better technique).

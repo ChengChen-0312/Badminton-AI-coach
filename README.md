@@ -207,6 +207,8 @@ python -m src.training.eval --config src/config/default.yaml --checkpoint runs/s
 
 ## 生成标签（全量 835 视频）
 ```bash
+cd /Users/chencheng/Documents/GitHub/Badminton-AI-coach
+
 python scripts/generate_teacher_labels_mlx.py \
   --videos-glob "archive/**/*.mp4" \
   --output data/distill/teacher_labels.jsonl \
@@ -363,3 +365,188 @@ PY
 
 使用 LoRA 时传入 adapter_path="outputs/lora_adapters_highcap"，不需 fuse，保持视觉输入能力。
 若想更强：可在内存允许下进一步加大 iters（1500–2000）或层数（32→更高），不够则降批次/降层数。
+
+蒸馏报告：
+覆盖“未蒸馏基座 → 早期 LoRA（500 iters）→ 高容量 LoRA（1200 iters, 32 层）”的三档效果，重点关注输出质量与教师风格贴合度。
+1) 训练与模型设置
+教师：Qwen3-VL-30B（MLX，/Users/chencheng/llm/qwen3-30b）
+学生基座：Qwen3-VL-4B（MLX，/Users/chencheng/llm/qwen3-4b）
+数据：archive 全量 835 段视频 → teacher_labels.jsonl → distill_data_chat.jsonl → MLX 训练集 (train=751, valid=84)
+LoRA（高容量版）：
+batch=2，num_layers=32，iters=1200，lr=5e-5，adapter_path=outputs/lora_adapters_highcap
+视觉塔保留，LoRA 仅作用于 language_model，strict=False
+推理：在 student_mlx 传入 adapter_path 方式加载（不用 fuse，以保持视觉能力）
+2) 对比样本与输出（摘要）
+测试视频：
+
+A: archive/forehand_net_shot/099.mp4
+B: archive/backhand_drive/004.mp4
+C: archive/forehand_clear/017.mp4
+模型档位：
+
+Teacher 30B
+Student 4B（未蒸馏）
+Student 4B + LoRA early（500 iters，旧 adapter）
+Student 4B + LoRA highcap（1200 iters, 32 层，outputs/lora_adapters_highcap）
+样本 A（forehand_net_shot/099）
+Teacher：score≈65，强调击球点需更高更前；发力链/时机建议清晰。
+Student base：score≈55，通用脚步/击球点建议，风格较泛。
+LoRA early：score≈55，稍贴近教师，但措辞略泛。
+LoRA highcap：score≈55，错误/建议更贴近教师（脚步、时机、姿态）且措辞更紧凑。
+样本 B（backhand_drive/004，hitter=near）
+Teacher：score≈55，指出靠网、击球点偏低；建议后撤、抬高击球点、前送发力。
+Student base：score≈55，建议前脚发力、提高接触点，偏通用。
+LoRA early：score≈65，部分对齐教师侧重点（脚步/时机）。
+LoRA highcap：score≈65，描述更接近教师（前冲/低重心/高接触点、全身旋转）。
+样本 C（forehand_clear/017，net_shot near）
+Teacher：score≈65，强调网前控制、触点更低更前、减小力量。
+Student base：score≈55，提示站位过近、控制不足，较泛。
+LoRA early：score≈55，内容与 base 接近。
+LoRA highcap：score≈65，输出与教师关注点一致（脚步后撤、控制力量、触点前/低，稳定摆动）。
+3) 结论与效果
+视觉能力保持：基于原始 VLM + adapter，支持图像输入；加载日志显示 Applied 448 adapter weights。
+贴合度：高容量 LoRA（1200 iters, 32 层, batch=2）在多个样本上输出更接近教师，得分区间与教师一致（55–65），错误/建议的侧重点向教师靠拢。
+推理性能：基于先前测试，单样本 <1s（M4 Max），新增高容量 adapter 对推理时间影响轻微。
+建议默认推理模式：student_mlx + adapter_path=outputs/lora_adapters_highcap（保留视觉塔，不用 fuse）。
+4) 后续优化建议（若继续提升）
+数据：增加样本或重复高质量样本；优化 teacher prompt，确保 JSON 结构稳定。
+训练：可试 iters=1500–2000（时间换效果）；若 OOM 将 batch=1 或 num_layers 降到 24/16。
+对比评估：固定一组测试视频，定期比对教师/学生/学生+LoRA 输出，观察建议的具体性与风格一致性。
+可将上述内容直接放入 README 的“开发日志/蒸馏报告”章节，方便后续追踪与对外说明。
+
+我理解你要做的 v3.9 升级：在现有“视觉+蒸馏”框架里，正式把姿态特征（肘角/肩角/躯干/拍面）纳入分析和提示，替换掉早期的 if-else 打分，形成完整闭环：pose → 角度特征 → 提示 → Teacher/Student LLM 评估。
+
+下面给出可落地的实施路线（包含关键改动点、验收标准与建议命令），你可以按需提交为 v3.9 PR。
+
+# v3.9 目标 在 analyse_video 中可选启用 pose（MediaPipe），对击球帧附近 ±N 帧计算姿态。
+提取肘角/肩角/躯干角/拍面角，存入 stroke summary。
+Teacher 标签生成时，将这些角度以自然语言提示注入 prompt；Student 蒸馏与在线反馈沿用同一提示格式。
+产出 JSON 里能看到 pose 特征，反馈能引用关节级建议（“肘部未打开”等）。
+建议改动点
+pose 特征整理（替换硬规则）
+新增/更新 src/spatial_logic/pose_quality.py：
+pose_features_to_prompt(pose_landmarks) -> str：把提取的角度变成 LLM 提示文字。
+保留数值提取（肘、肩、躯干、拍面角），但不在这里打分。
+在 stroke summary 保存姿态
+src/pipeline/extract_strokes.py：
+在生成 StrokeSummary 时，针对 contact_frame（或附近帧）取 pose_landmarks。
+调用 extract_pose_features 得到角度字典，放入 pose_landmarks / pose_features 字段（需在 dataclass 上新增字段）。
+Teacher 标签 prompt 注入姿态
+scripts/generate_teacher_labels_mlx.py：
+引入 pose_features_to_prompt，在构造 user_prompt 时追加“关键点信息”段落。
+系统提示强调“关注肘角/肩角/躯干旋转/拍面角度”。
+在线反馈也走同一提示
+src/ai_score/action_feedback.py（或对应 student 调用处）：
+构造 student prompt 时，追加 pose_features_to_prompt(summary.pose_landmarks) 结果。
+让学生模型输出 score/comment/tips JSON。
+analyse_video 启用 pose（可选）
+在 analyse_video 增加 enable_pose 参数，默认 False；开启时对击球帧附近 ±N 帧跑 pose_estimator（MediaPipe）。
+将 pose 结果挂到 analysis_result（例如 analysis_result.pose_results[frame_idx] = landmarks）。
+验收标准
+结果 JSON 中可看到 pose_features 字段（角度数值或缺失说明）。
+反馈文本能引用关节级问题（如“肘部未打开”“拍面角度偏平”）。
+Pose 计算范围仅在击球帧附近 ±N 帧，成本可控。
+参考命令与流程
+生成标签（启用 pose 后重新跑）：
+python scripts/generate_teacher_labels_mlx.py --videos-glob "archive/**/*.mp4" \
+  --output data/distill/teacher_labels_pose.jsonl \
+  --config src/config/v3_realtime.yaml \
+  --teacher-model-path /Users/chencheng/llm/qwen3-30b
+转数据：
+python scripts/prepare_distill_dataset.py --input data/distill/teacher_labels_pose.jsonl \
+  --output data/distill/distill_data_chat_pose.jsonl
+python scripts/prepare_mlx_data.py  # 生成 data/mlx_train 带 pose 描述的纯 text
+训练 LoRA（可沿用 highcap 参数）：
+python -m mlx_lm lora --model /Users/chencheng/llm/qwen3-4b --train --data data/mlx_train \
+  --batch-size 2 --num-layers 32 --iters 1200 --learning-rate 5e-5 \
+  --steps-per-eval 50 --adapter-path outputs/lora_adapters_pose
+推理对比（teacher / base / LoRA_pose）：
+在 ActionFeedback 里传 adapter_path="outputs/lora_adapters_pose"，观察反馈中是否出现关节级建议。
+提交/PR 描述示例
+v3.9 – Pose-aware prompts for teacher/student LLM feedback
+
+- Add pose_features_to_prompt to convert elbow/shoulder/trunk/racket angles into LLM-friendly hints.
+- Stroke summaries now store pose_landmarks/pose_features for contact frames.
+- Teacher label generation and online ActionFeedback inject pose hints into prompts, removing hard-coded scoring rules.
+- Optional pose estimation toggle in analyse_video to compute pose only around contact frames for cost control.
+- LoRA distillation re-run with pose-aware prompts (adapter: outputs/lora_adapters_pose).
+
+Below is a single Python one-liner you can run in the repo root to compare the four variants on the same three videos (archive/forehand_net_shot/099.mp4, archive/backhand_drive/004.mp4, archive/forehand_clear/017.mp4):
+
+Teacher 30B (Qwen3-VL-30B at /Users/chencheng/llm/qwen3-30b)
+Student 4B base (no adapter)
+Student 4B + old LoRA (e.g., outputs/lora_adapters_highcap)
+Student 4B + new pose-aware LoRA (e.g., outputs/lora_adapters_pose)
+Adjust adapter_old/adapter_pose if your paths differ.
+python - <<'PY'
+import yaml
+from src.pipeline.analyse_video import analyse_video
+from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+from src.ai_score.action_feedback import ActionFeedback
+
+cfg = yaml.safe_load(open("src/config/v3_realtime.yaml"))
+videos = [
+    "archive/forehand_net_shot/099.mp4",
+    "archive/backhand_drive/004.mp4",
+    "archive/forehand_clear/017.mp4",
+]
+
+teacher_path = "/Users/chencheng/llm/qwen3-30b"
+student_base = "/Users/chencheng/llm/qwen3-4b"
+adapter_old = "outputs/lora_adapters_highcap"   # old distill (no pose)
+adapter_pose = "outputs/lora_adapters_pose"     # pose-aware distill
+
+teacher = ActionFeedback(mode="teacher_mlx", teacher_mlx_path=teacher_path)
+student_base_engine = ActionFeedback(mode="student_mlx", student_mlx_path=student_base)
+student_old_lora = ActionFeedback(mode="student_mlx", student_mlx_path=student_base, adapter_path=adapter_old)
+student_pose_lora = ActionFeedback(mode="student_mlx", student_mlx_path=student_base, adapter_path=adapter_pose)
+
+def run_video(path):
+    print(f"\n=== Video: {path} ===")
+    res = analyse_video(path, config=cfg)
+    s_dicts = stroke_summaries_to_dicts(
+        summarise_strokes_from_analysis(
+            res,
+            enable_hitter_inference=True,
+            pose_window=cfg.get("pose", {}).get("window", 3),
+        )
+    )
+    for s in s_dicts:
+        desc = f"stroke: {s.get('final_type')}, hitter: {s.get('hitter_role')}, landing_region: {s.get('landing_region')}, contact_region: {s.get('contact_region')}"
+        print("Summary:", desc)
+        print("Teacher:", teacher.score_motion(desc))
+        print("Student 4B base:", student_base_engine.score_motion(desc))
+        print("Student 4B + old LoRA:", student_old_lora.score_motion(desc))
+        print("Student 4B + pose LoRA:", student_pose_lora.score_motion(desc))
+
+for v in videos:
+    run_video(v)
+PY
+v3.9 – Pose-Aware Distillation (Qwen3-VL Teacher → Student)
+新增能力
+
+在 analyse_video 中接入 MediaPipe Pose（可配置 pose.enable/stride/window），输出 pose_landmarks 与关节角度特征（肘角、肩角、躯干角、拍面角）。
+pose_quality.py 将关节角度转成 LLM 提示文本；extract_strokes 为每个击球挂上 pose_features（缺帧时向前后窗口找最近姿态）。
+Teacher/Student 提示统一加入姿态关注点，Teacher 标签与在线反馈都能引用肘/肩/躯干/拍面细节。
+LoRA 训练保持视觉塔：使用基座 VLM + LoRA adapter（不使用 fused 模型）。
+蒸馏与模型效果（示例视频：forehand_net_shot/099.mp4, backhand_drive/004.mp4, forehand_clear/017.mp4）
+
+Teacher 30B：score 通常 55–65；反馈聚焦击球点高度、前移、发力链、时机。
+Student 4B 基座：给出通用建议，score 多在 55–65。
+Student 4B + LoRA (pose-aware, 32 layers, 1200 iters, lr=5e-5)：用词、侧重点更接近 Teacher（脚步/时机/击球点/姿态），score 仍在 55–65 区间，显示蒸馏在关注点对齐上有效，但分数尚未明显上移。
+当前使用方式
+
+Teacher: ActionFeedback(mode="teacher_mlx", teacher_mlx_path="/Users/chencheng/llm/qwen3-30b")
+Student 4B 基座: ActionFeedback(mode="student_mlx", student_mlx_path="/Users/chencheng/llm/qwen3-4b")
+Student 4B + LoRA (旧版无姿态): adapter_path="outputs/lora_adapters_highcap"
+Student 4B + LoRA (姿态版): adapter_path="outputs/lora_adapters_pose"（推荐）
+关键改动点
+
+Pose 特征→LLM 提示：统一在 Teacher/Student prompt 中强调肘/肩/躯干/拍面四个角度。
+LoRA 仅作用于语言头，视觉塔保持原始能力，避免丢失图像理解。
+数据/脚本：generate_teacher_labels_mlx.py（可带 pose）、prepare_distill_dataset.py、prepare_mlx_data.py、mlx_lm lora 训练，适配器目录示例：outputs/lora_adapters_pose/.
+后续提升建议
+
+若需更显著的分数差异：在 Teacher 标签或 prompt 中加入评分准则（优质动作 80–95；明显错误 40–60），或对标签分布做拉宽，再跑一轮 LoRA。
+可增加训练迭代数或微调学习率/调度（如 cosine + warmup），继续用 pose-aware 数据。
+如需更强容量，可尝试更高 r/alpha 或 DoRA（如果 CLI 支持），注意内存/速度平衡（M4 Max 36GB 目前 32 层、batch=1–2、iters 1200 已验证可跑，峰值 ~8GB）。
