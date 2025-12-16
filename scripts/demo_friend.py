@@ -410,7 +410,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-heatmap", action="store_true", help="Disable heatmap image.")
     p.add_argument("--no-timeline", action="store_true", help="Disable timeline image.")
     p.add_argument("--no-court-debug", action="store_true", help="Disable saving a court detection debug image.")
-    p.add_argument("--court-debug-frame", type=int, default=0, help="Frame index used for court debug image.")
+    p.add_argument(
+        "--court-debug-frame",
+        type=int,
+        default=None,
+        help="Frame index used for court debug image (default: use the detection frame if available).",
+    )
 
     p.add_argument(
         "--pose",
@@ -563,7 +568,14 @@ def main() -> None:
     court_debug_path: Optional[Path] = None
     if not args.no_court_debug:
         try:
-            frame_bgr = _read_video_frame_bgr(video_path, frame_idx=int(args.court_debug_frame))
+            det = getattr(analysis, "court_detection", None)
+            det_frame_idx = det.get("frame_idx") if isinstance(det, dict) else None
+            debug_frame_idx = (
+                int(args.court_debug_frame)
+                if args.court_debug_frame is not None
+                else int(det_frame_idx) if det_frame_idx is not None else 0
+            )
+            frame_bgr = _read_video_frame_bgr(video_path, frame_idx=debug_frame_idx)
             if frame_bgr is None:
                 print("[WARN] Court debug image skipped (failed to read frame).")
             else:
@@ -573,7 +585,6 @@ def main() -> None:
                     if isinstance(getattr(analysis, "court_corners", None), list) and len(analysis.court_corners) == 4
                     else []
                 )
-                det = getattr(analysis, "court_detection", None)
                 if isinstance(det, dict):
                     src = det.get("source", "unknown")
                     conf = det.get("confidence", None)
