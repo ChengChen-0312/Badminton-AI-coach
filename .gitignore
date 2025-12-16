@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# macOS
+.DS_Store
+
 # C extensions
 *.so
 
@@ -207,6 +210,14 @@ marimo/_lsp/
 __marimo__/
 *.pt
 runs/
+
+# Local artifacts / demos
+reports/
+outputs/_tmp*/
+outputs/_tmp_*/
+archive/**/*.mp4
+archive/**/*.mov
+archive/**/*.mkv
 
 # Model weights - too large for GitHub
 *.pt
