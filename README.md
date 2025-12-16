@@ -4,7 +4,7 @@ End-to-end badminton analytics and coaching system. Includes stroke classificati
 
 ## Project Layout
 - `src/data`, `src/models`, `src/training`, `src/config`: stroke-classification stack.
-- `src/vision` **(finished)**: YOLO-based detection (Ultralytics YOLOv8), ball detector with class filtering, optional MediaPipe pose, simple court detector (Canny+Hough fallback).
+- `src/vision` **(finished)**: YOLO-based detection (Ultralytics YOLOv8), ball detector with class filtering, optional MediaPipe pose, court corner detection (white-line segmentation + geometry) with optional manual calibration.
 - `src/tracking` **(finished)**: ByteTrack-style multi-object tracker, single-ball tracker with smoothing, role assignment (near/far) heuristics.
 - `src/geometry` **(finished)**: homography, coordinate mapping, region definitions, metrics.
 - `src/spatial_logic` **(finished)**: relations, events (velocity-drop hit detector), temporal smoothing/segment slicing, stroke_reasoner (zone→stroke heuristic).
@@ -57,8 +57,7 @@ output:
 - `src/pipeline/extract_strokes.py`: turn `analyse_video` outputs into stroke summaries (frame range, type, landing region) for reporting.
 
 ### v3.4 – Hitter Identity (Who Hits the Shuttle?)
-- `src/tracking/player_track.py`: maintains two long-lived player tracks, assigns near/far roles via IoU + vertical position.
-- `src/pipeline/analyse_video.py`: integrates PlayerTracker so each FrameResult carries player_states; AnalyseResult exposes player_tracks.
+- `src/pipeline/analyse_video.py`: emits per-frame player tracks and `player_states` (on-court filtered); assigns near/far roles (homography-based when available).
 - `src/spatial_logic/hitter_detector.py`: picks the closest player to the ball at contact_frame (role + track_id + distance).
 - `src/pipeline/extract_strokes.py`: stroke summaries now include `hitter_track_id` and `hitter_distance`, combining classifier label, event type, hitter, and landing info.
 
@@ -103,6 +102,9 @@ python -m src.training.eval --config src/config/default.yaml --checkpoint runs/s
 ## Notes
 - Court-focus: set `data.focus_court: far` to prioritize far-side player.
 - x3d backbones need newer torchvision; if unavailable, code falls back to `r3d_34`.
+- Videos in `archive/` are treated as local data and are typically not tracked by git; pass `--video path/to/video.mp4` when running demos.
+- Court calibration: heatmaps/regions depend on homography; for stability set `vision.court_corners` (LB, RB, RT, LT) via `python scripts/calibrate_court_corners.py --video <path> --print-yaml`.
+- `landing_predicted=true` points are treated as predictions (excluded from landing heatmap density, shown as separate markers).
 - Vision/tracking/geometry/pipeline files are scaffolds for code agents to fill with real models and logic.
 
 # 开发日志 / 操作手册（v1.0 → v3.7）
@@ -163,6 +165,9 @@ python -m src.training.eval --config src/config/default.yaml --checkpoint runs/s
 
 ## v3.3 – 报告与可视化
 - 改动：report_generator Markdown/JSON/CSV + tactical summary；heatmap 绿色底白线红点，无方框；timeline 角色散点；visualization 开关。
+- 场地标定（重要）：heatmap/区域分类依赖 homography。如果自动场地角点检测在多场地/遮挡场景下不稳定，建议在配置里手动提供角点：
+  - `vision.court_corners`: 4 个点，顺序 **LB, RB, RT, LT**（外侧双打边界）
+  - 交互式标定脚本：`python scripts/calibrate_court_corners.py --video <path> --print-yaml`
 - 验证：
   ```bash
   python - <<'PY'

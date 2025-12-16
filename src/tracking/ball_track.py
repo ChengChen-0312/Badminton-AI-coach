@@ -16,6 +16,7 @@ class BallTrackState:
     score: float
     cx: float
     cy: float
+    predicted: bool = False
 
 
 class SingleBallTracker:
@@ -83,6 +84,7 @@ class SingleBallTracker:
             score=best_det.score,
             cx=cx,
             cy=cy,
+            predicted=False,
         )
 
     def predict_only(self) -> Optional[BallTrackState]:
@@ -96,4 +98,11 @@ class SingleBallTracker:
             return None
         cx = float((self.prev_bbox[0] + self.prev_bbox[2]) / 2.0)
         cy = float((self.prev_bbox[1] + self.prev_bbox[3]) / 2.0)
-        return BallTrackState(frame_idx=-1, bbox=self.prev_bbox, score=self.prev_score, cx=cx, cy=cy)
+        return BallTrackState(
+            frame_idx=-1,
+            bbox=self.prev_bbox,
+            score=self.prev_score,
+            cx=cx,
+            cy=cy,
+            predicted=True,
+        )

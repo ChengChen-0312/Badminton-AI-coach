@@ -19,6 +19,8 @@ class StrokeSummary:
     final_type: str
     confidence: float
     hitter_role: Optional[str] = None
+    hitter_x: Optional[float] = None
+    hitter_y: Optional[float] = None
     landing_region: Optional[str] = None
     landing_x: Optional[float] = None
     landing_y: Optional[float] = None
@@ -85,12 +87,13 @@ def summarise_strokes_from_analysis(
     final: FinalStroke = combine_classifier_and_event(clf_label, event)
 
     hitter_info: Optional[HitterInfo] = None
+    hitter_xy: tuple[float, float] | None = None
     if enable_hitter_inference and landing is not None and landing.contact_frame_idx is not None:
         # find players at contact frame
         players_at_contact: List[PlayerState] = []
         if frame_results:
             for fr in frame_results:
-                idx = getattr(fr, "frame_idx", None) or (fr.get("frame_idx") if isinstance(fr, dict) else None)
+                idx = getattr(fr, "frame_idx", None) if hasattr(fr, "frame_idx") else (fr.get("frame_idx") if isinstance(fr, dict) else None)
                 if idx == landing.contact_frame_idx:
                     ps = getattr(fr, "player_states", None) or (fr.get("player_states") if isinstance(fr, dict) else None)
                     if ps:
@@ -111,8 +114,10 @@ def summarise_strokes_from_analysis(
             hitter = next((p for p in players_at_contact if p.track_id == hitter_info.hitter_track_id), None)
             if hitter and hitter.bboxes:
                 hb = hitter.bboxes[-1]
-                hx, hy = (hb[0] + hb[2]) / 2.0, (hb[1] + hb[3]) / 2.0
-                hx_c, hy_c = H.to_court((hx, hy))
+                # Use bottom-center (foot point) as a better proxy for on-court hitter position.
+                hx_img, hy_img = (hb[0] + hb[2]) / 2.0, hb[3]
+                hx_c, hy_c = H.to_court((hx_img, hy_img))
+                hitter_xy = (float(hx_c), float(hy_c))
                 if hasattr(regions, "classify_region"):
                     hitter_region = regions.classify_region(hx_c, hy_c)
                 else:
@@ -154,6 +159,8 @@ def summarise_strokes_from_analysis(
         final_type=final.type,
         confidence=final.confidence,
         hitter_role=final.hitter_role,
+        hitter_x=hitter_xy[0] if hitter_xy is not None else None,
+        hitter_y=hitter_xy[1] if hitter_xy is not None else None,
         landing_region=final.landing_region,
         landing_x=landing.court_x if landing is not None else None,
         landing_y=landing.court_y if landing is not None else None,

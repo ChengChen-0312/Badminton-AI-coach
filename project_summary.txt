@@ -1,0 +1,46 @@
+Badminton AI Coach 项目总结（截至 v3.7）
+---------------------------------------
+
+项目概览
+- 端到端羽毛球视频分析与教练系统：检测/追踪/几何 → 空间事件推理 → 击球者身份 → 报告与可视化 → LLM 动作反馈与蒸馏。
+- 目录结构：src/vision（YOLOv8 检测、球/场地/可选姿态），src/tracking（ByteTrack 球员 + 单球追踪），src/geometry（单应映射、区域划分），src/spatial_logic
+（落点估计、事件/击球类型推理），src/pipeline（analyse_video、extract_strokes、render/report），scripts/*（训练、蒸馏、性能/分析脚本），archive/（按类别的视频数据）。
+
+已完成的核心能力
+- 视觉/追踪：YOLOv8 封装（players/ball），可选场地 ROI，简化 ByteTrack 多目标 + 单球平滑追踪，near/far 角色分配，稳定的 player_track（跨帧身份保持）。
+- 空间逻辑：落点估计 + 前/中/后场区域分类；启发式事件（clear/lift/net_shot/drive/smash）；stroke_reasoner 融合分类标签与事件。
+- 击球者身份：最近球-人距离决定 hitter_role + track_id，写入 stroke summary。
+- 报告/可视化：extract_strokes 生成击球摘要（类型、角色、落点/触点帧）；report_generator 输出 Markdown/JSON/CSV，并生成落点热力图 + 时间轴；tactical_stats 给出进攻/防守/中性阶段与 control index。
+- 训练与配置：视频分类管线（resnet18/50、mc3_18、r3d_18/34、x3d_s/m），统一/随机/跨步采样，强/弱增强，class weight + weighted sampler，Cosine/OneCycle 调度，AMP、早停；配置 default.yaml、v2_highcap.yaml、v3_realtime.yaml 等。
+- 性能与实时：detect_stride 批量检测 + 关键帧策略，YOLO batch 推理、ROI 裁剪，MPS/macOS 兼容设置。
+- LLM 动作反馈与蒸馏（MLX）：ActionFeedback 支持 teacher_mlx（Qwen3-VL-30B）和 student_mlx（Qwen3-VL-4B）；generate_teacher_labels_mlx.py → distill 数据；prepare_distill_dataset.py / prepare_mlx_data.py → MLX 训练集；mlx_lm lora 训练/融合，adapter 见 outputs/*。
+- 说明：当前 demo 的击球类型默认来自空间逻辑启发式（classifier_label 为空时），并非已训练的挥拍分类模型直接输出；如需融合分类器结果，需要在调用 summarise_strokes_from_analysis 时传入 classifier_labels。
+
+关键脚本与入口
+- 训练：python scripts/train_strokes_v2.py --config src/config/default.yaml
+- 蒸馏标签：python scripts/generate_teacher_labels_mlx.py --videos-glob "archive/**/*.mp4" --output data/distill/teacher_labels.jsonl --config src/config/v3_realtime.yaml --teacher-model-path /Users/chencheng/llm/qwen3-30b
+- 数据转换：python scripts/prepare_distill_dataset.py --input data/distill/teacher_labels.jsonl --output data/distill/distill_data_chat.jsonl；python scripts/prepare_mlx_data.py
+- 性能测试：python scripts/test_realtime_fps.py
+
+快速演示（给朋友看的 1 分钟 Demo）
+1) 安装依赖（若未装）：pip install -r requirements.txt
+2) 运行一键演示脚本（默认会从 archive/ 里选一个小视频并生成报告）：
+   # 先进入项目根目录（包含 README.md 的那个目录），例如：
+   cd /Users/chencheng/Documents/GitHub/Badminton-AI-coach
+   python scripts/demo_friend.py
+   # 若提示 "[INFO] mediapipe not found"，不影响 demo；需要姿态特征可先安装：pip install mediapipe
+   # 默认会跑 3 个 LLM 对比：Teacher 30B vs Student 4B base vs Student 4B + LoRA pose
+   # 可选：跑更多对比（all = base + early + highcap + pose + teacher）
+   # python scripts/demo_friend.py --llm-variants all
+   # 可选：关闭 LLM（只跑检测/追踪/报告）
+   # python scripts/demo_friend.py --no-llm
+   # 可选：指定视频/输出目录
+   # python scripts/demo_friend.py --video archive/backhand_drive/004.mp4 --out-dir reports/demo_friend2
+3) 产物：
+   - reports/demo_friend/demo_friend_report.{md,json,csv}
+   - reports/demo_friend/demo_friend_heatmap.png / reports/demo_friend/demo_friend_timeline.png
+   - reports/demo_friend/demo_friend_llm_compare.json（3 个模型的 JSON 输出与 score 对比）
+
+补充：场地标定（影响 heatmap/击球点区域）
+- 如果自动场地角点检测在多场地/遮挡场景下不稳定，可在配置里手动提供 `vision.court_corners`（顺序：LB, RB, RT, LT）。
+- 交互式标定脚本：`python scripts/calibrate_court_corners.py --video <path> --print-yaml`

@@ -74,11 +74,16 @@ class YoloDetector:
             imgsz=self.imgsz,
         )
 
+        # Ultralytics returns a list[Results] for both single-frame and batch inputs.
+        if isinstance(results, list):
+            results_list = results
+        else:
+            results_list = [results]
         if not is_batch:
-            results = [results]
+            results_list = results_list[:1]
 
         all_dets: List[List[Detection]] = []
-        for res in results:
+        for res in results_list:
             dets: List[Detection] = []
             if res.boxes is None:
                 all_dets.append(dets)

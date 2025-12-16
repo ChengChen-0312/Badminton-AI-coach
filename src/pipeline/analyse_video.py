@@ -11,8 +11,7 @@ import numpy as np
 
 from src.tracking.ball_track import BallTrackState, SingleBallTracker
 from src.tracking.bytetrack import SimpleByteTrack, Track
-from src.tracking.id_assign import assign_player_roles
-from src.tracking.player_track import PlayerState, PlayerTracker
+from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.detectors import PlayerDetector
@@ -60,6 +59,12 @@ def analyse_video(
     use_court_roi = vision_cfg.get("use_court_roi", False)
     court_margin = vision_cfg.get("court_roi_margin", 0.0)
     court_corners: Optional[List[List[float]]] = None
+    manual_corners = vision_cfg.get("court_corners")
+    if isinstance(manual_corners, (list, tuple)) and len(manual_corners) == 4:
+        try:
+            court_corners = [[float(x), float(y)] for x, y in manual_corners]  # type: ignore[misc]
+        except Exception:
+            court_corners = None
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -89,8 +94,8 @@ def analyse_video(
         ema_alpha=0.6,
         max_age=tracking_cfg.get("ball_max_age", 5),
     )
-    identity_tracker = PlayerTracker(max_iou_mismatch=tracking_cfg.get("iou_thresh", 0.3))
-    court_detector = CourtDetector() if use_court_roi else None
+    detect_court_corners = bool(vision_cfg.get("detect_court_corners", True))
+    court_detector = CourtDetector() if (detect_court_corners or use_court_roi) else None
 
     # Pose settings
     enable_pose = pose_cfg.get("enable", False)
@@ -109,57 +114,99 @@ def analyse_video(
     frame_results: List[FrameResult] = []
     pose_results: Dict[int, Dict] = {}
 
-    # optional ROI from first frame; also capture default full-frame corners
+    # Court corners / ROI from the first frame.
     court_roi = None
     default_corners = None
-    if use_court_roi:
-        ok, first_bgr = cap.read()
-        if ok:
-            h0, w0 = first_bgr.shape[:2]
-            first_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
-            # Default full-frame corners: LB, RB, RT, LT
-            default_corners = [
-                [0.0, float(h0 - 1)],
-                [float(w0 - 1), float(h0 - 1)],
-                [float(w0 - 1), 0.0],
-                [0.0, 0.0],
-            ]
-            if court_detector is not None:
-                lines = court_detector.detect_court(first_rgb)
-                if lines is not None and lines.corners is not None:
-                    court_corners = lines.corners.tolist()
-                    xs = lines.corners[:, 0]
-                    ys = lines.corners[:, 1]
-                    x1 = max(0, int(xs.min() * (1 - court_margin)))
-                    y1 = max(0, int(ys.min() * (1 - court_margin)))
-                    x2 = min(w0, int(xs.max() * (1 + court_margin)))
-                    y2 = min(h0, int(ys.max() * (1 + court_margin)))
-                    court_roi = (x1, y1, x2, y2)
-            if court_roi is None:
-                x1 = int(w0 * court_margin)
-                y1 = int(h0 * court_margin)
-                x2 = int(w0 * (1 - court_margin))
-                y2 = int(h0 * (1 - court_margin))
+    ok, first_bgr = cap.read()
+    if ok:
+        h0, w0 = first_bgr.shape[:2]
+        first_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
+        # Default full-frame corners: LB, RB, RT, LT
+        default_corners = [
+            [0.0, float(h0 - 1)],
+            [float(w0 - 1), float(h0 - 1)],
+            [float(w0 - 1), 0.0],
+            [0.0, 0.0],
+        ]
+
+        if court_corners is None and court_detector is not None:
+            lines = court_detector.detect_court(first_rgb)
+            if lines is not None and lines.corners is not None:
+                court_corners = lines.corners.tolist()
+
+        if court_corners is not None and use_court_roi:
+            xs = np.array([p[0] for p in court_corners], dtype=np.float32)
+            ys = np.array([p[1] for p in court_corners], dtype=np.float32)
+            pad_x = float(w0) * float(court_margin)
+            pad_y = float(h0) * float(court_margin)
+            x1 = max(0, int(round(float(xs.min() - pad_x))))
+            y1 = max(0, int(round(float(ys.min() - pad_y))))
+            x2 = min(w0, int(round(float(xs.max() + pad_x))))
+            y2 = min(h0, int(round(float(ys.max() + pad_y))))
+            if x2 > x1 and y2 > y1:
                 court_roi = (x1, y1, x2, y2)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    else:
-        # No ROI, use full-frame corners for downstream homography if needed
-        cap_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        ok, first_bgr = cap.read()
-        if ok:
-            h0, w0 = first_bgr.shape[:2]
-            default_corners = [
-                [0.0, float(h0 - 1)],
-                [float(w0 - 1), float(h0 - 1)],
-                [float(w0 - 1), 0.0],
-                [0.0, 0.0],
-            ]
-        if cap_pos is not None:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, cap_pos)
+
+        if use_court_roi and court_roi is None:
+            x1 = int(round(w0 * float(court_margin)))
+            y1 = int(round(h0 * float(court_margin)))
+            x2 = int(round(w0 * (1.0 - float(court_margin))))
+            y2 = int(round(h0 * (1.0 - float(court_margin))))
+            if x2 > x1 and y2 > y1:
+                court_roi = (x1, y1, x2, y2)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     batch_frames: list[np.ndarray] = []
     batch_indices: list[int] = []
     last_ball_state: BallTrackState | None = None
+    roi_dx = int(court_roi[0]) if court_roi is not None else 0
+    roi_dy = int(court_roi[1]) if court_roi is not None else 0
+    court_poly = None
+    poly_src = court_corners if (court_corners is not None and len(court_corners) == 4) else default_corners
+    if poly_src is not None and len(poly_src) == 4:
+        court_poly = np.array(poly_src, dtype=np.float32).reshape(-1, 1, 2)
+
+    court_h = None
+    court_half_len = None
+    if poly_src is not None and len(poly_src) == 4:
+        try:
+            from src.geometry.homography import COURT_LENGTH_M, CourtHomography
+
+            court_h = CourtHomography.from_corners(poly_src)
+            court_half_len = float(COURT_LENGTH_M) / 2.0
+        except Exception:
+            court_h = None
+            court_half_len = None
+
+    def _filter_player_detections_to_court(dets: list, min_keep: int = 1):
+        if court_poly is None or not dets:
+            return dets
+        kept = []
+        for det in dets:
+            x1, y1, x2, y2 = det.bbox
+            px = float((x1 + x2) / 2.0)
+            py = float(y2)  # bottom-center is a better proxy for "on court"
+            if cv2.pointPolygonTest(court_poly, (px, py), False) >= 0:
+                kept.append(det)
+        # If filtering removes everything (e.g., failed court detection), keep original.
+        return kept if len(kept) >= min_keep else dets
+
+    def _roles_for_tracks(tracks: List[Track]) -> Dict[int, str]:
+        if not tracks:
+            return {}
+
+        if court_h is not None and court_half_len is not None:
+            roles: Dict[int, str] = {}
+            for tr in tracks:
+                x1, y1, x2, y2 = [float(v) for v in tr.bbox]
+                foot = ((x1 + x2) / 2.0, y2)
+                _, cy = court_h.to_court(foot)
+                roles[tr.track_id] = "near" if float(cy) < court_half_len else "far"
+            return roles
+
+        centers = [(tr.track_id, float((tr.bbox[1] + tr.bbox[3]) / 2.0)) for tr in tracks]
+        thresh = float(np.median([c for _, c in centers]))
+        return {tid: ("near" if cy >= thresh else "far") for tid, cy in centers}
 
     while True:
         ok, frame_bgr = cap.read()
@@ -181,8 +228,15 @@ def analyse_video(
 
             if len(batch_frames) >= batch_size:
                 player_dets_batch = player_det.detect(batch_frames)
-                ball_dets_batch = ball_det.detect(batch_frames)
+                exclude_bboxes_batch = [[d.bbox for d in pdets] for pdets in player_dets_batch]
+                ball_dets_batch = ball_det.detect(batch_frames, exclude_bboxes_batch=exclude_bboxes_batch)
                 for fi, pdets, bdets, fproc in zip(batch_indices, player_dets_batch, ball_dets_batch, batch_frames):
+                    if roi_dx != 0 or roi_dy != 0:
+                        for det in pdets:
+                            det.bbox = det.bbox + np.array([roi_dx, roi_dy, roi_dx, roi_dy], dtype=float)
+                        for det in bdets:
+                            det.bbox = det.bbox + np.array([roi_dx, roi_dy, roi_dx, roi_dy], dtype=float)
+                    pdets = _filter_player_detections_to_court(pdets)
                     player_tracks = player_tracker.update(pdets, frame_idx=fi)
                     ball_state = ball_tracker.update(fi, bdets)
                     if ball_state is None:
@@ -194,6 +248,7 @@ def analyse_video(
                                 score=pred.score,
                                 cx=pred.cx,
                                 cy=pred.cy,
+                                predicted=True,
                             )
                     if ball_state is None and last_ball_state is not None:
                         ball_state = BallTrackState(
@@ -202,20 +257,31 @@ def analyse_video(
                             score=last_ball_state.score,
                             cx=last_ball_state.cx,
                             cy=last_ball_state.cy,
+                            predicted=True,
                         )
                     if ball_state is not None:
                         last_ball_state = ball_state
-                    roles = assign_player_roles(player_tracks, frame_height=h)
-                    # update identity tracker with current player boxes
-                    identity_tracker.update(fi, [tuple(t.bbox) for t in player_tracks])
-                    player_states = identity_tracker.get_players_at(fi)
+                    roles = _roles_for_tracks(player_tracks)
+                    player_states = [
+                        PlayerState(
+                            track_id=tr.track_id,
+                            role=roles.get(tr.track_id, "unknown"),
+                            bboxes=[tuple(float(v) for v in tr.bbox)],
+                            frames=[int(fi)],
+                        )
+                        for tr in player_tracks
+                    ]
                     # Pose inference (sparse by stride)
                     if enable_pose and pose_estimator is not None and (fi % pose_stride == 0):
                         try:
                             poses: List[PoseKeypoints] = pose_estimator.estimate(fproc)
                             if poses:
                                 # store first person for now
-                                pose_results[fi] = {"points": poses[0].points.tolist()}
+                                pts = poses[0].points.copy()
+                                if roi_dx != 0 or roi_dy != 0:
+                                    pts[:, 0] += float(roi_dx)
+                                    pts[:, 1] += float(roi_dy)
+                                pose_results[fi] = {"points": pts.tolist()}
                         except Exception as exc:  # pragma: no cover
                             print(f"[WARN] Pose inference failed at frame {fi}: {exc}")
                     frame_results.append(
@@ -240,6 +306,7 @@ def analyse_video(
                     score=pred.score,
                     cx=pred.cx,
                     cy=pred.cy,
+                    predicted=True,
                 )
             elif last_ball_state is not None:
                 ball_state = BallTrackState(
@@ -248,17 +315,29 @@ def analyse_video(
                     score=last_ball_state.score,
                     cx=last_ball_state.cx,
                     cy=last_ball_state.cy,
+                    predicted=True,
                 )
             if ball_state is not None:
                 last_ball_state = ball_state
-            roles = assign_player_roles(player_tracks, frame_height=h)
-            identity_tracker.update(frame_idx, [tuple(t.bbox) for t in player_tracks])
-            player_states = identity_tracker.get_players_at(frame_idx)
+            roles = _roles_for_tracks(player_tracks)
+            player_states = [
+                PlayerState(
+                    track_id=tr.track_id,
+                    role=roles.get(tr.track_id, "unknown"),
+                    bboxes=[tuple(float(v) for v in tr.bbox)],
+                    frames=[int(frame_idx)],
+                )
+                for tr in player_tracks
+            ]
             if enable_pose and pose_estimator is not None and (frame_idx % pose_stride == 0):
                 try:
                     poses: List[PoseKeypoints] = pose_estimator.estimate(frame_proc)
                     if poses:
-                        pose_results[frame_idx] = {"points": poses[0].points.tolist()}
+                        pts = poses[0].points.copy()
+                        if roi_dx != 0 or roi_dy != 0:
+                            pts[:, 0] += float(roi_dx)
+                            pts[:, 1] += float(roi_dy)
+                        pose_results[frame_idx] = {"points": pts.tolist()}
                 except Exception as exc:  # pragma: no cover
                     print(f"[WARN] Pose inference failed at frame {frame_idx}: {exc}")
             frame_results.append(
@@ -277,8 +356,15 @@ def analyse_video(
     # process leftover batch
     if batch_frames:
         player_dets_batch = player_det.detect(batch_frames)
-        ball_dets_batch = ball_det.detect(batch_frames)
+        exclude_bboxes_batch = [[d.bbox for d in pdets] for pdets in player_dets_batch]
+        ball_dets_batch = ball_det.detect(batch_frames, exclude_bboxes_batch=exclude_bboxes_batch)
         for fi, pdets, bdets in zip(batch_indices, player_dets_batch, ball_dets_batch):
+            if roi_dx != 0 or roi_dy != 0:
+                for det in pdets:
+                    det.bbox = det.bbox + np.array([roi_dx, roi_dy, roi_dx, roi_dy], dtype=float)
+                for det in bdets:
+                    det.bbox = det.bbox + np.array([roi_dx, roi_dy, roi_dx, roi_dy], dtype=float)
+            pdets = _filter_player_detections_to_court(pdets)
             player_tracks = player_tracker.update(pdets, frame_idx=fi)
             ball_state = ball_tracker.update(fi, bdets)
             if ball_state is None:
@@ -290,6 +376,7 @@ def analyse_video(
                         score=pred.score,
                         cx=pred.cx,
                         cy=pred.cy,
+                        predicted=True,
                     )
             if ball_state is None and last_ball_state is not None:
                 ball_state = BallTrackState(
@@ -298,12 +385,20 @@ def analyse_video(
                     score=last_ball_state.score,
                     cx=last_ball_state.cx,
                     cy=last_ball_state.cy,
+                    predicted=True,
                 )
             if ball_state is not None:
                 last_ball_state = ball_state
-            roles = assign_player_roles(player_tracks, frame_height=h)
-            identity_tracker.update(fi, [tuple(t.bbox) for t in player_tracks])
-            player_states = identity_tracker.get_players_at(fi)
+            roles = _roles_for_tracks(player_tracks)
+            player_states = [
+                PlayerState(
+                    track_id=tr.track_id,
+                    role=roles.get(tr.track_id, "unknown"),
+                    bboxes=[tuple(float(v) for v in tr.bbox)],
+                    frames=[int(fi)],
+                )
+                for tr in player_tracks
+            ]
             frame_results.append(
                 FrameResult(
                     frame_idx=fi,
@@ -319,6 +414,6 @@ def analyse_video(
         fps=fps,
         frame_results=frame_results,
         court_corners=court_corners if court_corners is not None else default_corners,
-        player_tracks=identity_tracker.players,
+        player_tracks=None,
         pose_results=pose_results if enable_pose else None,
     )

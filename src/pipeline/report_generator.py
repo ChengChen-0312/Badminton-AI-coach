@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.analysis.tactical_stats import summarize_tactics
-from src.analysis.heatmap import create_landing_heatmap
+from src.analysis.heatmap import create_hitter_heatmap, create_landing_heatmap
 from src.analysis.timeline import create_stroke_timeline
 
 
@@ -16,6 +16,7 @@ def generate_markdown_report(
     output_path: str,
     tactical_summary: Optional[Dict[str, Any]] = None,
     heatmap_path: Optional[str] = None,
+    hitter_heatmap_path: Optional[str] = None,
     timeline_path: Optional[str] = None,
 ) -> str:
     """Generate a Markdown tactical match report."""
@@ -78,11 +79,13 @@ def generate_markdown_report(
                 lines.append("")
 
     # Visualizations
-    if heatmap_path or timeline_path:
+    if heatmap_path or hitter_heatmap_path or timeline_path:
         lines.append("---\n")
         lines.append("## 🎨 Visualizations\n")
         if heatmap_path:
-            lines.append(f"![Heatmap]({Path(heatmap_path).name})")
+            lines.append(f"![Landing Heatmap]({Path(heatmap_path).name})")
+        if hitter_heatmap_path:
+            lines.append(f"![Hitter (Contact) Heatmap]({Path(hitter_heatmap_path).name})")
         if timeline_path:
             lines.append(f"![Timeline]({Path(timeline_path).name})")
         lines.append("")
@@ -99,7 +102,7 @@ def generate_markdown_report(
             f"- Hitter: **{s.get('hitter_role')}** (track_id={s.get('hitter_track_id')})"
         )
         lines.append(f"- Landing Region: {s.get('landing_region')}")
-        lines.append(f"- Contact Region: {s.get('contact_region')}")
+        lines.append(f"- Hitter Region: {s.get('contact_region')}")
         lines.append(f"- Contact Frame: {s.get('contact_frame')}")
         lines.append(f"- Landing Frame: {s.get('landing_frame')}")
         conf = s.get("confidence")
@@ -144,17 +147,24 @@ def generate_match_report(
     json_path = out / f"{match_name}_report.json"
     csv_path = out / f"{match_name}_report.csv"
     heatmap_path = out / f"{match_name}_heatmap.png"
+    hitter_heatmap_path = out / f"{match_name}_hitter_heatmap.png"
     timeline_path = out / f"{match_name}_timeline.png"
 
     tactical_summary = summarize_tactics(stroke_summaries)
 
     # Visualizations
     heatmap_file = None
+    hitter_heatmap_file = None
     timeline_file = None
     if enable_heatmap:
         heatmap_file = create_landing_heatmap(
             stroke_summaries,
             str(heatmap_path),
+            bins=heatmap_bins,
+        )
+        hitter_heatmap_file = create_hitter_heatmap(
+            stroke_summaries,
+            str(hitter_heatmap_path),
             bins=heatmap_bins,
         )
     if enable_timeline:
@@ -167,9 +177,10 @@ def generate_match_report(
         match_name,
         stroke_summaries,
         str(md_path),
-        tactical_summary,
-        heatmap_file,
-        timeline_file,
+        tactical_summary=tactical_summary,
+        heatmap_path=heatmap_file,
+        hitter_heatmap_path=hitter_heatmap_file,
+        timeline_path=timeline_file,
     )
     generate_json_report(stroke_summaries, str(json_path))
     generate_csv_report(stroke_summaries, str(csv_path))
@@ -180,6 +191,7 @@ def generate_match_report(
         "csv": str(csv_path),
         "tactical_summary": tactical_summary,
         "heatmap": heatmap_file,
+        "hitter_heatmap": hitter_heatmap_file,
         "timeline": timeline_file,
     }
 

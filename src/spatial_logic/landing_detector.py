@@ -98,6 +98,9 @@ def extract_ball_track(frame_results: Sequence[Any]) -> List[BallState]:
         ball = _get_ball_from_frame(fr)
         if ball is None:
             continue
+        # Ignore tracker-only predictions; use only observed detections for landing inference.
+        if bool(getattr(ball, "predicted", False)) or (isinstance(ball, dict) and bool(ball.get("predicted", False))):
+            continue
         center = _get_ball_center(ball)
         if center is None:
             continue
@@ -179,18 +182,85 @@ def infer_landing(
         return None
 
     smoothed = smooth_track(raw_track, window=3)
-    contact_state, landing_state = detect_landing_point(smoothed)
-    if landing_state is None:
+    if not smoothed:
         return None
 
+    # --- Contact (racket hit) inference ---
+    ball_by_frame = {b.frame_idx: b for b in smoothed}
+
+    def _frame_idx(fr: Any) -> Optional[int]:
+        if hasattr(fr, "frame_idx"):
+            return getattr(fr, "frame_idx")
+        if isinstance(fr, dict):
+            return fr.get("frame_idx")
+        return None
+
+    def _player_states(fr: Any) -> List[Any]:
+        ps = getattr(fr, "player_states", None) if hasattr(fr, "player_states") else None
+        if ps is None and isinstance(fr, dict):
+            ps = fr.get("player_states")
+        return ps or []
+
+    def _point_to_bbox_dist(px: float, py: float, bbox: Sequence[float]) -> float:
+        x1, y1, x2, y2 = bbox
+        dx = max(float(x1) - px, 0.0, px - float(x2))
+        dy = max(float(y1) - py, 0.0, py - float(y2))
+        return float(np.hypot(dx, dy))
+
+    best = None  # (dist, frame_idx, bx, by)
+    last_frame_idx = None
+    for fr in frame_results:
+        fi = _frame_idx(fr)
+        if fi is None:
+            continue
+        last_frame_idx = fi
+        ball = ball_by_frame.get(int(fi))
+        if ball is None:
+            continue
+        players = _player_states(fr)
+        if not players:
+            continue
+        bx, by = float(ball.x), float(ball.y)
+        for p in players:
+            bboxes = getattr(p, "bboxes", None) if hasattr(p, "bboxes") else None
+            if bboxes is None and isinstance(p, dict):
+                bboxes = p.get("bboxes")
+            if not bboxes:
+                continue
+            bbox = bboxes[-1]
+            dist = _point_to_bbox_dist(bx, by, bbox)
+            if best is None or dist < best[0]:
+                best = (dist, int(fi), bx, by)
+
+    if best is not None:
+        contact_frame_idx = int(best[1])
+        contact_x = float(best[2])
+        contact_y = float(best[3])
+    else:
+        ys = [b.y for b in smoothed]
+        dy_total = (ys[-1] - ys[0]) if len(ys) >= 2 else 0.0
+        contact_state = max(smoothed, key=lambda b: b.y) if dy_total < 0 else min(smoothed, key=lambda b: b.y)
+        contact_frame_idx = int(contact_state.frame_idx)
+        contact_x = float(contact_state.x)
+        contact_y = float(contact_state.y)
+
+    # --- Landing inference ---
+    # For this lightweight demo pipeline: treat the last observed ball position as landing candidate.
+    # If the ball disappears for `missing_window` frames at the end, consider it an observed landing.
+    landing_state = smoothed[-1]
+    last_frame = int(last_frame_idx) if last_frame_idx is not None else int(landing_state.frame_idx)
+    missing_window = 3
+    end_gap = max(0, last_frame - int(landing_state.frame_idx))
+    landing_predicted = end_gap < missing_window or int(landing_state.frame_idx) <= contact_frame_idx
+
     lp = LandingPoint(
-        frame_idx=landing_state.frame_idx,
-        img_x=landing_state.x,
-        img_y=landing_state.y,
-        predicted=True if contact_state and contact_state.frame_idx != landing_state.frame_idx else False,
-        contact_frame_idx=contact_state.frame_idx if contact_state else None,
-        contact_x=contact_state.x if contact_state else None,
-        contact_y=contact_state.y if contact_state else None,
+        frame_idx=int(landing_state.frame_idx),
+        img_x=float(landing_state.x),
+        img_y=float(landing_state.y),
+        predicted=bool(landing_predicted),
+        contact_frame_idx=contact_frame_idx,
+        contact_x=contact_x,
+        contact_y=contact_y,
     )
 
     if homography is not None:

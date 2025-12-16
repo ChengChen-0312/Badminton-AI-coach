@@ -19,6 +19,14 @@ def _bbox_center(bbox: Sequence[float]) -> Tuple[float, float]:
     x1, y1, x2, y2 = bbox
     return (float((x1 + x2) / 2.0), float((y1 + y2) / 2.0))
 
+def _point_to_bbox_distance(point_xy: Tuple[float, float], bbox: Sequence[float]) -> float:
+    """Distance from a point to an axis-aligned bbox (0 if inside)."""
+    px, py = point_xy
+    x1, y1, x2, y2 = bbox
+    dx = max(float(x1) - px, 0.0, px - float(x2))
+    dy = max(float(y1) - py, 0.0, py - float(y2))
+    return float(np.hypot(dx, dy))
+
 
 def infer_hitter_for_stroke(
     contact_frame: int,
@@ -30,13 +38,12 @@ def infer_hitter_for_stroke(
     if not players_at_contact:
         return None
 
-    bx, by = ball_pos
     best: Optional[HitterInfo] = None
     for p in players_at_contact:
         if not p.bboxes:
             continue
-        cx, cy = _bbox_center(p.bboxes[-1])
-        dist = float(np.hypot(cx - bx, cy - by))
+        # Use point-to-rect distance (more robust when the shuttle is above a player).
+        dist = _point_to_bbox_distance(ball_pos, p.bboxes[-1])
         if best is None or dist < best.distance:
             best = HitterInfo(
                 hitter_role=p.role if p.role else "unknown",
