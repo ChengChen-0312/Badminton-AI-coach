@@ -564,26 +564,35 @@ def main() -> None:
     if not args.no_court_debug:
         try:
             frame_bgr = _read_video_frame_bgr(video_path, frame_idx=int(args.court_debug_frame))
-            corners = (
-                analysis.court_corners
-                if isinstance(analysis.court_corners, list) and len(analysis.court_corners) == 4
-                else None
-            )
-            if frame_bgr is None or corners is None:
-                print("[WARN] Court debug image skipped (failed to read frame or missing corners).")
+            if frame_bgr is None:
+                print("[WARN] Court debug image skipped (failed to read frame).")
             else:
                 h0, w0 = frame_bgr.shape[:2]
-                manual_corners = vision_cfg.get("court_corners")
-                if isinstance(manual_corners, (list, tuple)) and len(manual_corners) == 4:
-                    corner_source = "manual_config"
-                elif _looks_like_default_full_frame_corners(corners, w0, h0):
-                    corner_source = "fallback_full_frame (detector failed)"
+                corners = (
+                    analysis.court_corners
+                    if isinstance(getattr(analysis, "court_corners", None), list) and len(analysis.court_corners) == 4
+                    else []
+                )
+                det = getattr(analysis, "court_detection", None)
+                if isinstance(det, dict):
+                    src = det.get("source", "unknown")
+                    conf = det.get("confidence", None)
+                    reason = det.get("reason", None)
+                    extra = []
+                    if conf is not None:
+                        try:
+                            extra.append(f"conf={float(conf):.2f}")
+                        except Exception:
+                            extra.append(f"conf={conf}")
+                    if reason:
+                        extra.append(f"reason={reason}")
+                    corner_source = f"{src} ({', '.join(extra)})" if extra else str(src)
                 else:
-                    corner_source = "auto_detector"
+                    corner_source = "unknown"
 
                 use_court_roi = bool(vision_cfg.get("use_court_roi", False))
                 court_margin = float(vision_cfg.get("court_roi_margin", 0.0))
-                roi = _compute_court_roi(corners, w0, h0, margin=court_margin) if use_court_roi else None
+                roi = _compute_court_roi(corners, w0, h0, margin=court_margin) if (use_court_roi and len(corners) == 4) else None
                 debug_img = _draw_court_debug(
                     frame_bgr,
                     corners=corners,

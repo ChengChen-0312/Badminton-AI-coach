@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -34,6 +34,21 @@ class CourtDetector:
         min_contour_area_ratio: float = 0.01,
         min_bbox_width_ratio: float = 0.25,
         min_bbox_height_ratio: float = 0.25,
+        # Validation / scoring (reject common failure modes like roof/wall lines)
+        floor_y_min_ratio: float = 0.10,
+        min_quad_area_ratio: float = 0.01,
+        max_parallel_deg: float = 25.0,
+        min_edge_support_strong: float = 0.12,
+        min_edge_support_weak: float = 0.05,
+        min_strong_edges: int = 2,
+        min_confidence: float = 0.55,
+        support_dilate: int = 5,
+        edge_sample_points: int = 200,
+        # Floor region estimation (used to mask out roof/wall structures)
+        floor_sat_min: int = 35,
+        floor_val_min: int = 35,
+        floor_seed_y_ratio: float = 0.35,
+        floor_close_kernel: int = 35,
     ) -> None:
         self.white_s_max = int(white_s_max)
         self.white_v_min = int(white_v_min)
@@ -44,6 +59,24 @@ class CourtDetector:
         self.min_contour_area_ratio = float(min_contour_area_ratio)
         self.min_bbox_width_ratio = float(min_bbox_width_ratio)
         self.min_bbox_height_ratio = float(min_bbox_height_ratio)
+        self.floor_y_min_ratio = float(floor_y_min_ratio)
+        self.min_quad_area_ratio = float(min_quad_area_ratio)
+        self.max_parallel_deg = float(max_parallel_deg)
+        self.min_edge_support_strong = float(min_edge_support_strong)
+        self.min_edge_support_weak = float(min_edge_support_weak)
+        self.min_strong_edges = int(min_strong_edges)
+        self.min_confidence = float(min_confidence)
+        self.support_dilate = int(support_dilate)
+        self.edge_sample_points = int(edge_sample_points)
+        self.floor_sat_min = int(floor_sat_min)
+        self.floor_val_min = int(floor_val_min)
+        self.floor_seed_y_ratio = float(floor_seed_y_ratio)
+        self.floor_close_kernel = int(floor_close_kernel)
+
+        # Diagnostics from the last detection attempt.
+        self.last_confidence: float | None = None
+        self.last_reason: str | None = None
+        self.last_edge_support: list[float] | None = None
 
     @staticmethod
     def _order_corners_lb_rb_rt_lt(pts_xy: np.ndarray) -> np.ndarray:
@@ -59,6 +92,163 @@ class CourtDetector:
         lt, rt = top[0], top[1]
         return np.stack([lb, rb, rt, lt], axis=0)
 
+    @staticmethod
+    def _angle_deg(v1: np.ndarray, v2: np.ndarray) -> float:
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-6 or n2 < 1e-6:
+            return 180.0
+        u1 = v1 / n1
+        u2 = v2 / n2
+        cos = float(abs(np.clip(np.dot(u1, u2), -1.0, 1.0)))
+        return float(np.degrees(np.arccos(cos)))
+
+    @staticmethod
+    def _quad_area(pts_xy: np.ndarray) -> float:
+        pts = np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
+        return float(abs(cv2.contourArea(pts)))
+
+    @staticmethod
+    def _is_convex_quad(pts_xy: np.ndarray) -> bool:
+        pts = np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
+        try:
+            return bool(cv2.isContourConvex(pts))
+        except Exception:
+            return False
+
+    def _edge_support_ratios(
+        self,
+        white_mask: np.ndarray,
+        corners_xy: np.ndarray,
+    ) -> list[float]:
+        h, w = white_mask.shape[:2]
+        if self.support_dilate > 1:
+            k = int(self.support_dilate)
+            kernel = np.ones((k, k), np.uint8)
+            support = cv2.dilate(white_mask, kernel, iterations=1)
+        else:
+            support = white_mask
+
+        corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
+        edges = [
+            (corners[0], corners[1]),  # LB->RB
+            (corners[1], corners[2]),  # RB->RT
+            (corners[2], corners[3]),  # RT->LT
+            (corners[3], corners[0]),  # LT->LB
+        ]
+        ratios: list[float] = []
+        n = max(20, int(self.edge_sample_points))
+        for p1, p2 in edges:
+            xs = np.linspace(float(p1[0]), float(p2[0]), n)
+            ys = np.linspace(float(p1[1]), float(p2[1]), n)
+            ix = np.clip(np.rint(xs).astype(np.int32), 0, w - 1)
+            iy = np.clip(np.rint(ys).astype(np.int32), 0, h - 1)
+            hits = int(np.count_nonzero(support[iy, ix]))
+            ratios.append(float(hits) / float(n))
+        return ratios
+
+    def _estimate_floor_region(self, hsv: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Estimate the floor (court plane) region as a binary mask (uint8 0/255).
+
+        This is a heuristic to suppress false positives from roof lights / walls.
+        """
+        h, w = hsv.shape[:2]
+        y0 = int(round(float(h) * float(self.floor_seed_y_ratio)))
+        y0 = max(0, min(h - 1, y0))
+
+        seed = np.zeros((h, w), dtype=np.uint8)
+        seed[y0:, :] = 255
+
+        base = cv2.inRange(hsv, (0, self.floor_sat_min, self.floor_val_min), (180, 255, 255))
+        base = cv2.bitwise_and(base, seed)
+        if int(np.count_nonzero(base)) < int(0.01 * h * w):
+            return None
+
+        k = max(3, int(self.floor_close_kernel))
+        if k % 2 == 0:
+            k += 1
+        kernel = np.ones((k, k), np.uint8)
+        closed = cv2.morphologyEx(base, cv2.MORPH_CLOSE, kernel, iterations=1)
+        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8), iterations=1)
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+        if num <= 1:
+            return None
+
+        best_lbl = None
+        best_area = -1
+        for lbl in range(1, num):
+            x, y, ww, hh, area = stats[lbl].tolist()
+            if area <= 0:
+                continue
+            touches_bottom = (y + hh) >= (h - 2)
+            if not touches_bottom:
+                continue
+            if area > best_area:
+                best_area = area
+                best_lbl = lbl
+
+        if best_lbl is None:
+            best_lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+
+        return (labels == int(best_lbl)).astype(np.uint8) * 255
+
+    def _validate_and_score(
+        self,
+        corners_xy: np.ndarray,
+        white_mask: np.ndarray,
+        frame_shape: Tuple[int, int],
+    ) -> tuple[float, str, list[float]]:
+        h, w = int(frame_shape[0]), int(frame_shape[1])
+        corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
+
+        # R0: convex + area sanity
+        area = self._quad_area(corners)
+        if (not self._is_convex_quad(corners)) or area < (float(h * w) * float(self.min_quad_area_ratio)):
+            return 0.0, "R0_convex_or_area", [0.0, 0.0, 0.0, 0.0]
+
+        # R1: reject corners too high (not on floor plane)
+        if float(np.min(corners[:, 1])) < float(h) * float(self.floor_y_min_ratio):
+            return 0.0, "R1_not_on_floor", [0.0, 0.0, 0.0, 0.0]
+
+        # R2: require white-line support along edges
+        edge_support = self._edge_support_ratios(white_mask, corners)
+        strong = sum(1 for r in edge_support if r >= float(self.min_edge_support_strong))
+        if strong < int(self.min_strong_edges) or min(edge_support) < float(self.min_edge_support_weak):
+            return 0.0, "R2_weak_line_support", edge_support
+
+        # R3: parallelism constraints
+        v_bottom = corners[1] - corners[0]
+        v_top = corners[3] - corners[2]
+        v_left = corners[3] - corners[0]
+        v_right = corners[2] - corners[1]
+        ang_tb = self._angle_deg(v_bottom, v_top)
+        ang_lr = self._angle_deg(v_left, v_right)
+        if ang_tb > float(self.max_parallel_deg) or ang_lr > float(self.max_parallel_deg):
+            return 0.0, "R3_not_parallel", edge_support
+
+        # R4: aspect sanity (avoid extreme trapezoids)
+        bottom_len = float(np.linalg.norm(v_bottom))
+        top_len = float(np.linalg.norm(v_top))
+        left_len = float(np.linalg.norm(v_left))
+        right_len = float(np.linalg.norm(v_right))
+        if min(bottom_len, top_len, left_len, right_len) < 1.0:
+            return 0.0, "R4_degenerate_edges", edge_support
+        tb_ratio = top_len / bottom_len
+        lr_ratio = left_len / right_len
+        if not (0.20 <= tb_ratio <= 2.50 and 0.20 <= lr_ratio <= 2.50):
+            return 0.0, "R4_aspect_out_of_range", edge_support
+
+        # Soft confidence scoring
+        target = 0.15
+        s_line = float(np.clip(np.mean([r / target for r in edge_support]), 0.0, 1.0))
+        s_geom = float(np.clip(1.0 - 0.5 * (ang_tb + ang_lr) / float(self.max_parallel_deg), 0.0, 1.0))
+        min_y = float(np.min(corners[:, 1])) / float(max(h, 1))
+        s_floor = float(np.clip((min_y - float(self.floor_y_min_ratio)) / 0.40, 0.0, 1.0))
+        conf = 0.55 * s_line + 0.30 * s_geom + 0.15 * s_floor
+        return float(np.clip(conf, 0.0, 1.0)), "OK", edge_support
+
     def detect_court(self, frame: np.ndarray) -> Optional[CourtLines]:
         """
         Args:
@@ -67,15 +257,26 @@ class CourtDetector:
         Returns:
             CourtLines or None if failed.
         """
+        self.last_confidence = None
+        self.last_reason = None
+        self.last_edge_support = None
+
         if frame is None or frame.ndim != 3:
+            self.last_confidence = 0.0
+            self.last_reason = "invalid_frame"
             return None
         h, w = frame.shape[:2]
         if h < 32 or w < 32:
+            self.last_confidence = 0.0
+            self.last_reason = "frame_too_small"
             return None
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        floor_region = self._estimate_floor_region(hsv)
         # White-ish lines: low saturation, high value.
         white = cv2.inRange(hsv, (0, 0, self.white_v_min), (180, self.white_s_max, 255))
+        if floor_region is not None:
+            white = cv2.bitwise_and(white, floor_region)
 
         # Ignore the roof / lights region which often creates false positives.
         top = int(round(h * self.top_crop_ratio))
@@ -91,6 +292,8 @@ class CourtDetector:
         # Connected-component selection is more robust than raw contour sorting for thin line masks.
         num, labels, stats, centroids = cv2.connectedComponentsWithStats(white, connectivity=8)
         if num <= 1:
+            self.last_confidence = 0.0
+            self.last_reason = "no_components"
             return None
 
         min_area = float(h * w) * self.min_contour_area_ratio
@@ -121,11 +324,15 @@ class CourtDetector:
         comp = (labels == int(best_label)).astype(np.uint8) * 255
         contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            self.last_confidence = 0.0
+            self.last_reason = "no_contours"
             return None
         best_cnt = max(contours, key=cv2.contourArea)
         hull = cv2.convexHull(best_cnt)
         peri = cv2.arcLength(hull, True)
         if peri < 1e-6:
+            self.last_confidence = 0.0
+            self.last_reason = "degenerate_hull"
             return None
 
         quad = None
@@ -144,7 +351,19 @@ class CourtDetector:
         xs = ordered[:, 0]
         ys = ordered[:, 1]
         if (float(xs.max() - xs.min()) / float(w)) < self.min_bbox_width_ratio:
+            self.last_confidence = 0.0
+            self.last_reason = "bbox_too_narrow"
             return None
         if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
+            self.last_confidence = 0.0
+            self.last_reason = "bbox_too_short"
             return None
+
+        conf, reason, edge_support = self._validate_and_score(ordered, white_mask=white, frame_shape=(h, w))
+        self.last_confidence = conf
+        self.last_reason = reason
+        self.last_edge_support = edge_support
+        if reason != "OK" or conf < float(self.min_confidence):
+            return None
+
         return CourtLines(corners=ordered.astype(np.float32))

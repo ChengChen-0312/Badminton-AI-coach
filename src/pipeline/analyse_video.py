@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -33,6 +33,7 @@ class AnalyseResult:
     fps: float
     frame_results: List[FrameResult]
     court_corners: Optional[List[List[float]]] = None
+    court_detection: Optional[Dict[str, Any]] = None
     player_tracks: Optional[List[PlayerState]] = None
     pose_results: Optional[Dict[int, Dict]] = None
 
@@ -59,10 +60,12 @@ def analyse_video(
     use_court_roi = vision_cfg.get("use_court_roi", False)
     court_margin = vision_cfg.get("court_roi_margin", 0.0)
     court_corners: Optional[List[List[float]]] = None
+    court_detection: Dict[str, Any] = {"source": "none", "confidence": None, "reason": None}
     manual_corners = vision_cfg.get("court_corners")
     if isinstance(manual_corners, (list, tuple)) and len(manual_corners) == 4:
         try:
             court_corners = [[float(x), float(y)] for x, y in manual_corners]  # type: ignore[misc]
+            court_detection = {"source": "manual", "confidence": 1.0, "reason": "OK"}
         except Exception:
             court_corners = None
     cap = cv2.VideoCapture(str(video_path))
@@ -130,9 +133,43 @@ def analyse_video(
         ]
 
         if court_corners is None and court_detector is not None:
-            lines = court_detector.detect_court(first_rgb)
-            if lines is not None and lines.corners is not None:
-                court_corners = lines.corners.tolist()
+            # Try multiple early frames and keep the best-scoring detection.
+            samples = int(vision_cfg.get("court_detect_samples", 10))
+            stride = int(vision_cfg.get("court_detect_stride", 5))
+            samples = max(1, samples)
+            stride = max(1, stride)
+
+            best = None  # (confidence, corners, meta)
+            for i in range(samples):
+                fi = int(i * stride)
+                if fi == 0:
+                    rgb = first_rgb
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                    ok_i, bgr_i = cap.read()
+                    if not ok_i or bgr_i is None:
+                        break
+                    rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
+                lines = court_detector.detect_court(rgb)
+                conf = float(court_detector.last_confidence or 0.0)
+                reason = str(court_detector.last_reason or "unknown")
+                if lines is None or lines.corners is None:
+                    continue
+                corners_i = lines.corners.tolist()
+                meta_i = {"source": "auto", "confidence": conf, "reason": reason, "frame_idx": fi}
+                if best is None or conf > float(best[0]):
+                    best = (conf, corners_i, meta_i)
+
+            if best is not None:
+                court_corners = best[1]
+                court_detection = best[2]
+            else:
+                # Auto detector rejected all candidates.
+                court_detection = {
+                    "source": "auto_failed",
+                    "confidence": float(court_detector.last_confidence) if court_detector.last_confidence is not None else None,
+                    "reason": str(court_detector.last_reason) if court_detector.last_reason is not None else None,
+                }
 
         if court_corners is not None and use_court_roi:
             xs = np.array([p[0] for p in court_corners], dtype=np.float32)
@@ -168,11 +205,12 @@ def analyse_video(
 
     court_h = None
     court_half_len = None
-    if poly_src is not None and len(poly_src) == 4:
+    # Only build homography if we have real court corners (manual or validated auto detection).
+    if court_corners is not None and len(court_corners) == 4:
         try:
             from src.geometry.homography import COURT_LENGTH_M, CourtHomography
 
-            court_h = CourtHomography.from_corners(poly_src)
+            court_h = CourtHomography.from_corners(court_corners)
             court_half_len = float(COURT_LENGTH_M) / 2.0
         except Exception:
             court_h = None
@@ -413,7 +451,8 @@ def analyse_video(
         video_path=str(video_path),
         fps=fps,
         frame_results=frame_results,
-        court_corners=court_corners if court_corners is not None else default_corners,
+        court_corners=court_corners,
+        court_detection=court_detection,
         player_tracks=None,
         pose_results=pose_results if enable_pose else None,
     )
