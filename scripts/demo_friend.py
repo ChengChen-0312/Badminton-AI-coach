@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import cv2
+import numpy as np
 import yaml
 
 # Ensure repo root on path
@@ -138,6 +140,114 @@ def _extract_json_dict(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
         except Exception:
             return None, t
     return None, t
+
+
+def _read_video_frame_bgr(video_path: Path, frame_idx: int = 0) -> Optional[Any]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+    ok, frame_bgr = cap.read()
+    cap.release()
+    if not ok or frame_bgr is None:
+        return None
+    return frame_bgr
+
+
+def _looks_like_default_full_frame_corners(
+    corners: list[list[float]], width: int, height: int, tol_px: float = 2.0
+) -> bool:
+    if len(corners) != 4:
+        return False
+    target = [
+        [0.0, float(height - 1)],
+        [float(width - 1), float(height - 1)],
+        [float(width - 1), 0.0],
+        [0.0, 0.0],
+    ]
+    for p, t in zip(corners, target):
+        if len(p) != 2:
+            return False
+        if abs(float(p[0]) - float(t[0])) > tol_px:
+            return False
+        if abs(float(p[1]) - float(t[1])) > tol_px:
+            return False
+    return True
+
+
+def _compute_court_roi(
+    corners: list[list[float]],
+    width: int,
+    height: int,
+    margin: float,
+) -> Optional[tuple[int, int, int, int]]:
+    if len(corners) != 4:
+        return None
+    try:
+        xs = [float(p[0]) for p in corners]
+        ys = [float(p[1]) for p in corners]
+    except Exception:
+        return None
+    pad_x = float(width) * float(margin)
+    pad_y = float(height) * float(margin)
+    x1 = max(0, int(round(min(xs) - pad_x)))
+    y1 = max(0, int(round(min(ys) - pad_y)))
+    x2 = min(width, int(round(max(xs) + pad_x)))
+    y2 = min(height, int(round(max(ys) + pad_y)))
+    if x2 > x1 and y2 > y1:
+        return x1, y1, x2, y2
+    return None
+
+
+def _draw_court_debug(
+    frame_bgr: Any,
+    corners: list[list[float]],
+    corner_source: str,
+    roi: Optional[tuple[int, int, int, int]] = None,
+    roi_margin: Optional[float] = None,
+) -> Any:
+    out = frame_bgr.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    header = f"Court corners: {corner_source} (order: LB, RB, RT, LT)"
+    cv2.putText(out, header, (20, 40), font, 0.9, (0, 0, 0), 5, lineType=cv2.LINE_AA)
+    cv2.putText(out, header, (20, 40), font, 0.9, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+
+    if len(corners) == 4:
+        pts = [(int(round(float(x))), int(round(float(y)))) for x, y in corners]
+        labels = ["LB", "RB", "RT", "LT"]
+
+        cv2.polylines(out, [np.array(pts, dtype=np.int32).reshape(-1, 1, 2)], True, (0, 255, 0), 3)
+        for (x, y), label in zip(pts, labels):
+            cv2.circle(out, (x, y), 7, (0, 0, 255), -1)
+            cv2.putText(out, label, (x + 10, y - 10), font, 0.85, (0, 0, 0), 4, lineType=cv2.LINE_AA)
+            cv2.putText(out, label, (x + 10, y - 10), font, 0.85, (0, 0, 255), 2, lineType=cv2.LINE_AA)
+
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        cv2.rectangle(out, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        margin_txt = f"ROI (margin={roi_margin:.3f})" if roi_margin is not None else "ROI"
+        cv2.putText(
+            out,
+            margin_txt,
+            (x1 + 5, max(20, y1 - 10)),
+            font,
+            0.75,
+            (0, 0, 0),
+            4,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.putText(
+            out,
+            margin_txt,
+            (x1 + 5, max(20, y1 - 10)),
+            font,
+            0.75,
+            (255, 0, 0),
+            2,
+            lineType=cv2.LINE_AA,
+        )
+    return out
 
 
 def _llm_compare(
@@ -299,6 +409,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--no-heatmap", action="store_true", help="Disable heatmap image.")
     p.add_argument("--no-timeline", action="store_true", help="Disable timeline image.")
+    p.add_argument("--no-court-debug", action="store_true", help="Disable saving a court detection debug image.")
+    p.add_argument("--court-debug-frame", type=int, default=0, help="Frame index used for court debug image.")
 
     p.add_argument(
         "--pose",
@@ -448,6 +560,42 @@ def main() -> None:
         heatmap_bins=int(viz_cfg.get("heatmap_bins", 32)),
     )
 
+    court_debug_path: Optional[Path] = None
+    if not args.no_court_debug:
+        try:
+            frame_bgr = _read_video_frame_bgr(video_path, frame_idx=int(args.court_debug_frame))
+            corners = (
+                analysis.court_corners
+                if isinstance(analysis.court_corners, list) and len(analysis.court_corners) == 4
+                else None
+            )
+            if frame_bgr is None or corners is None:
+                print("[WARN] Court debug image skipped (failed to read frame or missing corners).")
+            else:
+                h0, w0 = frame_bgr.shape[:2]
+                manual_corners = vision_cfg.get("court_corners")
+                if isinstance(manual_corners, (list, tuple)) and len(manual_corners) == 4:
+                    corner_source = "manual_config"
+                elif _looks_like_default_full_frame_corners(corners, w0, h0):
+                    corner_source = "fallback_full_frame (detector failed)"
+                else:
+                    corner_source = "auto_detector"
+
+                use_court_roi = bool(vision_cfg.get("use_court_roi", False))
+                court_margin = float(vision_cfg.get("court_roi_margin", 0.0))
+                roi = _compute_court_roi(corners, w0, h0, margin=court_margin) if use_court_roi else None
+                debug_img = _draw_court_debug(
+                    frame_bgr,
+                    corners=corners,
+                    corner_source=corner_source,
+                    roi=roi,
+                    roi_margin=court_margin if use_court_roi else None,
+                )
+                court_debug_path = out_dir / f"{args.match_name}_court_detect_debug.jpg"
+                cv2.imwrite(str(court_debug_path), debug_img)
+        except Exception as exc:
+            print(f"[WARN] Court debug image failed: {exc}")
+
     frames = len(analysis.frame_results)
     fps = frames / max(t1 - t0, 1e-6)
 
@@ -464,8 +612,12 @@ def main() -> None:
     print(f"  - CSV:      {out.get('csv')}")
     if out.get("heatmap"):
         print(f"  - Heatmap:  {out.get('heatmap')}")
+    if out.get("hitter_heatmap"):
+        print(f"  - Hitter:   {out.get('hitter_heatmap')}")
     if out.get("timeline"):
         print(f"  - Timeline: {out.get('timeline')}")
+    if court_debug_path is not None:
+        print(f"  - Court:    {court_debug_path}")
 
     if args.llm:
         if not summary_dicts:
@@ -509,7 +661,10 @@ def main() -> None:
     if args.open:
         _maybe_open(out.get("markdown"))
         _maybe_open(out.get("heatmap"))
+        _maybe_open(out.get("hitter_heatmap"))
         _maybe_open(out.get("timeline"))
+        if court_debug_path is not None:
+            _maybe_open(str(court_debug_path))
 
     print("\nTip: open the Markdown in VS Code preview, or share the PNGs with your friends.")
 
