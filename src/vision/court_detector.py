@@ -423,6 +423,14 @@ class CourtDetector:
             tpl_f1 = float(self._edge_f1_score(white, ordered))
             span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
             top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
+            edge_support_by_side = None
+            if len(edge_support) == 4:
+                edge_support_by_side = {
+                    "bottom": float(edge_support[0]),
+                    "right": float(edge_support[1]),
+                    "top": float(edge_support[2]),
+                    "left": float(edge_support[3]),
+                }
             net_band_hit = float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
             tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
             top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
@@ -477,6 +485,7 @@ class CourtDetector:
                 "tpl_f1": float(tpl_f1),
                 "top_edge_support": float(top_edge_support),
                 "edge_support": [float(v) for v in edge_support],
+                "edge_support_by_side": edge_support_by_side,
                 "net_like_suspect": bool(net_like_suspect),
                 "net_band_hit": bool(net_band_hit),
                 "tpl_low_for_net": bool(tpl_low_for_net),
@@ -486,6 +495,11 @@ class CourtDetector:
                 "proposal_kind": proposal_kind,
             }
             record.update(info)
+            record["penalty_terms"] = {
+                "span_y_penalty_applied": bool(record.get("span_y_penalty_applied", False)),
+                "tpl_low": bool(record.get("tpl_low", False)),
+                "edge_penalty_applied": False,
+            }
             cand_list = list(mask_stats.get("candidates_topk", []))
             cand_list.append(record)
             cand_list.sort(key=lambda r: float(r.get("conf", 0.0)), reverse=True)
@@ -509,6 +523,7 @@ class CourtDetector:
                 "cfg_net_band": [float(self.net_suppress_y_min), float(self.net_suppress_y_max)],
                 "cfg_tpl_net_reject_max": float(self.tpl_net_reject_max),
                 "cfg_top_edge_net_reject_max": float(self.top_edge_net_reject_max),
+                "min_confidence": float(self.min_confidence),
             }
             if isinstance(info, dict):
                 if info.get("tpl_f1") is not None:
@@ -529,12 +544,19 @@ class CourtDetector:
                 metrics["tpl_low"] = bool(info.get("tpl_low", False))
                 metrics["span_y_violated"] = bool(info.get("span_y_violated", False))
                 metrics["span_y_penalty_applied"] = bool(info.get("span_y_penalty_applied", False))
+                metrics["penalty_terms"] = {
+                    "span_y_penalty_applied": bool(info.get("span_y_penalty_applied", False)),
+                    "tpl_low": bool(info.get("tpl_low", False)),
+                    "edge_penalty_applied": False,
+                }
                 if info.get("conf_raw") is not None:
                     metrics["conf_raw"] = float(info.get("conf_raw"))
                 if info.get("conf_after_net") is not None:
                     metrics["conf_after_net"] = float(info.get("conf_after_net"))
                 if info.get("conf_final") is not None:
                     metrics["conf_final"] = float(info.get("conf_final"))
+                    metrics["conf_margin"] = float(info.get("conf_final")) - float(self.min_confidence)
+                metrics["accepted_below_min_conf"] = bool(info.get("accepted_below_min_conf", False))
             metrics["fallback_triggered"] = False
             metrics.update(mask_stats)
             self.last_metrics = metrics
@@ -673,6 +695,8 @@ class CourtDetector:
         for cand in far_candidates:
             candidates.append((cand, "far_suppressed"))
 
+        min_conf = float(self.min_confidence)
+        near_min_conf = float(min(min_conf, 0.45))
         best: tuple[float, str, list[float], np.ndarray, dict[str, Any], bool] | None = None
         best_reject: tuple[float, str, list[float], np.ndarray, dict[str, Any]] | None = None
         best_suspect = True
@@ -710,8 +734,17 @@ class CourtDetector:
             )
             if best_reject is None or float(conf) > float(best_reject[0]):
                 best_reject = (float(conf), str(reason), edge_support, ordered, info)
-            if reason != "OK" or conf < float(self.min_confidence):
+            near_threshold_ok = False
+            if reason == "OK":
+                if proposal_kind == "far_suppressed" and not bool(info.get("net_like_suspect", False)):
+                    if conf >= (near_min_conf - 0.05):
+                        near_threshold_ok = True
+            if reason != "OK" or (conf < min_conf and not near_threshold_ok):
                 continue
+            if near_threshold_ok and conf < min_conf:
+                info["accepted_below_min_conf"] = True
+                info["min_confidence"] = float(min_conf)
+                info["conf_margin"] = float(conf - min_conf)
 
             cand_suspect = bool(info.get("net_like_suspect", False))
             if best is None or (best_suspect and not cand_suspect) or (cand_suspect == best_suspect and conf > float(best[0])):
