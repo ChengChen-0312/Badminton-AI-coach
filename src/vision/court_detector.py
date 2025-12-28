@@ -268,7 +268,7 @@ class CourtDetector:
             float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
             and float(tpl_f1) < float(self.tpl_net_reject_max)
         )
-        if net_like_flag and float(top_edge_support) < float(self.top_edge_net_reject_max):
+        if net_like_flag:
             return 0.0, "R_net_like_quad", edge_support
         if span_y_norm < 0.45 or span_y_norm > 0.90:
             return 0.0, "R_span_y_out_of_range", edge_support
