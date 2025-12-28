@@ -239,18 +239,18 @@ class CourtDetector:
         white_mask: np.ndarray,
         frame_shape: Tuple[int, int],
         floor_bbox_y1_norm: Optional[float] = None,
-    ) -> tuple[float, str, list[float]]:
+    ) -> tuple[float, str, list[float], dict[str, Any] | None]:
         h, w = int(frame_shape[0]), int(frame_shape[1])
         corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
 
         # R0: convex + area sanity
         area = self._quad_area(corners)
         if (not self._is_convex_quad(corners)) or area < (float(h * w) * float(self.min_quad_area_ratio)):
-            return 0.0, "R0_convex_or_area", [0.0, 0.0, 0.0, 0.0]
+            return 0.0, "R0_convex_or_area", [0.0, 0.0, 0.0, 0.0], None
 
         # R1: reject corners too high (not on floor plane)
         if float(np.min(corners[:, 1])) < float(h) * float(self.floor_y_min_ratio):
-            return 0.0, "R1_not_on_floor", [0.0, 0.0, 0.0, 0.0]
+            return 0.0, "R1_not_on_floor", [0.0, 0.0, 0.0, 0.0], None
 
         ys = corners[:, 1]
         span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
@@ -267,27 +267,25 @@ class CourtDetector:
         net_band_hit = float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
         tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
         top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
-        net_like_flag = bool(net_band_hit and tpl_low_for_net)
-        if net_like_flag and top_edge_weak_for_net:
-            return 0.0, "R_net_like_quad", edge_support
+        net_like_suspect = bool(net_band_hit and tpl_low_for_net)
         if span_y_norm < 0.45 or span_y_norm > 0.90:
-            return 0.0, "R_span_y_out_of_range", edge_support
+            return 0.0, "R_span_y_out_of_range", edge_support, None
         if bottom_y_norm < 0.78:
-            return 0.0, "R_bottom_too_high", edge_support
+            return 0.0, "R_bottom_too_high", edge_support, None
         if floor_bbox_y1_norm is not None:
             floor_y1 = max(float(floor_bbox_y1_norm), 0.25)
             if top_y_norm < float(floor_y1 - 0.02):
-                return 0.0, "R_above_floor_bbox", edge_support
+                return 0.0, "R_above_floor_bbox", edge_support, None
         if len(edge_support) == 4:
             if top_edge_support < float(self.edge_top_min):
-                return 0.0, "R_top_edge_weak", edge_support
+                return 0.0, "R_top_edge_weak", edge_support, None
             if bottom_edge_support < float(self.edge_bottom_min):
-                return 0.0, "R_bottom_edge_weak", edge_support
+                return 0.0, "R_bottom_edge_weak", edge_support, None
             if min(edge_support) < float(self.edge_min_floor):
-                return 0.0, "R_edge_too_weak", edge_support
+                return 0.0, "R_edge_too_weak", edge_support, None
         strong = sum(1 for r in edge_support if r >= float(self.min_edge_support_strong))
         if strong < int(self.min_strong_edges) or min(edge_support) < float(self.min_edge_support_weak):
-            return 0.0, "R2_weak_line_support", edge_support
+            return 0.0, "R2_weak_line_support", edge_support, None
 
         # R3: parallelism constraints
         v_bottom = corners[1] - corners[0]
@@ -297,7 +295,7 @@ class CourtDetector:
         ang_tb = self._angle_deg(v_bottom, v_top)
         ang_lr = self._angle_deg(v_left, v_right)
         if ang_tb > float(self.max_parallel_deg) or ang_lr > float(self.max_parallel_deg):
-            return 0.0, "R3_not_parallel", edge_support
+            return 0.0, "R3_not_parallel", edge_support, None
 
         # R4: aspect sanity (avoid extreme trapezoids)
         bottom_len = float(np.linalg.norm(v_bottom))
@@ -305,11 +303,11 @@ class CourtDetector:
         left_len = float(np.linalg.norm(v_left))
         right_len = float(np.linalg.norm(v_right))
         if min(bottom_len, top_len, left_len, right_len) < 1.0:
-            return 0.0, "R4_degenerate_edges", edge_support
+            return 0.0, "R4_degenerate_edges", edge_support, None
         tb_ratio = top_len / bottom_len
         lr_ratio = left_len / right_len
         if not (0.20 <= tb_ratio <= 2.50 and 0.20 <= lr_ratio <= 2.50):
-            return 0.0, "R4_aspect_out_of_range", edge_support
+            return 0.0, "R4_aspect_out_of_range", edge_support, None
 
         # Soft confidence scoring
         target = 0.15
@@ -318,10 +316,24 @@ class CourtDetector:
         min_y = float(np.min(corners[:, 1])) / float(max(h, 1))
         s_floor = float(np.clip((min_y - float(self.floor_y_min_ratio)) / 0.40, 0.0, 1.0))
         tpl_low = tpl_f1 < 0.05
-        conf = 0.55 * s_line + 0.30 * s_geom + 0.15 * s_floor
+        conf_raw = 0.55 * s_line + 0.30 * s_geom + 0.15 * s_floor
+        conf_after_net = float(conf_raw)
+        if net_like_suspect:
+            conf_after_net *= 0.35
+        conf_final = float(conf_after_net)
         if tpl_low:
-            conf *= 0.85
-        return float(np.clip(conf, 0.0, 1.0)), "OK", edge_support
+            conf_final *= 0.85
+        conf_final = float(np.clip(conf_final, 0.0, 1.0))
+        score_debug = {
+            "conf_raw": float(conf_raw),
+            "conf_after_net": float(conf_after_net),
+            "conf_final": float(conf_final),
+            "net_like_suspect": bool(net_like_suspect),
+            "net_band_hit": bool(net_band_hit),
+            "tpl_low_for_net": bool(tpl_low_for_net),
+            "top_edge_weak_for_net": bool(top_edge_weak_for_net),
+        }
+        return conf_final, "OK", edge_support, score_debug
 
     def detect_court(self, frame: np.ndarray) -> Optional[CourtLines]:
         """
@@ -387,6 +399,7 @@ class CourtDetector:
             conf: float,
             reason: str,
             edge_support: list[float],
+            score_debug: Optional[dict[str, Any]] = None,
         ) -> dict[str, Any]:
             xs = ordered[:, 0]
             ys = ordered[:, 1]
@@ -398,26 +411,41 @@ class CourtDetector:
             net_band_hit = float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
             tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
             top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
-            net_like_flag = bool(net_band_hit and tpl_low_for_net)
+            net_like_suspect = bool(net_band_hit and tpl_low_for_net)
+            conf_raw = float(conf)
+            conf_after_net = float(conf)
+            conf_final = float(conf)
+            if isinstance(score_debug, dict):
+                conf_raw = float(score_debug.get("conf_raw", conf_raw))
+                conf_after_net = float(score_debug.get("conf_after_net", conf_after_net))
+                conf_final = float(score_debug.get("conf_final", conf_final))
+                net_like_suspect = bool(score_debug.get("net_like_suspect", net_like_suspect))
+                net_band_hit = bool(score_debug.get("net_band_hit", net_band_hit))
+                tpl_low_for_net = bool(score_debug.get("tpl_low_for_net", tpl_low_for_net))
+                top_edge_weak_for_net = bool(score_debug.get("top_edge_weak_for_net", top_edge_weak_for_net))
             info = {
                 "tpl_f1": float(tpl_f1),
                 "top_y_norm": float(top_y_norm),
                 "bottom_y_norm": float(bottom_y_norm),
                 "span_y_norm": float(span_y_norm),
                 "top_edge_support": float(top_edge_support),
-                "net_like_reject_triggered": bool(net_like_flag and top_edge_weak_for_net),
-                "net_like_suspect": bool(net_like_flag),
+                "net_like_reject_triggered": False,
+                "net_like_suspect": bool(net_like_suspect),
                 "net_band_hit": bool(net_band_hit),
                 "tpl_low_for_net": bool(tpl_low_for_net),
                 "top_edge_weak_for_net": bool(top_edge_weak_for_net),
                 "tpl_low": bool(tpl_f1 < 0.05),
+                "conf_raw": float(conf_raw),
+                "conf_after_net": float(conf_after_net),
+                "conf_final": float(conf_final),
             }
             record_reason = str(reason)
-            if net_like_flag and top_edge_weak_for_net and record_reason == "OK":
-                record_reason = "R_net_like_quad"
             record = {
                 "corners": ordered.astype(np.float32).tolist(),
                 "conf": float(conf),
+                "conf_raw": float(conf_raw),
+                "conf_after_net": float(conf_after_net),
+                "conf_final": float(conf_final),
                 "reason": record_reason,
                 "top_y_norm": float(top_y_norm),
                 "bottom_y_norm": float(bottom_y_norm),
@@ -427,6 +455,10 @@ class CourtDetector:
                 "tpl_f1": float(tpl_f1),
                 "top_edge_support": float(top_edge_support),
                 "edge_support": [float(v) for v in edge_support],
+                "net_like_suspect": bool(net_like_suspect),
+                "net_band_hit": bool(net_band_hit),
+                "tpl_low_for_net": bool(tpl_low_for_net),
+                "top_edge_weak_for_net": bool(top_edge_weak_for_net),
             }
             record.update(info)
             cand_list = list(mask_stats.get("candidates_topk", []))
@@ -470,6 +502,12 @@ class CourtDetector:
                 metrics["tpl_low_for_net"] = bool(info.get("tpl_low_for_net", False))
                 metrics["top_edge_weak_for_net"] = bool(info.get("top_edge_weak_for_net", False))
                 metrics["tpl_low"] = bool(info.get("tpl_low", False))
+                if info.get("conf_raw") is not None:
+                    metrics["conf_raw"] = float(info.get("conf_raw"))
+                if info.get("conf_after_net") is not None:
+                    metrics["conf_after_net"] = float(info.get("conf_after_net"))
+                if info.get("conf_final") is not None:
+                    metrics["conf_final"] = float(info.get("conf_final"))
             metrics["fallback_triggered"] = False
             metrics.update(mask_stats)
             self.last_metrics = metrics
@@ -531,77 +569,119 @@ class CourtDetector:
                 quad = approx.reshape(4, 2)
                 break
 
-        if quad is None:
-            rect = cv2.minAreaRect(hull)
-            quad = cv2.boxPoints(rect).reshape(4, 2)
-
-        ordered = self._order_corners_lb_rb_rt_lt(quad)
-        xs = ordered[:, 0]
-        ys = ordered[:, 1]
-        if (float(xs.max() - xs.min()) / float(w)) < self.min_bbox_width_ratio:
-            self.last_confidence = 0.0
-            self.last_reason = "bbox_too_narrow"
-            edge_support = self._edge_support_ratios(white, ordered)
-            info = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
-            self.last_edge_support = edge_support
-            _set_metrics(edge_support, info)
-            return None
-        if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
-            self.last_confidence = 0.0
-            self.last_reason = "bbox_too_short"
-            edge_support = self._edge_support_ratios(white, ordered)
-            info = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
-            self.last_edge_support = edge_support
-            _set_metrics(edge_support, info)
-            return None
-
-        conf, reason, edge_support = self._validate_and_score(
-            ordered,
-            white_mask=white,
-            frame_shape=(h, w),
-            floor_bbox_y1_norm=mask_stats.get("floor_bbox_y1"),
+        candidates: list[np.ndarray] = []
+        if quad is not None:
+            candidates.append(quad)
+        rect = cv2.minAreaRect(hull)
+        candidates.append(cv2.boxPoints(rect).reshape(4, 2))
+        rect_cnt = cv2.minAreaRect(best_cnt)
+        candidates.append(cv2.boxPoints(rect_cnt).reshape(4, 2))
+        x, y, ww, hh = cv2.boundingRect(hull)
+        bbox_quad = np.array(
+            [[float(x), float(y + hh - 1)], [float(x + ww - 1), float(y + hh - 1)], [float(x + ww - 1), float(y)], [float(x), float(y)]],
+            dtype=np.float32,
         )
-        info = _push_candidate(ordered, conf, reason, edge_support)
-        self.last_confidence = conf
-        self.last_reason = reason
+        candidates.append(bbox_quad)
+
+        best: tuple[float, str, list[float], np.ndarray, dict[str, Any], bool] | None = None
+        best_reject: tuple[float, str, list[float], np.ndarray, dict[str, Any]] | None = None
+        best_suspect = True
+        for cand in candidates:
+            ordered = self._order_corners_lb_rb_rt_lt(cand)
+            xs = ordered[:, 0]
+            ys = ordered[:, 1]
+            if (float(xs.max() - xs.min()) / float(w)) < self.min_bbox_width_ratio:
+                edge_support = self._edge_support_ratios(white, ordered)
+                info = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
+                if best_reject is None or 0.0 > float(best_reject[0]):
+                    best_reject = (0.0, "bbox_too_narrow", edge_support, ordered, info)
+                continue
+            if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
+                edge_support = self._edge_support_ratios(white, ordered)
+                info = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
+                if best_reject is None or 0.0 > float(best_reject[0]):
+                    best_reject = (0.0, "bbox_too_short", edge_support, ordered, info)
+                continue
+
+            conf, reason, edge_support, score_debug = self._validate_and_score(
+                ordered,
+                white_mask=white,
+                frame_shape=(h, w),
+                floor_bbox_y1_norm=mask_stats.get("floor_bbox_y1"),
+            )
+            info = _push_candidate(ordered, conf, reason, edge_support, score_debug=score_debug)
+            if best_reject is None or float(conf) > float(best_reject[0]):
+                best_reject = (float(conf), str(reason), edge_support, ordered, info)
+            if reason != "OK" or conf < float(self.min_confidence):
+                continue
+
+            cand_suspect = bool(info.get("net_like_suspect", False))
+            if best is None or (best_suspect and not cand_suspect) or (cand_suspect == best_suspect and conf > float(best[0])):
+                best = (float(conf), str(reason), edge_support, ordered, info, cand_suspect)
+                best_suspect = cand_suspect
+
+        if best is None:
+            if best_reject is not None:
+                conf, reason, edge_support, ordered, info = best_reject
+                self.last_confidence = float(conf)
+                self.last_reason = str(reason)
+                self.last_edge_support = edge_support
+                _set_metrics(edge_support, info)
+            return None
+
+        conf, reason, edge_support, ordered, info, _suspect = best
+        self.last_confidence = float(conf)
+        self.last_reason = str(reason)
         self.last_edge_support = edge_support
         _set_metrics(edge_support, info)
-        if reason != "OK" or conf < float(self.min_confidence):
-            if reason == "R_net_like_quad":
-                cand_topk = mask_stats.get("candidates_topk")
-                all_net_like = False
-                if isinstance(cand_topk, list) and cand_topk:
-                    all_net_like = all(str(c.get("reason")) == "R_net_like_quad" for c in cand_topk)
-                if all_net_like and not bool(getattr(self, "_fallback_active", False)):
-                    pre_reason = str(reason)
-                    pre_conf = float(conf)
-                    pre_top_y = info.get("top_y_norm") if isinstance(info, dict) else None
-                    pre_bottom_y = info.get("bottom_y_norm") if isinstance(info, dict) else None
-                    prev_top = float(self.top_crop_ratio)
-                    prev_close = int(self.morph_close_iter)
-                    prev_seed = float(self.floor_seed_y_ratio)
-                    self._fallback_active = True
-                    try:
-                        self.top_crop_ratio = 0.0
-                        self.morph_close_iter = int(max(1, prev_close + 1))
-                        self.floor_seed_y_ratio = float(max(0.20, prev_seed - 0.10))
-                        result = self.detect_court(frame)
-                    finally:
-                        self.top_crop_ratio = prev_top
-                        self.morph_close_iter = prev_close
-                        self.floor_seed_y_ratio = prev_seed
-                        self._fallback_active = False
-                    if isinstance(self.last_metrics, dict):
-                        self.last_metrics["fallback_triggered"] = True
-                        self.last_metrics["fallback_pre_reason"] = pre_reason
-                        self.last_metrics["fallback_pre_conf"] = pre_conf
-                        self.last_metrics["fallback_pre_top_y_norm"] = pre_top_y
-                        self.last_metrics["fallback_pre_bottom_y_norm"] = pre_bottom_y
-                        self.last_metrics["fallback_best_reason"] = self.last_reason
-                        self.last_metrics["fallback_best_conf"] = self.last_confidence
-                        self.last_metrics["fallback_best_top_y_norm"] = self.last_metrics.get("top_y_norm")
-                        self.last_metrics["fallback_best_bottom_y_norm"] = self.last_metrics.get("bottom_y_norm")
-                    return result
-            return None
+
+        cand_topk = mask_stats.get("candidates_topk")
+        all_net_like = False
+        if isinstance(cand_topk, list) and cand_topk:
+            all_net_like = all(bool(c.get("net_like_suspect", False)) for c in cand_topk)
+        if all_net_like and not bool(getattr(self, "_fallback_active", False)):
+            pre_reason = str(reason)
+            pre_conf = float(conf)
+            pre_top_y = info.get("top_y_norm") if isinstance(info, dict) else None
+            pre_bottom_y = info.get("bottom_y_norm") if isinstance(info, dict) else None
+            pre_metrics = dict(self.last_metrics) if isinstance(self.last_metrics, dict) else None
+            prev_top = float(self.top_crop_ratio)
+            prev_close = int(self.morph_close_iter)
+            prev_seed = float(self.floor_seed_y_ratio)
+            self._fallback_active = True
+            try:
+                self.top_crop_ratio = 0.0
+                self.morph_close_iter = int(max(1, prev_close + 1))
+                self.floor_seed_y_ratio = float(max(0.20, prev_seed - 0.10))
+                result = self.detect_court(frame)
+            finally:
+                self.top_crop_ratio = prev_top
+                self.morph_close_iter = prev_close
+                self.floor_seed_y_ratio = prev_seed
+                self._fallback_active = False
+            if isinstance(self.last_metrics, dict):
+                self.last_metrics["fallback_triggered"] = True
+                self.last_metrics["fallback_pre_reason"] = pre_reason
+                self.last_metrics["fallback_pre_conf"] = pre_conf
+                self.last_metrics["fallback_pre_top_y_norm"] = pre_top_y
+                self.last_metrics["fallback_pre_bottom_y_norm"] = pre_bottom_y
+                self.last_metrics["fallback_best_reason"] = self.last_reason
+                self.last_metrics["fallback_best_conf"] = self.last_confidence
+                self.last_metrics["fallback_best_top_y_norm"] = self.last_metrics.get("top_y_norm")
+                self.last_metrics["fallback_best_bottom_y_norm"] = self.last_metrics.get("bottom_y_norm")
+            if result is not None:
+                return result
+            if pre_metrics is not None:
+                pre_metrics["fallback_triggered"] = True
+                pre_metrics["fallback_pre_reason"] = pre_reason
+                pre_metrics["fallback_pre_conf"] = pre_conf
+                pre_metrics["fallback_pre_top_y_norm"] = pre_top_y
+                pre_metrics["fallback_pre_bottom_y_norm"] = pre_bottom_y
+                pre_metrics["fallback_best_reason"] = self.last_reason
+                pre_metrics["fallback_best_conf"] = self.last_confidence
+                if isinstance(self.last_metrics, dict):
+                    pre_metrics["fallback_best_top_y_norm"] = self.last_metrics.get("top_y_norm")
+                    pre_metrics["fallback_best_bottom_y_norm"] = self.last_metrics.get("bottom_y_norm")
+                self.last_metrics = pre_metrics
 
         return CourtLines(corners=ordered.astype(np.float32))
