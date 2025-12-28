@@ -14,7 +14,7 @@ from src.tracking.bytetrack import SimpleByteTrack, Track
 from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
-from src.vision.court_fit_homography import draw_debug_overlay, fit_court_homography
+from src.vision.court_fit_homography import fit_court_homography
 from src.vision.detectors import PlayerDetector
 from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
 
@@ -160,9 +160,12 @@ def analyse_video(
             stride = int(vision_cfg.get("court_detect_stride", 5))
             samples = max(1, samples)
             stride = max(1, stride)
+            if use_model_fit:
+                samples = 1
+                stride = 1
 
-            best = None  # (confidence, corners, meta, frame_bgr, H)
-            best_fail = None  # (confidence, meta)
+            best = None  # (confidence, corners, meta, debug_img, white_mask)
+            best_fail = None  # (confidence, meta, debug_img, white_mask)
             for i in range(samples):
                 fi = int(i * stride)
                 if fi == 0:
@@ -186,11 +189,11 @@ def analyse_video(
                     }
                     if fit.corners is None:
                         if best_fail is None or conf > float(best_fail[0]):
-                            best_fail = (conf, meta_i)
+                            best_fail = (conf, meta_i, fit.debug_image, fit.white_mask)
                         continue
                     corners_i = fit.corners.tolist()
                     if best is None or conf > float(best[0]):
-                        best = (conf, corners_i, meta_i, bgr_i, fit.H)
+                        best = (conf, corners_i, meta_i, fit.debug_image, fit.white_mask)
                 else:
                     rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
                     lines = court_detector.detect_court(rgb) if court_detector is not None else None
@@ -223,8 +226,8 @@ def analyse_video(
                         best = (conf, corners_i, meta_i, None, None)
 
             if best is not None:
-                conf, corners_i, meta_i, best_frame, best_H = best
-                if use_model_fit and best_frame is not None and isinstance(best_H, np.ndarray):
+                conf, corners_i, meta_i, debug_img, white_mask = best
+                if use_model_fit:
                     debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                     debug_path = vision_cfg.get("model_fit_debug_path", None)
                     if debug_path:
@@ -236,23 +239,38 @@ def analyse_video(
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         path = debug_dir / f"{Path(video_path).stem}_court_fit_debug.jpg"
                     metrics = meta_i.get("metrics") if isinstance(meta_i, dict) else None
-                    if isinstance(metrics, dict):
-                        debug_img = draw_debug_overlay(
-                            best_frame,
-                            best_H,
-                            conf=float(meta_i.get("confidence", 0.0)),
-                            inlier_ratio=float(metrics.get("inlier_ratio", 0.0)),
-                            mean_dist_px=float(metrics.get("mean_dist_px", 0.0)),
-                            p90_dist_px=float(metrics.get("p90_dist_px", 0.0)),
-                        )
+                    if isinstance(metrics, dict) and isinstance(debug_img, np.ndarray):
                         cv2.imwrite(str(path), debug_img)
                         metrics["debug_image_path"] = str(path)
+                    if isinstance(metrics, dict) and isinstance(white_mask, np.ndarray):
+                        mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask.png")
+                        cv2.imwrite(str(mask_path), white_mask)
+                        metrics["white_mask_path"] = str(mask_path)
                 court_corners = corners_i
                 court_detection = meta_i
             else:
                 # Auto detector rejected all candidates.
                 if best_fail is not None:
-                    _conf, _meta = best_fail
+                    _conf, _meta, debug_img, white_mask = best_fail
+                    if use_model_fit:
+                        debug_dir = vision_cfg.get("model_fit_debug_dir", None)
+                        debug_path = vision_cfg.get("model_fit_debug_path", None)
+                        if debug_path:
+                            path = Path(debug_path)
+                        else:
+                            if debug_dir is None:
+                                debug_dir = Path("reports") / "demo_friend"
+                            debug_dir = Path(debug_dir)
+                            debug_dir.mkdir(parents=True, exist_ok=True)
+                            path = debug_dir / f"{Path(video_path).stem}_court_fit_debug.jpg"
+                        metrics = _meta.get("metrics") if isinstance(_meta, dict) else None
+                        if isinstance(metrics, dict) and isinstance(debug_img, np.ndarray):
+                            cv2.imwrite(str(path), debug_img)
+                            metrics["debug_image_path"] = str(path)
+                        if isinstance(metrics, dict) and isinstance(white_mask, np.ndarray):
+                            mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask.png")
+                            cv2.imwrite(str(mask_path), white_mask)
+                            metrics["white_mask_path"] = str(mask_path)
                     court_detection = {**_meta, "source": "auto_failed"}
                 else:
                     court_detection = {"source": "auto_failed", "confidence": None, "reason": "no_valid_candidate"}
