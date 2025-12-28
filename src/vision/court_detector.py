@@ -278,8 +278,6 @@ class CourtDetector:
             floor_y1 = max(float(floor_bbox_y1_norm), 0.25)
             if top_y_norm < float(floor_y1 - 0.02):
                 return 0.0, "R_above_floor_bbox", edge_support
-        if tpl_f1 < 0.05:
-            return 0.0, "R_tpl_too_low", edge_support
         if len(edge_support) == 4:
             if top_edge_support < float(self.edge_top_min):
                 return 0.0, "R_top_edge_weak", edge_support
@@ -319,7 +317,10 @@ class CourtDetector:
         s_geom = float(np.clip(1.0 - 0.5 * (ang_tb + ang_lr) / float(self.max_parallel_deg), 0.0, 1.0))
         min_y = float(np.min(corners[:, 1])) / float(max(h, 1))
         s_floor = float(np.clip((min_y - float(self.floor_y_min_ratio)) / 0.40, 0.0, 1.0))
+        tpl_low = tpl_f1 < 0.05
         conf = 0.55 * s_line + 0.30 * s_geom + 0.15 * s_floor
+        if tpl_low:
+            conf *= 0.85
         return float(np.clip(conf, 0.0, 1.0)), "OK", edge_support
 
     def detect_court(self, frame: np.ndarray) -> Optional[CourtLines]:
@@ -405,11 +406,15 @@ class CourtDetector:
                 "span_y_norm": float(span_y_norm),
                 "top_edge_support": float(top_edge_support),
                 "net_like_reject_triggered": bool(net_like_flag),
+                "tpl_low": bool(tpl_f1 < 0.05),
             }
+            record_reason = str(reason)
+            if net_like_flag and record_reason == "OK":
+                record_reason = "R_net_like_quad"
             record = {
                 "corners": ordered.astype(np.float32).tolist(),
                 "conf": float(conf),
-                "reason": str(reason),
+                "reason": record_reason,
                 "top_y_norm": float(top_y_norm),
                 "bottom_y_norm": float(bottom_y_norm),
                 "span_x": float(xs.max() - xs.min()) / float(max(w, 1)),
@@ -456,6 +461,7 @@ class CourtDetector:
                 if info.get("top_edge_support") is not None:
                     metrics["top_edge_support"] = float(info.get("top_edge_support"))
                 metrics["net_like_reject_triggered"] = bool(info.get("net_like_reject_triggered", False))
+                metrics["tpl_low"] = bool(info.get("tpl_low", False))
             metrics.update(mask_stats)
             self.last_metrics = metrics
 
