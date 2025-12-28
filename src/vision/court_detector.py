@@ -327,6 +327,11 @@ class CourtDetector:
         s_floor = float(np.clip((min_y - float(self.floor_y_min_ratio)) / 0.40, 0.0, 1.0))
         tpl_low = tpl_f1 < 0.05
         conf_raw = 0.55 * s_line + 0.30 * s_geom + 0.15 * s_floor
+        conf_bonus_far_top = 0.0
+        if not net_band_hit:
+            bonus_scale = float(np.clip((0.50 - top_y_norm) / 0.20, 0.0, 1.0))
+            conf_bonus_far_top = 0.15 * bonus_scale
+            conf_raw = float(np.clip(conf_raw + conf_bonus_far_top, 0.0, 1.0))
         conf_after_net = float(conf_raw)
         if net_like_suspect:
             conf_after_net *= 0.35
@@ -340,6 +345,7 @@ class CourtDetector:
             "conf_raw": float(conf_raw),
             "conf_after_net": float(conf_after_net),
             "conf_final": float(conf_final),
+            "conf_bonus_far_top": float(conf_bonus_far_top),
             "net_like_suspect": bool(net_like_suspect),
             "net_band_hit": bool(net_band_hit),
             "tpl_low_for_net": bool(tpl_low_for_net),
@@ -440,10 +446,12 @@ class CourtDetector:
             conf_raw = float(conf)
             conf_after_net = float(conf)
             conf_final = float(conf)
+            conf_bonus_far_top = 0.0
             if isinstance(score_debug, dict):
                 conf_raw = float(score_debug.get("conf_raw", conf_raw))
                 conf_after_net = float(score_debug.get("conf_after_net", conf_after_net))
                 conf_final = float(score_debug.get("conf_final", conf_final))
+                conf_bonus_far_top = float(score_debug.get("conf_bonus_far_top", conf_bonus_far_top))
                 net_like_suspect = bool(score_debug.get("net_like_suspect", net_like_suspect))
                 net_band_hit = bool(score_debug.get("net_band_hit", net_band_hit))
                 tpl_low_for_net = bool(score_debug.get("tpl_low_for_net", tpl_low_for_net))
@@ -467,6 +475,7 @@ class CourtDetector:
                 "conf_raw": float(conf_raw),
                 "conf_after_net": float(conf_after_net),
                 "conf_final": float(conf_final),
+                "conf_bonus_far_top": float(conf_bonus_far_top),
                 "proposal_kind": proposal_kind,
             }
             record_reason = str(reason)
@@ -476,6 +485,7 @@ class CourtDetector:
                 "conf_raw": float(conf_raw),
                 "conf_after_net": float(conf_after_net),
                 "conf_final": float(conf_final),
+                "conf_bonus_far_top": float(conf_bonus_far_top),
                 "reason": record_reason,
                 "top_y_norm": float(top_y_norm),
                 "bottom_y_norm": float(bottom_y_norm),
@@ -503,7 +513,15 @@ class CourtDetector:
             cand_list = list(mask_stats.get("candidates_topk", []))
             cand_list.append(record)
             cand_list.sort(key=lambda r: float(r.get("conf", 0.0)), reverse=True)
-            mask_stats["candidates_topk"] = cand_list[:5]
+            cand_list = cand_list[:5]
+            if proposal_kind == "far_suppressed_high" and float(top_y_norm) <= 0.50:
+                has_high = any(r.get("proposal_kind") == "far_suppressed_high" for r in cand_list)
+                if not has_high:
+                    if len(cand_list) < 5:
+                        cand_list.append(record)
+                    else:
+                        cand_list[-1] = record
+            mask_stats["candidates_topk"] = cand_list
             return info
 
         def _set_metrics(edge_support: list[float], info: Optional[dict[str, Any]]) -> None:
@@ -556,6 +574,10 @@ class CourtDetector:
                 if info.get("conf_final") is not None:
                     metrics["conf_final"] = float(info.get("conf_final"))
                     metrics["conf_margin"] = float(info.get("conf_final")) - float(self.min_confidence)
+                if info.get("conf_bonus_far_top") is not None:
+                    metrics["conf_bonus_far_top"] = float(info.get("conf_bonus_far_top"))
+                if info.get("proposal_kind") is not None:
+                    metrics["proposal_kind"] = info.get("proposal_kind")
                 metrics["accepted_below_min_conf"] = bool(info.get("accepted_below_min_conf", False))
             metrics["fallback_triggered"] = False
             metrics.update(mask_stats)
@@ -632,17 +654,12 @@ class CourtDetector:
         )
         candidates.append((bbox_quad, None))
 
-        far_candidates: list[np.ndarray] = []
-        try:
-            white_far = white.copy()
-            net_y1 = int(round(float(h) * float(self.net_suppress_y_min)))
-            net_y2 = int(round(float(h) * float(self.net_suppress_y_max)))
-            y1 = max(0, min(h, min(net_y1, net_y2)))
-            y2 = max(0, min(h, max(net_y1, net_y2)))
-            if y2 > y1:
-                white_far[y1:y2, :] = 0
-            num_f, labels_f, stats_f, centroids_f = cv2.connectedComponentsWithStats(white_far, connectivity=8)
-            if num_f > 1:
+        def _extract_far_candidates(mask: np.ndarray, prefer_top: bool = False) -> list[np.ndarray]:
+            out: list[np.ndarray] = []
+            try:
+                num_f, labels_f, stats_f, centroids_f = cv2.connectedComponentsWithStats(mask, connectivity=8)
+                if num_f <= 1:
+                    return out
                 best_label_f = None
                 best_cost_f = None
                 for lbl in range(1, num_f):
@@ -650,10 +667,13 @@ class CourtDetector:
                     if area_f < min_area:
                         continue
                     cx, cy = centroids_f[lbl]
-                    dist = float(np.hypot(cx - anchor[0], cy - anchor[1]))
-                    dist_norm = dist / diag
-                    area_ratio = area_f / frame_area
-                    cost = dist_norm - 2.0 * area_ratio
+                    if prefer_top:
+                        cost = float(cy)
+                    else:
+                        dist = float(np.hypot(cx - anchor[0], cy - anchor[1]))
+                        dist_norm = dist / diag
+                        area_ratio = area_f / frame_area
+                        cost = dist_norm - 2.0 * area_ratio
                     if best_cost_f is None or cost < best_cost_f:
                         best_cost_f = cost
                         best_label_f = lbl
@@ -673,11 +693,11 @@ class CourtDetector:
                                 quad_f = approx.reshape(4, 2)
                                 break
                         if quad_f is not None:
-                            far_candidates.append(quad_f)
+                            out.append(quad_f)
                         rect_f = cv2.minAreaRect(hull_f)
-                        far_candidates.append(cv2.boxPoints(rect_f).reshape(4, 2))
+                        out.append(cv2.boxPoints(rect_f).reshape(4, 2))
                         rect_cnt_f = cv2.minAreaRect(best_cnt_f)
-                        far_candidates.append(cv2.boxPoints(rect_cnt_f).reshape(4, 2))
+                        out.append(cv2.boxPoints(rect_cnt_f).reshape(4, 2))
                         x_f, y_f, ww_f, hh_f = cv2.boundingRect(hull_f)
                         bbox_f = np.array(
                             [
@@ -688,12 +708,56 @@ class CourtDetector:
                             ],
                             dtype=np.float32,
                         )
-                        far_candidates.append(bbox_f)
-        except Exception:
-            far_candidates = []
+                        out.append(bbox_f)
+            except Exception:
+                return []
+            return out
 
-        for cand in far_candidates:
+        net_y1 = int(round(float(h) * float(self.net_suppress_y_min)))
+        net_y2 = int(round(float(h) * float(self.net_suppress_y_max)))
+        y1 = max(0, min(h, min(net_y1, net_y2)))
+        y2 = max(0, min(h, max(net_y1, net_y2)))
+
+        white_far = white.copy()
+        if y2 > y1:
+            white_far[y1:y2, :] = 0
+        for cand in _extract_far_candidates(white_far):
             candidates.append((cand, "far_suppressed"))
+
+        white_far_high = white.copy()
+        floor_bbox = mask_stats.get("floor_bbox", None)
+        floor_y1_norm = float(mask_stats.get("floor_bbox_y1", 0.0))
+        floor_y2_norm = float(floor_bbox[3]) if isinstance(floor_bbox, list) and len(floor_bbox) == 4 else 1.0
+        floor_y1_px = int(round(float(h) * floor_y1_norm))
+        floor_y2_px = int(round(float(h) * floor_y2_norm))
+        floor_y1_px = max(0, min(h, floor_y1_px))
+        floor_y2_px = max(0, min(h, floor_y2_px))
+        roi_height = max(1, floor_y2_px - floor_y1_px)
+        high_end = int(round(float(floor_y1_px) + 0.35 * float(roi_height)))
+        high_end = max(0, min(h, high_end))
+        if floor_y1_px > 0:
+            white_far_high[:floor_y1_px, :] = 0
+        if high_end < h:
+            white_far_high[high_end:, :] = 0
+        ys_high, xs_high = np.where(white_far_high > 0)
+        if ys_high.size > 0 and xs_high.size > 0:
+            x1_h = float(xs_high.min())
+            x2_h = float(xs_high.max())
+            y1_h = float(ys_high.min())
+            y2_h = float(ys_high.max())
+            if x2_h > x1_h and y2_h > y1_h:
+                bbox_high = np.array(
+                    [
+                        [x1_h, y2_h],
+                        [x2_h, y2_h],
+                        [x2_h, y1_h],
+                        [x1_h, y1_h],
+                    ],
+                    dtype=np.float32,
+                )
+                candidates.append((bbox_high, "far_suppressed_high"))
+        for cand in _extract_far_candidates(white_far_high, prefer_top=True):
+            candidates.append((cand, "far_suppressed_high"))
 
         min_conf = float(self.min_confidence)
         near_min_conf = float(min(min_conf, 0.45))
