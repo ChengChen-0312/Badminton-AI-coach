@@ -400,6 +400,7 @@ class CourtDetector:
             reason: str,
             edge_support: list[float],
             score_debug: Optional[dict[str, Any]] = None,
+            proposal_kind: Optional[str] = None,
         ) -> dict[str, Any]:
             xs = ordered[:, 0]
             ys = ordered[:, 1]
@@ -438,6 +439,7 @@ class CourtDetector:
                 "conf_raw": float(conf_raw),
                 "conf_after_net": float(conf_after_net),
                 "conf_final": float(conf_final),
+                "proposal_kind": proposal_kind,
             }
             record_reason = str(reason)
             record = {
@@ -459,6 +461,7 @@ class CourtDetector:
                 "net_band_hit": bool(net_band_hit),
                 "tpl_low_for_net": bool(tpl_low_for_net),
                 "top_edge_weak_for_net": bool(top_edge_weak_for_net),
+                "proposal_kind": proposal_kind,
             }
             record.update(info)
             cand_list = list(mask_stats.get("candidates_topk", []))
@@ -569,36 +572,99 @@ class CourtDetector:
                 quad = approx.reshape(4, 2)
                 break
 
-        candidates: list[np.ndarray] = []
+        candidates: list[tuple[np.ndarray, Optional[str]]] = []
         if quad is not None:
-            candidates.append(quad)
+            candidates.append((quad, None))
         rect = cv2.minAreaRect(hull)
-        candidates.append(cv2.boxPoints(rect).reshape(4, 2))
+        candidates.append((cv2.boxPoints(rect).reshape(4, 2), None))
         rect_cnt = cv2.minAreaRect(best_cnt)
-        candidates.append(cv2.boxPoints(rect_cnt).reshape(4, 2))
+        candidates.append((cv2.boxPoints(rect_cnt).reshape(4, 2), None))
         x, y, ww, hh = cv2.boundingRect(hull)
         bbox_quad = np.array(
             [[float(x), float(y + hh - 1)], [float(x + ww - 1), float(y + hh - 1)], [float(x + ww - 1), float(y)], [float(x), float(y)]],
             dtype=np.float32,
         )
-        candidates.append(bbox_quad)
+        candidates.append((bbox_quad, None))
+
+        far_candidates: list[np.ndarray] = []
+        try:
+            white_far = white.copy()
+            net_y1 = int(round(float(h) * float(self.net_suppress_y_min)))
+            net_y2 = int(round(float(h) * float(self.net_suppress_y_max)))
+            y1 = max(0, min(h, min(net_y1, net_y2)))
+            y2 = max(0, min(h, max(net_y1, net_y2)))
+            if y2 > y1:
+                white_far[y1:y2, :] = 0
+            num_f, labels_f, stats_f, centroids_f = cv2.connectedComponentsWithStats(white_far, connectivity=8)
+            if num_f > 1:
+                best_label_f = None
+                best_cost_f = None
+                for lbl in range(1, num_f):
+                    area_f = float(stats_f[lbl, cv2.CC_STAT_AREA])
+                    if area_f < min_area:
+                        continue
+                    cx, cy = centroids_f[lbl]
+                    dist = float(np.hypot(cx - anchor[0], cy - anchor[1]))
+                    dist_norm = dist / diag
+                    area_ratio = area_f / frame_area
+                    cost = dist_norm - 2.0 * area_ratio
+                    if best_cost_f is None or cost < best_cost_f:
+                        best_cost_f = cost
+                        best_label_f = lbl
+                if best_label_f is None:
+                    best_label_f = 1 + int(np.argmax(stats_f[1:, cv2.CC_STAT_AREA]))
+                comp_f = (labels_f == int(best_label_f)).astype(np.uint8) * 255
+                contours_f, _ = cv2.findContours(comp_f, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours_f:
+                    best_cnt_f = max(contours_f, key=cv2.contourArea)
+                    hull_f = cv2.convexHull(best_cnt_f)
+                    peri_f = cv2.arcLength(hull_f, True)
+                    if peri_f > 1e-6:
+                        quad_f = None
+                        for eps_frac in np.linspace(0.01, 0.08, 20):
+                            approx = cv2.approxPolyDP(hull_f, eps_frac * peri_f, True)
+                            if len(approx) == 4:
+                                quad_f = approx.reshape(4, 2)
+                                break
+                        if quad_f is not None:
+                            far_candidates.append(quad_f)
+                        rect_f = cv2.minAreaRect(hull_f)
+                        far_candidates.append(cv2.boxPoints(rect_f).reshape(4, 2))
+                        rect_cnt_f = cv2.minAreaRect(best_cnt_f)
+                        far_candidates.append(cv2.boxPoints(rect_cnt_f).reshape(4, 2))
+                        x_f, y_f, ww_f, hh_f = cv2.boundingRect(hull_f)
+                        bbox_f = np.array(
+                            [
+                                [float(x_f), float(y_f + hh_f - 1)],
+                                [float(x_f + ww_f - 1), float(y_f + hh_f - 1)],
+                                [float(x_f + ww_f - 1), float(y_f)],
+                                [float(x_f), float(y_f)],
+                            ],
+                            dtype=np.float32,
+                        )
+                        far_candidates.append(bbox_f)
+        except Exception:
+            far_candidates = []
+
+        for cand in far_candidates:
+            candidates.append((cand, "far_suppressed"))
 
         best: tuple[float, str, list[float], np.ndarray, dict[str, Any], bool] | None = None
         best_reject: tuple[float, str, list[float], np.ndarray, dict[str, Any]] | None = None
         best_suspect = True
-        for cand in candidates:
+        for cand, proposal_kind in candidates:
             ordered = self._order_corners_lb_rb_rt_lt(cand)
             xs = ordered[:, 0]
             ys = ordered[:, 1]
             if (float(xs.max() - xs.min()) / float(w)) < self.min_bbox_width_ratio:
                 edge_support = self._edge_support_ratios(white, ordered)
-                info = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
+                info = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support, proposal_kind=proposal_kind)
                 if best_reject is None or 0.0 > float(best_reject[0]):
                     best_reject = (0.0, "bbox_too_narrow", edge_support, ordered, info)
                 continue
             if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
                 edge_support = self._edge_support_ratios(white, ordered)
-                info = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
+                info = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support, proposal_kind=proposal_kind)
                 if best_reject is None or 0.0 > float(best_reject[0]):
                     best_reject = (0.0, "bbox_too_short", edge_support, ordered, info)
                 continue
@@ -609,7 +675,14 @@ class CourtDetector:
                 frame_shape=(h, w),
                 floor_bbox_y1_norm=mask_stats.get("floor_bbox_y1"),
             )
-            info = _push_candidate(ordered, conf, reason, edge_support, score_debug=score_debug)
+            info = _push_candidate(
+                ordered,
+                conf,
+                reason,
+                edge_support,
+                score_debug=score_debug,
+                proposal_kind=proposal_kind,
+            )
             if best_reject is None or float(conf) > float(best_reject[0]):
                 best_reject = (float(conf), str(reason), edge_support, ordered, info)
             if reason != "OK" or conf < float(self.min_confidence):
