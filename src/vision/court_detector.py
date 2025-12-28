@@ -239,6 +239,7 @@ class CourtDetector:
         white_mask: np.ndarray,
         frame_shape: Tuple[int, int],
         floor_bbox_y1_norm: Optional[float] = None,
+        proposal_kind: Optional[str] = None,
     ) -> tuple[float, str, list[float], dict[str, Any] | None]:
         h, w = int(frame_shape[0]), int(frame_shape[1])
         corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
@@ -268,8 +269,17 @@ class CourtDetector:
         tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
         top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
         net_like_suspect = bool(net_band_hit and tpl_low_for_net)
-        if span_y_norm < 0.45 or span_y_norm > 0.90:
+        span_y_low = span_y_norm < 0.45
+        span_y_high = span_y_norm > 0.90
+        span_y_violated = span_y_low or span_y_high
+        span_y_penalty_applied = False
+        if span_y_high:
             return 0.0, "R_span_y_out_of_range", edge_support, None
+        if span_y_low:
+            if proposal_kind == "far_suppressed":
+                span_y_penalty_applied = True
+            else:
+                return 0.0, "R_span_y_out_of_range", edge_support, None
         if bottom_y_norm < 0.78:
             return 0.0, "R_bottom_too_high", edge_support, None
         if floor_bbox_y1_norm is not None:
@@ -321,6 +331,8 @@ class CourtDetector:
         if net_like_suspect:
             conf_after_net *= 0.35
         conf_final = float(conf_after_net)
+        if span_y_penalty_applied:
+            conf_final *= 0.5
         if tpl_low:
             conf_final *= 0.85
         conf_final = float(np.clip(conf_final, 0.0, 1.0))
@@ -332,6 +344,8 @@ class CourtDetector:
             "net_band_hit": bool(net_band_hit),
             "tpl_low_for_net": bool(tpl_low_for_net),
             "top_edge_weak_for_net": bool(top_edge_weak_for_net),
+            "span_y_violated": bool(span_y_violated),
+            "span_y_penalty_applied": bool(span_y_penalty_applied),
         }
         return conf_final, "OK", edge_support, score_debug
 
@@ -413,6 +427,8 @@ class CourtDetector:
             tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
             top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
             net_like_suspect = bool(net_band_hit and tpl_low_for_net)
+            span_y_violated = bool(span_y_norm < 0.45 or span_y_norm > 0.90)
+            span_y_penalty_applied = False
             conf_raw = float(conf)
             conf_after_net = float(conf)
             conf_final = float(conf)
@@ -424,6 +440,8 @@ class CourtDetector:
                 net_band_hit = bool(score_debug.get("net_band_hit", net_band_hit))
                 tpl_low_for_net = bool(score_debug.get("tpl_low_for_net", tpl_low_for_net))
                 top_edge_weak_for_net = bool(score_debug.get("top_edge_weak_for_net", top_edge_weak_for_net))
+                span_y_violated = bool(score_debug.get("span_y_violated", span_y_violated))
+                span_y_penalty_applied = bool(score_debug.get("span_y_penalty_applied", span_y_penalty_applied))
             info = {
                 "tpl_f1": float(tpl_f1),
                 "top_y_norm": float(top_y_norm),
@@ -436,6 +454,8 @@ class CourtDetector:
                 "tpl_low_for_net": bool(tpl_low_for_net),
                 "top_edge_weak_for_net": bool(top_edge_weak_for_net),
                 "tpl_low": bool(tpl_f1 < 0.05),
+                "span_y_violated": bool(span_y_violated),
+                "span_y_penalty_applied": bool(span_y_penalty_applied),
                 "conf_raw": float(conf_raw),
                 "conf_after_net": float(conf_after_net),
                 "conf_final": float(conf_final),
@@ -461,6 +481,8 @@ class CourtDetector:
                 "net_band_hit": bool(net_band_hit),
                 "tpl_low_for_net": bool(tpl_low_for_net),
                 "top_edge_weak_for_net": bool(top_edge_weak_for_net),
+                "span_y_violated": bool(span_y_violated),
+                "span_y_penalty_applied": bool(span_y_penalty_applied),
                 "proposal_kind": proposal_kind,
             }
             record.update(info)
@@ -505,6 +527,8 @@ class CourtDetector:
                 metrics["tpl_low_for_net"] = bool(info.get("tpl_low_for_net", False))
                 metrics["top_edge_weak_for_net"] = bool(info.get("top_edge_weak_for_net", False))
                 metrics["tpl_low"] = bool(info.get("tpl_low", False))
+                metrics["span_y_violated"] = bool(info.get("span_y_violated", False))
+                metrics["span_y_penalty_applied"] = bool(info.get("span_y_penalty_applied", False))
                 if info.get("conf_raw") is not None:
                     metrics["conf_raw"] = float(info.get("conf_raw"))
                 if info.get("conf_after_net") is not None:
@@ -674,6 +698,7 @@ class CourtDetector:
                 white_mask=white,
                 frame_shape=(h, w),
                 floor_bbox_y1_norm=mask_stats.get("floor_bbox_y1"),
+                proposal_kind=proposal_kind,
             )
             info = _push_candidate(
                 ordered,
