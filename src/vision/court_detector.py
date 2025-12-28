@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -202,6 +202,29 @@ class CourtDetector:
 
         return (labels == int(best_lbl)).astype(np.uint8) * 255
 
+    @staticmethod
+    def _bbox_from_mask(mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+        ys, xs = np.where(mask.astype(bool))
+        if ys.size == 0:
+            return None
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+    @staticmethod
+    def _edge_f1_score(line_mask: np.ndarray, corners_xy: np.ndarray) -> float:
+        if line_mask is None or line_mask.size == 0:
+            return 0.0
+        h, w = line_mask.shape[:2]
+        tmpl = np.zeros((h, w), dtype=np.uint8)
+        pts = np.rint(np.array(corners_xy, dtype=np.float32).reshape(4, 2)).astype(np.int32)
+        cv2.polylines(tmpl, [pts], True, 255, thickness=2)
+        line_b = line_mask > 0
+        tmpl_b = tmpl > 0
+        tp = int(np.count_nonzero(line_b & tmpl_b))
+        fp = int(np.count_nonzero(line_b & (~tmpl_b)))
+        fn = int(np.count_nonzero((~line_b) & tmpl_b))
+        denom = int(2 * tp + fp + fn)
+        return float(2 * tp) / float(max(denom, 1))
+
     def _validate_and_score(
         self,
         corners_xy: np.ndarray,
@@ -307,11 +330,77 @@ class CourtDetector:
         if self.morph_open_iter > 0:
             white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel, iterations=self.morph_open_iter)
 
+        mask_density = float(np.count_nonzero(white)) / float(max(h * w, 1))
+        floor_bbox = self._bbox_from_mask(floor_region) if floor_region is not None else None
+        if floor_bbox is None:
+            floor_bbox = (0, top, w, h)
+        fx1, fy1, fx2, fy2 = floor_bbox
+        mask_stats: dict[str, Any] = {
+            "mask_density": float(mask_density),
+            "top_crop_px": float(top),
+            "floor_bbox": [
+                float(fx1) / float(max(w, 1)),
+                float(fy1) / float(max(h, 1)),
+                float(fx2) / float(max(w, 1)),
+                float(fy2) / float(max(h, 1)),
+            ],
+            "candidates_topk": [],
+        }
+
+        def _push_candidate(
+            ordered: np.ndarray,
+            conf: float,
+            reason: str,
+            edge_support: list[float],
+        ) -> float:
+            xs = ordered[:, 0]
+            ys = ordered[:, 1]
+            top_y_norm = float((ordered[2, 1] + ordered[3, 1]) * 0.5) / float(max(h, 1))
+            bottom_y_norm = float((ordered[0, 1] + ordered[1, 1]) * 0.5) / float(max(h, 1))
+            tpl_f1 = float(self._edge_f1_score(white, ordered))
+            record = {
+                "corners": ordered.astype(np.float32).tolist(),
+                "conf": float(conf),
+                "reason": str(reason),
+                "top_y_norm": float(top_y_norm),
+                "bottom_y_norm": float(bottom_y_norm),
+                "span_x": float(xs.max() - xs.min()) / float(max(w, 1)),
+                "span_y": float(ys.max() - ys.min()) / float(max(h, 1)),
+                "tpl_f1": float(tpl_f1),
+                "edge_support": [float(v) for v in edge_support],
+            }
+            cand_list = list(mask_stats.get("candidates_topk", []))
+            cand_list.append(record)
+            cand_list.sort(key=lambda r: float(r.get("conf", 0.0)), reverse=True)
+            mask_stats["candidates_topk"] = cand_list[:5]
+            return tpl_f1
+
+        def _set_metrics(edge_support: list[float], tpl_f1: Optional[float]) -> None:
+            edge_support_by_side = None
+            if len(edge_support) == 4:
+                edge_support_by_side = {
+                    "bottom": float(edge_support[0]),
+                    "right": float(edge_support[1]),
+                    "top": float(edge_support[2]),
+                    "left": float(edge_support[3]),
+                }
+            metrics: dict[str, Any] = {
+                "edge_support_by_side": edge_support_by_side,
+                "cfg_edge_top_min": float(self.edge_top_min),
+                "cfg_edge_bottom_min": float(self.edge_bottom_min),
+                "cfg_edge_min_floor": float(self.edge_min_floor),
+            }
+            if tpl_f1 is not None:
+                metrics["tpl_f1"] = float(tpl_f1)
+            metrics.update(mask_stats)
+            self.last_metrics = metrics
+
         # Connected-component selection is more robust than raw contour sorting for thin line masks.
         num, labels, stats, centroids = cv2.connectedComponentsWithStats(white, connectivity=8)
         if num <= 1:
             self.last_confidence = 0.0
             self.last_reason = "no_components"
+            self.last_metrics = mask_stats
             return None
 
         min_area = float(h * w) * self.min_contour_area_ratio
@@ -344,6 +433,7 @@ class CourtDetector:
         if not contours:
             self.last_confidence = 0.0
             self.last_reason = "no_contours"
+            self.last_metrics = mask_stats
             return None
         best_cnt = max(contours, key=cv2.contourArea)
         hull = cv2.convexHull(best_cnt)
@@ -351,6 +441,7 @@ class CourtDetector:
         if peri < 1e-6:
             self.last_confidence = 0.0
             self.last_reason = "degenerate_hull"
+            self.last_metrics = mask_stats
             return None
 
         quad = None
@@ -371,30 +462,26 @@ class CourtDetector:
         if (float(xs.max() - xs.min()) / float(w)) < self.min_bbox_width_ratio:
             self.last_confidence = 0.0
             self.last_reason = "bbox_too_narrow"
+            edge_support = self._edge_support_ratios(white, ordered)
+            tpl_f1 = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
+            self.last_edge_support = edge_support
+            _set_metrics(edge_support, tpl_f1)
             return None
         if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
             self.last_confidence = 0.0
             self.last_reason = "bbox_too_short"
+            edge_support = self._edge_support_ratios(white, ordered)
+            tpl_f1 = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
+            self.last_edge_support = edge_support
+            _set_metrics(edge_support, tpl_f1)
             return None
 
         conf, reason, edge_support = self._validate_and_score(ordered, white_mask=white, frame_shape=(h, w))
+        tpl_f1 = _push_candidate(ordered, conf, reason, edge_support)
         self.last_confidence = conf
         self.last_reason = reason
         self.last_edge_support = edge_support
-        edge_support_by_side = None
-        if len(edge_support) == 4:
-            edge_support_by_side = {
-                "bottom": float(edge_support[0]),
-                "right": float(edge_support[1]),
-                "top": float(edge_support[2]),
-                "left": float(edge_support[3]),
-            }
-        self.last_metrics = {
-            "edge_support_by_side": edge_support_by_side,
-            "cfg_edge_top_min": float(self.edge_top_min),
-            "cfg_edge_bottom_min": float(self.edge_bottom_min),
-            "cfg_edge_min_floor": float(self.edge_min_floor),
-        }
+        _set_metrics(edge_support, tpl_f1)
         if reason != "OK" or conf < float(self.min_confidence):
             return None
 

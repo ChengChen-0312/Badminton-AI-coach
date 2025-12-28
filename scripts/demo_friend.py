@@ -564,6 +564,45 @@ def main() -> None:
         enable_timeline=bool(viz_cfg.get("enable_timeline", True)) and (not args.no_timeline),
         heatmap_bins=int(viz_cfg.get("heatmap_bins", 32)),
     )
+    report_json = out.get("json")
+    if report_json:
+        try:
+            report_path = Path(report_json)
+            if not report_path.is_absolute():
+                report_path = out_dir / report_path
+            report_data: Any = {}
+            if report_path.exists():
+                report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            if isinstance(report_data, list):
+                report_data = {"strokes": report_data}
+            det = getattr(analysis, "court_detection", None)
+            corners = None
+            if isinstance(getattr(analysis, "court_corners", None), list) and len(analysis.court_corners) == 4:
+                try:
+                    corners = [[float(x), float(y)] for x, y in analysis.court_corners]
+                except Exception:
+                    corners = analysis.court_corners
+            source = None
+            confidence = None
+            reason = None
+            last_metrics = None
+            if isinstance(det, dict):
+                source = det.get("source")
+                confidence = det.get("confidence")
+                reason = det.get("reason")
+                last_metrics = det.get("metrics")
+            if source not in ("manual", "auto", "auto_failed"):
+                source = "auto" if corners is not None else "auto_failed"
+            report_data["court_detection"] = {
+                "source": source,
+                "corners": corners,
+                "confidence": confidence,
+                "reason": reason,
+                "last_metrics": last_metrics,
+            }
+            report_path.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            print(f"[WARN] Failed to write court_detection into report JSON: {exc}")
 
     court_debug_path: Optional[Path] = None
     if not args.no_court_debug:

@@ -151,6 +151,7 @@ def analyse_video(
             stride = max(1, stride)
 
             best = None  # (confidence, corners, meta)
+            best_fail = None  # (confidence, meta)
             for i in range(samples):
                 fi = int(i * stride)
                 if fi == 0:
@@ -170,9 +171,6 @@ def analyse_video(
                     else None
                 )
                 metrics = court_detector.last_metrics if isinstance(court_detector.last_metrics, dict) else None
-                if lines is None or lines.corners is None:
-                    continue
-                corners_i = lines.corners.tolist()
                 meta_i = {
                     "source": "auto",
                     "confidence": conf,
@@ -181,6 +179,11 @@ def analyse_video(
                     "edge_support": edge_support,
                     "metrics": metrics,
                 }
+                if lines is None or lines.corners is None:
+                    if best_fail is None or conf > float(best_fail[0]):
+                        best_fail = (conf, meta_i)
+                    continue
+                corners_i = lines.corners.tolist()
                 if best is None or conf > float(best[0]):
                     best = (conf, corners_i, meta_i)
 
@@ -189,17 +192,11 @@ def analyse_video(
                 court_detection = best[2]
             else:
                 # Auto detector rejected all candidates.
-                court_detection = {
-                    "source": "auto_failed",
-                    "confidence": float(court_detector.last_confidence) if court_detector.last_confidence is not None else None,
-                    "reason": str(court_detector.last_reason) if court_detector.last_reason is not None else None,
-                    "edge_support": (
-                        [float(v) for v in court_detector.last_edge_support]
-                        if isinstance(court_detector.last_edge_support, list)
-                        else None
-                    ),
-                    "metrics": court_detector.last_metrics if isinstance(court_detector.last_metrics, dict) else None,
-                }
+                if best_fail is not None:
+                    _conf, _meta = best_fail
+                    court_detection = {**_meta, "source": "auto_failed"}
+                else:
+                    court_detection = {"source": "auto_failed", "confidence": None, "reason": "no_valid_candidate"}
 
         if court_corners is not None and use_court_roi:
             xs = np.array([p[0] for p in court_corners], dtype=np.float32)
