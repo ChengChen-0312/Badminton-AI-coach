@@ -462,6 +462,7 @@ class CourtDetector:
                     metrics["top_edge_support"] = float(info.get("top_edge_support"))
                 metrics["net_like_reject_triggered"] = bool(info.get("net_like_reject_triggered", False))
                 metrics["tpl_low"] = bool(info.get("tpl_low", False))
+            metrics["fallback_triggered"] = False
             metrics.update(mask_stats)
             self.last_metrics = metrics
 
@@ -558,6 +559,41 @@ class CourtDetector:
         self.last_edge_support = edge_support
         _set_metrics(edge_support, info)
         if reason != "OK" or conf < float(self.min_confidence):
+            if reason == "R_net_like_quad":
+                cand_topk = mask_stats.get("candidates_topk")
+                all_net_like = False
+                if isinstance(cand_topk, list) and cand_topk:
+                    all_net_like = all(str(c.get("reason")) == "R_net_like_quad" for c in cand_topk)
+                if all_net_like and not bool(getattr(self, "_fallback_active", False)):
+                    pre_reason = str(reason)
+                    pre_conf = float(conf)
+                    pre_top_y = info.get("top_y_norm") if isinstance(info, dict) else None
+                    pre_bottom_y = info.get("bottom_y_norm") if isinstance(info, dict) else None
+                    prev_top = float(self.top_crop_ratio)
+                    prev_close = int(self.morph_close_iter)
+                    prev_seed = float(self.floor_seed_y_ratio)
+                    self._fallback_active = True
+                    try:
+                        self.top_crop_ratio = 0.0
+                        self.morph_close_iter = int(max(1, prev_close + 1))
+                        self.floor_seed_y_ratio = float(max(0.20, prev_seed - 0.10))
+                        result = self.detect_court(frame)
+                    finally:
+                        self.top_crop_ratio = prev_top
+                        self.morph_close_iter = prev_close
+                        self.floor_seed_y_ratio = prev_seed
+                        self._fallback_active = False
+                    if isinstance(self.last_metrics, dict):
+                        self.last_metrics["fallback_triggered"] = True
+                        self.last_metrics["fallback_pre_reason"] = pre_reason
+                        self.last_metrics["fallback_pre_conf"] = pre_conf
+                        self.last_metrics["fallback_pre_top_y_norm"] = pre_top_y
+                        self.last_metrics["fallback_pre_bottom_y_norm"] = pre_bottom_y
+                        self.last_metrics["fallback_best_reason"] = self.last_reason
+                        self.last_metrics["fallback_best_conf"] = self.last_confidence
+                        self.last_metrics["fallback_best_top_y_norm"] = self.last_metrics.get("top_y_norm")
+                        self.last_metrics["fallback_best_bottom_y_norm"] = self.last_metrics.get("bottom_y_norm")
+                    return result
             return None
 
         return CourtLines(corners=ordered.astype(np.float32))
