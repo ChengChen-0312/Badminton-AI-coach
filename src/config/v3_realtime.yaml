@@ -11,12 +11,37 @@ vision:
   edge_top_min: 0.20
   edge_bottom_min: 0.18
   edge_min_floor: 0.10
+
+  court_detector_method: "farin2005"   # 改这里：先用 farin2005
+
+  top_crop_ratio: 0.05
+  floor_close_kernel: 45              # 比 35 更容易桥接网导致的断裂
+  floor_close_iter: 2                 # 迭代一次常常不够
+
+  min_confidence: 0.45                # 先放宽，先确保能出 corners（之后再升回 0.60）
+  court_min_span_x_norm: 0.75         # 避免选到内部小矩形（先中等偏紧）
+  court_min_span_y_norm: 0.70
+  court_tpl_weight: 0.40              # 更依赖模板匹配，压制发球区矩形
+
+  net_suppress_y_min: 0.35
+  net_suppress_y_max: 0.55
+  net_penalty: 0.60
+  tpl_net_reject_max: 0.14
+  top_edge_net_reject_max: 0.18
+
+  court_bottom_min_y_norm: 0.78
+
+  gap_scan_enable: true
+  gap_row_density_thresh: 0.003
+  gap_min_height_norm: 0.03
+  gap_penalty_or_reject: "reject"     # "reject" | "penalty"
+  gap_penalty: 0.60
   use_court_roi: false
   court_roi_margin: 0.05
+
   yolo_model: "yolov8n.pt"
   ball_model: "yolov8n.pt"
   ball_allow_all_if_empty: true
-
 tracking:
   detect_stride: 1
   max_age: 10

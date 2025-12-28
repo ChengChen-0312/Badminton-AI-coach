@@ -43,6 +43,10 @@ class CourtDetector:
         edge_top_min: float = 0.20,
         edge_bottom_min: float = 0.18,
         edge_min_floor: float = 0.10,
+        net_suppress_y_min: float = 0.35,
+        net_suppress_y_max: float = 0.55,
+        tpl_net_reject_max: float = 0.14,
+        top_edge_net_reject_max: float = 0.18,
         min_strong_edges: int = 2,
         min_confidence: float = 0.55,
         support_dilate: int = 5,
@@ -70,6 +74,10 @@ class CourtDetector:
         self.edge_top_min = float(edge_top_min)
         self.edge_bottom_min = float(edge_bottom_min)
         self.edge_min_floor = float(edge_min_floor)
+        self.net_suppress_y_min = float(net_suppress_y_min)
+        self.net_suppress_y_max = float(net_suppress_y_max)
+        self.tpl_net_reject_max = float(tpl_net_reject_max)
+        self.top_edge_net_reject_max = float(top_edge_net_reject_max)
         self.min_strong_edges = int(min_strong_edges)
         self.min_confidence = float(min_confidence)
         self.support_dilate = int(support_dilate)
@@ -244,10 +252,19 @@ class CourtDetector:
             return 0.0, "R1_not_on_floor", [0.0, 0.0, 0.0, 0.0]
 
         # R2: require white-line support along edges
+        top_edge_y = float((corners[2, 1] + corners[3, 1]) * 0.5)
+        top_y_norm = float(top_edge_y) / float(max(h, 1))
         edge_support = self._edge_support_ratios(white_mask, corners)
+        top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
+        bottom_edge_support = float(edge_support[0]) if len(edge_support) == 4 else 0.0
+        tpl_f1 = float(self._edge_f1_score(white_mask, corners))
+        if (
+            float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
+            and float(tpl_f1) < float(self.tpl_net_reject_max)
+            and float(top_edge_support) < float(self.top_edge_net_reject_max)
+        ):
+            return 0.0, "R_net_like_quad", edge_support
         if len(edge_support) == 4:
-            bottom_edge_support = float(edge_support[0])
-            top_edge_support = float(edge_support[2])
             if top_edge_support < float(self.edge_top_min):
                 return 0.0, "R_top_edge_weak", edge_support
             if bottom_edge_support < float(self.edge_bottom_min):
@@ -352,12 +369,24 @@ class CourtDetector:
             conf: float,
             reason: str,
             edge_support: list[float],
-        ) -> float:
+        ) -> dict[str, Any]:
             xs = ordered[:, 0]
             ys = ordered[:, 1]
             top_y_norm = float((ordered[2, 1] + ordered[3, 1]) * 0.5) / float(max(h, 1))
             bottom_y_norm = float((ordered[0, 1] + ordered[1, 1]) * 0.5) / float(max(h, 1))
             tpl_f1 = float(self._edge_f1_score(white, ordered))
+            top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
+            net_like_reject = (
+                float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
+                and float(tpl_f1) < float(self.tpl_net_reject_max)
+                and float(top_edge_support) < float(self.top_edge_net_reject_max)
+            )
+            info = {
+                "tpl_f1": float(tpl_f1),
+                "top_y_norm": float(top_y_norm),
+                "top_edge_support": float(top_edge_support),
+                "net_like_reject_triggered": bool(net_like_reject),
+            }
             record = {
                 "corners": ordered.astype(np.float32).tolist(),
                 "conf": float(conf),
@@ -367,15 +396,17 @@ class CourtDetector:
                 "span_x": float(xs.max() - xs.min()) / float(max(w, 1)),
                 "span_y": float(ys.max() - ys.min()) / float(max(h, 1)),
                 "tpl_f1": float(tpl_f1),
+                "top_edge_support": float(top_edge_support),
                 "edge_support": [float(v) for v in edge_support],
             }
+            record.update(info)
             cand_list = list(mask_stats.get("candidates_topk", []))
             cand_list.append(record)
             cand_list.sort(key=lambda r: float(r.get("conf", 0.0)), reverse=True)
             mask_stats["candidates_topk"] = cand_list[:5]
-            return tpl_f1
+            return info
 
-        def _set_metrics(edge_support: list[float], tpl_f1: Optional[float]) -> None:
+        def _set_metrics(edge_support: list[float], info: Optional[dict[str, Any]]) -> None:
             edge_support_by_side = None
             if len(edge_support) == 4:
                 edge_support_by_side = {
@@ -389,9 +420,18 @@ class CourtDetector:
                 "cfg_edge_top_min": float(self.edge_top_min),
                 "cfg_edge_bottom_min": float(self.edge_bottom_min),
                 "cfg_edge_min_floor": float(self.edge_min_floor),
+                "cfg_net_band": [float(self.net_suppress_y_min), float(self.net_suppress_y_max)],
+                "cfg_tpl_net_reject_max": float(self.tpl_net_reject_max),
+                "cfg_top_edge_net_reject_max": float(self.top_edge_net_reject_max),
             }
-            if tpl_f1 is not None:
-                metrics["tpl_f1"] = float(tpl_f1)
+            if isinstance(info, dict):
+                if info.get("tpl_f1") is not None:
+                    metrics["tpl_f1"] = float(info.get("tpl_f1"))
+                if info.get("top_y_norm") is not None:
+                    metrics["top_y_norm"] = float(info.get("top_y_norm"))
+                if info.get("top_edge_support") is not None:
+                    metrics["top_edge_support"] = float(info.get("top_edge_support"))
+                metrics["net_like_reject_triggered"] = bool(info.get("net_like_reject_triggered", False))
             metrics.update(mask_stats)
             self.last_metrics = metrics
 
@@ -463,25 +503,25 @@ class CourtDetector:
             self.last_confidence = 0.0
             self.last_reason = "bbox_too_narrow"
             edge_support = self._edge_support_ratios(white, ordered)
-            tpl_f1 = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
+            info = _push_candidate(ordered, 0.0, "bbox_too_narrow", edge_support)
             self.last_edge_support = edge_support
-            _set_metrics(edge_support, tpl_f1)
+            _set_metrics(edge_support, info)
             return None
         if (float(ys.max() - ys.min()) / float(h)) < self.min_bbox_height_ratio:
             self.last_confidence = 0.0
             self.last_reason = "bbox_too_short"
             edge_support = self._edge_support_ratios(white, ordered)
-            tpl_f1 = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
+            info = _push_candidate(ordered, 0.0, "bbox_too_short", edge_support)
             self.last_edge_support = edge_support
-            _set_metrics(edge_support, tpl_f1)
+            _set_metrics(edge_support, info)
             return None
 
         conf, reason, edge_support = self._validate_and_score(ordered, white_mask=white, frame_shape=(h, w))
-        tpl_f1 = _push_candidate(ordered, conf, reason, edge_support)
+        info = _push_candidate(ordered, conf, reason, edge_support)
         self.last_confidence = conf
         self.last_reason = reason
         self.last_edge_support = edge_support
-        _set_metrics(edge_support, tpl_f1)
+        _set_metrics(edge_support, info)
         if reason != "OK" or conf < float(self.min_confidence):
             return None
 

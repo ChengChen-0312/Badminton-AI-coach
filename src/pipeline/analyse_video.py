@@ -62,6 +62,10 @@ def analyse_video(
     edge_top_min = float(vision_cfg.get("edge_top_min", 0.20))
     edge_bottom_min = float(vision_cfg.get("edge_bottom_min", 0.18))
     edge_min_floor = float(vision_cfg.get("edge_min_floor", 0.10))
+    net_suppress_y_min = float(vision_cfg.get("net_suppress_y_min", 0.35))
+    net_suppress_y_max = float(vision_cfg.get("net_suppress_y_max", 0.55))
+    tpl_net_reject_max = float(vision_cfg.get("tpl_net_reject_max", 0.14))
+    top_edge_net_reject_max = float(vision_cfg.get("top_edge_net_reject_max", 0.18))
     court_corners: Optional[List[List[float]]] = None
     court_detection: Dict[str, Any] = {"source": "none", "confidence": None, "reason": None}
     manual_corners = vision_cfg.get("court_corners")
@@ -106,6 +110,10 @@ def analyse_video(
             edge_top_min=edge_top_min,
             edge_bottom_min=edge_bottom_min,
             edge_min_floor=edge_min_floor,
+            net_suppress_y_min=net_suppress_y_min,
+            net_suppress_y_max=net_suppress_y_max,
+            tpl_net_reject_max=tpl_net_reject_max,
+            top_edge_net_reject_max=top_edge_net_reject_max,
         )
         if (detect_court_corners or use_court_roi)
         else None
