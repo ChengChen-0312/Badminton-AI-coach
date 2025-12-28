@@ -3,6 +3,9 @@ vision:
   court_model: "court_segmenter.pt"
   pose_model: "yolo-pose-s"
   device: "mps"
+  edge_top_min: 0.20
+  edge_bottom_min: 0.18
+  edge_min_floor: 0.10
 
 tracking:
   player: "bytetrack"

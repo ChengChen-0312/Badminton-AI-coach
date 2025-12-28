@@ -40,6 +40,9 @@ class CourtDetector:
         max_parallel_deg: float = 25.0,
         min_edge_support_strong: float = 0.12,
         min_edge_support_weak: float = 0.05,
+        edge_top_min: float = 0.20,
+        edge_bottom_min: float = 0.18,
+        edge_min_floor: float = 0.10,
         min_strong_edges: int = 2,
         min_confidence: float = 0.55,
         support_dilate: int = 5,
@@ -64,6 +67,9 @@ class CourtDetector:
         self.max_parallel_deg = float(max_parallel_deg)
         self.min_edge_support_strong = float(min_edge_support_strong)
         self.min_edge_support_weak = float(min_edge_support_weak)
+        self.edge_top_min = float(edge_top_min)
+        self.edge_bottom_min = float(edge_bottom_min)
+        self.edge_min_floor = float(edge_min_floor)
         self.min_strong_edges = int(min_strong_edges)
         self.min_confidence = float(min_confidence)
         self.support_dilate = int(support_dilate)
@@ -77,6 +83,7 @@ class CourtDetector:
         self.last_confidence: float | None = None
         self.last_reason: str | None = None
         self.last_edge_support: list[float] | None = None
+        self.last_metrics: dict | None = None
 
     @staticmethod
     def _order_corners_lb_rb_rt_lt(pts_xy: np.ndarray) -> np.ndarray:
@@ -130,11 +137,12 @@ class CourtDetector:
             support = white_mask
 
         corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
+        # Order: bottom, right, top, left (LB->RB, RB->RT, RT->LT, LT->LB).
         edges = [
-            (corners[0], corners[1]),  # LB->RB
-            (corners[1], corners[2]),  # RB->RT
-            (corners[2], corners[3]),  # RT->LT
-            (corners[3], corners[0]),  # LT->LB
+            (corners[0], corners[1]),  # bottom
+            (corners[1], corners[2]),  # right
+            (corners[2], corners[3]),  # top
+            (corners[3], corners[0]),  # left
         ]
         ratios: list[float] = []
         n = max(20, int(self.edge_sample_points))
@@ -214,6 +222,15 @@ class CourtDetector:
 
         # R2: require white-line support along edges
         edge_support = self._edge_support_ratios(white_mask, corners)
+        if len(edge_support) == 4:
+            bottom_edge_support = float(edge_support[0])
+            top_edge_support = float(edge_support[2])
+            if top_edge_support < float(self.edge_top_min):
+                return 0.0, "R_top_edge_weak", edge_support
+            if bottom_edge_support < float(self.edge_bottom_min):
+                return 0.0, "R_bottom_edge_weak", edge_support
+            if min(edge_support) < float(self.edge_min_floor):
+                return 0.0, "R_edge_too_weak", edge_support
         strong = sum(1 for r in edge_support if r >= float(self.min_edge_support_strong))
         if strong < int(self.min_strong_edges) or min(edge_support) < float(self.min_edge_support_weak):
             return 0.0, "R2_weak_line_support", edge_support
@@ -260,6 +277,7 @@ class CourtDetector:
         self.last_confidence = None
         self.last_reason = None
         self.last_edge_support = None
+        self.last_metrics = None
 
         if frame is None or frame.ndim != 3:
             self.last_confidence = 0.0
@@ -363,6 +381,20 @@ class CourtDetector:
         self.last_confidence = conf
         self.last_reason = reason
         self.last_edge_support = edge_support
+        edge_support_by_side = None
+        if len(edge_support) == 4:
+            edge_support_by_side = {
+                "bottom": float(edge_support[0]),
+                "right": float(edge_support[1]),
+                "top": float(edge_support[2]),
+                "left": float(edge_support[3]),
+            }
+        self.last_metrics = {
+            "edge_support_by_side": edge_support_by_side,
+            "cfg_edge_top_min": float(self.edge_top_min),
+            "cfg_edge_bottom_min": float(self.edge_bottom_min),
+            "cfg_edge_min_floor": float(self.edge_min_floor),
+        }
         if reason != "OK" or conf < float(self.min_confidence):
             return None
 

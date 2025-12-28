@@ -589,6 +589,7 @@ def main() -> None:
                     src = det.get("source", "unknown")
                     conf = det.get("confidence", None)
                     reason = det.get("reason", None)
+                    edge_support = det.get("edge_support", None)
                     extra = []
                     if conf is not None:
                         try:
@@ -597,6 +598,11 @@ def main() -> None:
                             extra.append(f"conf={conf}")
                     if reason:
                         extra.append(f"reason={reason}")
+                    if isinstance(edge_support, (list, tuple)) and len(edge_support) == 4:
+                        try:
+                            extra.append(f"top_edge={float(edge_support[2]):.2f}")
+                        except Exception:
+                            pass
                     corner_source = f"{src} ({', '.join(extra)})" if extra else str(src)
                 else:
                     corner_source = "unknown"

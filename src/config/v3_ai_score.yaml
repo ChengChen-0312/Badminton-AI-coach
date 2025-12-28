@@ -5,6 +5,9 @@ device:
 vision:
   yolo_imgsz: 512
   yolo_conf: 0.25
+  edge_top_min: 0.20
+  edge_bottom_min: 0.18
+  edge_min_floor: 0.10
   use_court_roi: false
   yolo_model: "yolov8n.pt"
   ball_model: "yolov8n.pt"

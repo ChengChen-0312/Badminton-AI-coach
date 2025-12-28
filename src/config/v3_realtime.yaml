@@ -8,6 +8,9 @@ device:
 vision:
   yolo_imgsz: 512
   yolo_conf: 0.25
+  edge_top_min: 0.20
+  edge_bottom_min: 0.18
+  edge_min_floor: 0.10
   use_court_roi: false
   court_roi_margin: 0.05
   yolo_model: "yolov8n.pt"
@@ -38,4 +41,3 @@ pose:
   backend: mediapipe
   stride: 2      # 可调
   window: 3      # contact 帧±3 帧内找最近 pose
-

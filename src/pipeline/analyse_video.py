@@ -59,6 +59,9 @@ def analyse_video(
     yolo_conf = vision_cfg.get("yolo_conf", 0.25)
     use_court_roi = vision_cfg.get("use_court_roi", False)
     court_margin = vision_cfg.get("court_roi_margin", 0.0)
+    edge_top_min = float(vision_cfg.get("edge_top_min", 0.20))
+    edge_bottom_min = float(vision_cfg.get("edge_bottom_min", 0.18))
+    edge_min_floor = float(vision_cfg.get("edge_min_floor", 0.10))
     court_corners: Optional[List[List[float]]] = None
     court_detection: Dict[str, Any] = {"source": "none", "confidence": None, "reason": None}
     manual_corners = vision_cfg.get("court_corners")
@@ -98,7 +101,15 @@ def analyse_video(
         max_age=tracking_cfg.get("ball_max_age", 5),
     )
     detect_court_corners = bool(vision_cfg.get("detect_court_corners", True))
-    court_detector = CourtDetector() if (detect_court_corners or use_court_roi) else None
+    court_detector = (
+        CourtDetector(
+            edge_top_min=edge_top_min,
+            edge_bottom_min=edge_bottom_min,
+            edge_min_floor=edge_min_floor,
+        )
+        if (detect_court_corners or use_court_roi)
+        else None
+    )
 
     # Pose settings
     enable_pose = pose_cfg.get("enable", False)
@@ -153,10 +164,23 @@ def analyse_video(
                 lines = court_detector.detect_court(rgb)
                 conf = float(court_detector.last_confidence or 0.0)
                 reason = str(court_detector.last_reason or "unknown")
+                edge_support = (
+                    [float(v) for v in court_detector.last_edge_support]
+                    if isinstance(court_detector.last_edge_support, list)
+                    else None
+                )
+                metrics = court_detector.last_metrics if isinstance(court_detector.last_metrics, dict) else None
                 if lines is None or lines.corners is None:
                     continue
                 corners_i = lines.corners.tolist()
-                meta_i = {"source": "auto", "confidence": conf, "reason": reason, "frame_idx": fi}
+                meta_i = {
+                    "source": "auto",
+                    "confidence": conf,
+                    "reason": reason,
+                    "frame_idx": fi,
+                    "edge_support": edge_support,
+                    "metrics": metrics,
+                }
                 if best is None or conf > float(best[0]):
                     best = (conf, corners_i, meta_i)
 
@@ -169,6 +193,12 @@ def analyse_video(
                     "source": "auto_failed",
                     "confidence": float(court_detector.last_confidence) if court_detector.last_confidence is not None else None,
                     "reason": str(court_detector.last_reason) if court_detector.last_reason is not None else None,
+                    "edge_support": (
+                        [float(v) for v in court_detector.last_edge_support]
+                        if isinstance(court_detector.last_edge_support, list)
+                        else None
+                    ),
+                    "metrics": court_detector.last_metrics if isinstance(court_detector.last_metrics, dict) else None,
                 }
 
         if court_corners is not None and use_court_roi:
