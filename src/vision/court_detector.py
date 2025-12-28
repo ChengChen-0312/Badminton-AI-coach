@@ -264,11 +264,11 @@ class CourtDetector:
         top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
         bottom_edge_support = float(edge_support[0]) if len(edge_support) == 4 else 0.0
         tpl_f1 = float(self._edge_f1_score(white_mask, corners))
-        net_like_flag = (
-            float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
-            and float(tpl_f1) < float(self.tpl_net_reject_max)
-        )
-        if net_like_flag:
+        net_band_hit = float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
+        tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
+        top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
+        net_like_flag = bool(net_band_hit and tpl_low_for_net)
+        if net_like_flag and top_edge_weak_for_net:
             return 0.0, "R_net_like_quad", edge_support
         if span_y_norm < 0.45 or span_y_norm > 0.90:
             return 0.0, "R_span_y_out_of_range", edge_support
@@ -395,21 +395,25 @@ class CourtDetector:
             tpl_f1 = float(self._edge_f1_score(white, ordered))
             span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
             top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
-            net_like_flag = (
-                float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
-                and float(tpl_f1) < float(self.tpl_net_reject_max)
-            )
+            net_band_hit = float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
+            tpl_low_for_net = float(tpl_f1) <= float(self.tpl_net_reject_max)
+            top_edge_weak_for_net = float(top_edge_support) <= float(self.top_edge_net_reject_max)
+            net_like_flag = bool(net_band_hit and tpl_low_for_net)
             info = {
                 "tpl_f1": float(tpl_f1),
                 "top_y_norm": float(top_y_norm),
                 "bottom_y_norm": float(bottom_y_norm),
                 "span_y_norm": float(span_y_norm),
                 "top_edge_support": float(top_edge_support),
-                "net_like_reject_triggered": bool(net_like_flag),
+                "net_like_reject_triggered": bool(net_like_flag and top_edge_weak_for_net),
+                "net_like_suspect": bool(net_like_flag),
+                "net_band_hit": bool(net_band_hit),
+                "tpl_low_for_net": bool(tpl_low_for_net),
+                "top_edge_weak_for_net": bool(top_edge_weak_for_net),
                 "tpl_low": bool(tpl_f1 < 0.05),
             }
             record_reason = str(reason)
-            if net_like_flag and record_reason == "OK":
+            if net_like_flag and top_edge_weak_for_net and record_reason == "OK":
                 record_reason = "R_net_like_quad"
             record = {
                 "corners": ordered.astype(np.float32).tolist(),
@@ -461,6 +465,10 @@ class CourtDetector:
                 if info.get("top_edge_support") is not None:
                     metrics["top_edge_support"] = float(info.get("top_edge_support"))
                 metrics["net_like_reject_triggered"] = bool(info.get("net_like_reject_triggered", False))
+                metrics["net_like_suspect"] = bool(info.get("net_like_suspect", False))
+                metrics["net_band_hit"] = bool(info.get("net_band_hit", False))
+                metrics["tpl_low_for_net"] = bool(info.get("tpl_low_for_net", False))
+                metrics["top_edge_weak_for_net"] = bool(info.get("top_edge_weak_for_net", False))
                 metrics["tpl_low"] = bool(info.get("tpl_low", False))
             metrics["fallback_triggered"] = False
             metrics.update(mask_stats)
