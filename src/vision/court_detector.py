@@ -264,7 +264,13 @@ class CourtDetector:
         top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
         bottom_edge_support = float(edge_support[0]) if len(edge_support) == 4 else 0.0
         tpl_f1 = float(self._edge_f1_score(white_mask, corners))
-        if span_y_norm < 0.65 or span_y_norm > 0.90:
+        if (
+            float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
+            and float(tpl_f1) < float(self.tpl_net_reject_max)
+            and float(top_edge_support) < float(self.top_edge_net_reject_max)
+        ):
+            return 0.0, "R_net_like_quad", edge_support
+        if span_y_norm < 0.45 or span_y_norm > 0.90:
             return 0.0, "R_span_y_out_of_range", edge_support
         if top_y_norm > 0.45:
             return 0.0, "R_top_too_low", edge_support
@@ -276,12 +282,6 @@ class CourtDetector:
                 return 0.0, "R_above_floor_bbox", edge_support
         if tpl_f1 < 0.05:
             return 0.0, "R_tpl_too_low", edge_support
-        if (
-            float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
-            and float(tpl_f1) < float(self.tpl_net_reject_max)
-            and float(top_edge_support) < float(self.top_edge_net_reject_max)
-        ):
-            return 0.0, "R_net_like_quad", edge_support
         if len(edge_support) == 4:
             if top_edge_support < float(self.edge_top_min):
                 return 0.0, "R_top_edge_weak", edge_support
