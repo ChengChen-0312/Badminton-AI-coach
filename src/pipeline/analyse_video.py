@@ -14,6 +14,7 @@ from src.tracking.bytetrack import SimpleByteTrack, Track
 from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
+from src.vision.court_fit_homography import draw_debug_overlay, fit_court_homography
 from src.vision.detectors import PlayerDetector
 from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
 
@@ -105,6 +106,8 @@ def analyse_video(
         max_age=tracking_cfg.get("ball_max_age", 5),
     )
     detect_court_corners = bool(vision_cfg.get("detect_court_corners", True))
+    court_method = str(vision_cfg.get("court_detector_method", "heuristic")).lower()
+    use_model_fit = court_method in ("model_fit", "model_fit_bwf")
     court_detector = (
         CourtDetector(
             edge_top_min=edge_top_min,
@@ -115,7 +118,7 @@ def analyse_video(
             tpl_net_reject_max=tpl_net_reject_max,
             top_edge_net_reject_max=top_edge_net_reject_max,
         )
-        if (detect_court_corners or use_court_roi)
+        if (detect_court_corners or use_court_roi) and not use_model_fit
         else None
     )
 
@@ -151,53 +154,101 @@ def analyse_video(
             [0.0, 0.0],
         ]
 
-        if court_corners is None and court_detector is not None:
+        if court_corners is None and (detect_court_corners or use_court_roi):
             # Try multiple early frames and keep the best-scoring detection.
             samples = int(vision_cfg.get("court_detect_samples", 10))
             stride = int(vision_cfg.get("court_detect_stride", 5))
             samples = max(1, samples)
             stride = max(1, stride)
 
-            best = None  # (confidence, corners, meta)
+            best = None  # (confidence, corners, meta, frame_bgr, H)
             best_fail = None  # (confidence, meta)
             for i in range(samples):
                 fi = int(i * stride)
                 if fi == 0:
-                    rgb = first_rgb
+                    bgr_i = first_bgr
                 else:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
                     ok_i, bgr_i = cap.read()
                     if not ok_i or bgr_i is None:
                         break
+                if use_model_fit:
+                    fit = fit_court_homography(bgr_i)
+                    conf = float(fit.confidence)
+                    reason = str(fit.reason)
+                    metrics = fit.metrics
+                    meta_i = {
+                        "source": "auto",
+                        "confidence": conf,
+                        "reason": reason,
+                        "frame_idx": fi,
+                        "metrics": metrics,
+                    }
+                    if fit.corners is None:
+                        if best_fail is None or conf > float(best_fail[0]):
+                            best_fail = (conf, meta_i)
+                        continue
+                    corners_i = fit.corners.tolist()
+                    if best is None or conf > float(best[0]):
+                        best = (conf, corners_i, meta_i, bgr_i, fit.H)
+                else:
                     rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
-                lines = court_detector.detect_court(rgb)
-                conf = float(court_detector.last_confidence or 0.0)
-                reason = str(court_detector.last_reason or "unknown")
-                edge_support = (
-                    [float(v) for v in court_detector.last_edge_support]
-                    if isinstance(court_detector.last_edge_support, list)
-                    else None
-                )
-                metrics = court_detector.last_metrics if isinstance(court_detector.last_metrics, dict) else None
-                meta_i = {
-                    "source": "auto",
-                    "confidence": conf,
-                    "reason": reason,
-                    "frame_idx": fi,
-                    "edge_support": edge_support,
-                    "metrics": metrics,
-                }
-                if lines is None or lines.corners is None:
-                    if best_fail is None or conf > float(best_fail[0]):
-                        best_fail = (conf, meta_i)
-                    continue
-                corners_i = lines.corners.tolist()
-                if best is None or conf > float(best[0]):
-                    best = (conf, corners_i, meta_i)
+                    lines = court_detector.detect_court(rgb) if court_detector is not None else None
+                    conf = float(court_detector.last_confidence or 0.0) if court_detector is not None else 0.0
+                    reason = str(court_detector.last_reason or "unknown") if court_detector is not None else "unknown"
+                    edge_support = (
+                        [float(v) for v in court_detector.last_edge_support]
+                        if court_detector is not None and isinstance(court_detector.last_edge_support, list)
+                        else None
+                    )
+                    metrics = (
+                        court_detector.last_metrics
+                        if court_detector is not None and isinstance(court_detector.last_metrics, dict)
+                        else None
+                    )
+                    meta_i = {
+                        "source": "auto",
+                        "confidence": conf,
+                        "reason": reason,
+                        "frame_idx": fi,
+                        "edge_support": edge_support,
+                        "metrics": metrics,
+                    }
+                    if lines is None or lines.corners is None:
+                        if best_fail is None or conf > float(best_fail[0]):
+                            best_fail = (conf, meta_i)
+                        continue
+                    corners_i = lines.corners.tolist()
+                    if best is None or conf > float(best[0]):
+                        best = (conf, corners_i, meta_i, None, None)
 
             if best is not None:
-                court_corners = best[1]
-                court_detection = best[2]
+                conf, corners_i, meta_i, best_frame, best_H = best
+                if use_model_fit and best_frame is not None and isinstance(best_H, np.ndarray):
+                    debug_dir = vision_cfg.get("model_fit_debug_dir", None)
+                    debug_path = vision_cfg.get("model_fit_debug_path", None)
+                    if debug_path:
+                        path = Path(debug_path)
+                    else:
+                        if debug_dir is None:
+                            debug_dir = Path("reports") / "demo_friend"
+                        debug_dir = Path(debug_dir)
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        path = debug_dir / f"{Path(video_path).stem}_court_fit_debug.jpg"
+                    metrics = meta_i.get("metrics") if isinstance(meta_i, dict) else None
+                    if isinstance(metrics, dict):
+                        debug_img = draw_debug_overlay(
+                            best_frame,
+                            best_H,
+                            conf=float(meta_i.get("confidence", 0.0)),
+                            inlier_ratio=float(metrics.get("inlier_ratio", 0.0)),
+                            mean_dist_px=float(metrics.get("mean_dist_px", 0.0)),
+                            p90_dist_px=float(metrics.get("p90_dist_px", 0.0)),
+                        )
+                        cv2.imwrite(str(path), debug_img)
+                        metrics["debug_image_path"] = str(path)
+                court_corners = corners_i
+                court_detection = meta_i
             else:
                 # Auto detector rejected all candidates.
                 if best_fail is not None:
