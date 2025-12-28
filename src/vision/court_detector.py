@@ -238,6 +238,7 @@ class CourtDetector:
         corners_xy: np.ndarray,
         white_mask: np.ndarray,
         frame_shape: Tuple[int, int],
+        floor_bbox_y1_norm: Optional[float] = None,
     ) -> tuple[float, str, list[float]]:
         h, w = int(frame_shape[0]), int(frame_shape[1])
         corners = np.array(corners_xy, dtype=np.float32).reshape(4, 2)
@@ -251,13 +252,30 @@ class CourtDetector:
         if float(np.min(corners[:, 1])) < float(h) * float(self.floor_y_min_ratio):
             return 0.0, "R1_not_on_floor", [0.0, 0.0, 0.0, 0.0]
 
-        # R2: require white-line support along edges
+        ys = corners[:, 1]
+        span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
         top_edge_y = float((corners[2, 1] + corners[3, 1]) * 0.5)
+        bottom_edge_y = float((corners[0, 1] + corners[1, 1]) * 0.5)
         top_y_norm = float(top_edge_y) / float(max(h, 1))
+        bottom_y_norm = float(bottom_edge_y) / float(max(h, 1))
+
+        # R2: require white-line support along edges
         edge_support = self._edge_support_ratios(white_mask, corners)
         top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
         bottom_edge_support = float(edge_support[0]) if len(edge_support) == 4 else 0.0
         tpl_f1 = float(self._edge_f1_score(white_mask, corners))
+        if span_y_norm < 0.65 or span_y_norm > 0.90:
+            return 0.0, "R_span_y_out_of_range", edge_support
+        if top_y_norm > 0.45:
+            return 0.0, "R_top_too_low", edge_support
+        if bottom_y_norm < 0.78:
+            return 0.0, "R_bottom_too_high", edge_support
+        if floor_bbox_y1_norm is not None:
+            floor_y1 = max(float(floor_bbox_y1_norm), 0.25)
+            if top_y_norm < float(floor_y1 - 0.02):
+                return 0.0, "R_above_floor_bbox", edge_support
+        if tpl_f1 < 0.05:
+            return 0.0, "R_tpl_too_low", edge_support
         if (
             float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
             and float(tpl_f1) < float(self.tpl_net_reject_max)
@@ -361,6 +379,7 @@ class CourtDetector:
                 float(fx2) / float(max(w, 1)),
                 float(fy2) / float(max(h, 1)),
             ],
+            "floor_bbox_y1": float(fy1) / float(max(h, 1)),
             "candidates_topk": [],
         }
 
@@ -375,6 +394,7 @@ class CourtDetector:
             top_y_norm = float((ordered[2, 1] + ordered[3, 1]) * 0.5) / float(max(h, 1))
             bottom_y_norm = float((ordered[0, 1] + ordered[1, 1]) * 0.5) / float(max(h, 1))
             tpl_f1 = float(self._edge_f1_score(white, ordered))
+            span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
             top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
             net_like_reject = (
                 float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
@@ -384,6 +404,8 @@ class CourtDetector:
             info = {
                 "tpl_f1": float(tpl_f1),
                 "top_y_norm": float(top_y_norm),
+                "bottom_y_norm": float(bottom_y_norm),
+                "span_y_norm": float(span_y_norm),
                 "top_edge_support": float(top_edge_support),
                 "net_like_reject_triggered": bool(net_like_reject),
             }
@@ -395,6 +417,7 @@ class CourtDetector:
                 "bottom_y_norm": float(bottom_y_norm),
                 "span_x": float(xs.max() - xs.min()) / float(max(w, 1)),
                 "span_y": float(ys.max() - ys.min()) / float(max(h, 1)),
+                "span_y_norm": float(span_y_norm),
                 "tpl_f1": float(tpl_f1),
                 "top_edge_support": float(top_edge_support),
                 "edge_support": [float(v) for v in edge_support],
@@ -429,6 +452,10 @@ class CourtDetector:
                     metrics["tpl_f1"] = float(info.get("tpl_f1"))
                 if info.get("top_y_norm") is not None:
                     metrics["top_y_norm"] = float(info.get("top_y_norm"))
+                if info.get("bottom_y_norm") is not None:
+                    metrics["bottom_y_norm"] = float(info.get("bottom_y_norm"))
+                if info.get("span_y_norm") is not None:
+                    metrics["span_y_norm"] = float(info.get("span_y_norm"))
                 if info.get("top_edge_support") is not None:
                     metrics["top_edge_support"] = float(info.get("top_edge_support"))
                 metrics["net_like_reject_triggered"] = bool(info.get("net_like_reject_triggered", False))
@@ -516,7 +543,12 @@ class CourtDetector:
             _set_metrics(edge_support, info)
             return None
 
-        conf, reason, edge_support = self._validate_and_score(ordered, white_mask=white, frame_shape=(h, w))
+        conf, reason, edge_support = self._validate_and_score(
+            ordered,
+            white_mask=white,
+            frame_shape=(h, w),
+            floor_bbox_y1_norm=mask_stats.get("floor_bbox_y1"),
+        )
         info = _push_candidate(ordered, conf, reason, edge_support)
         self.last_confidence = conf
         self.last_reason = reason
