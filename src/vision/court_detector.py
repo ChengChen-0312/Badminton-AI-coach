@@ -264,16 +264,14 @@ class CourtDetector:
         top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
         bottom_edge_support = float(edge_support[0]) if len(edge_support) == 4 else 0.0
         tpl_f1 = float(self._edge_f1_score(white_mask, corners))
-        if (
+        net_like_flag = (
             float(self.net_suppress_y_min) <= top_y_norm <= float(self.net_suppress_y_max)
             and float(tpl_f1) < float(self.tpl_net_reject_max)
-            and float(top_edge_support) < float(self.top_edge_net_reject_max)
-        ):
+        )
+        if net_like_flag and float(top_edge_support) < float(self.top_edge_net_reject_max):
             return 0.0, "R_net_like_quad", edge_support
         if span_y_norm < 0.45 or span_y_norm > 0.90:
             return 0.0, "R_span_y_out_of_range", edge_support
-        if top_y_norm > 0.45:
-            return 0.0, "R_top_too_low", edge_support
         if bottom_y_norm < 0.78:
             return 0.0, "R_bottom_too_high", edge_support
         if floor_bbox_y1_norm is not None:
@@ -396,10 +394,9 @@ class CourtDetector:
             tpl_f1 = float(self._edge_f1_score(white, ordered))
             span_y_norm = float(ys.max() - ys.min()) / float(max(h, 1))
             top_edge_support = float(edge_support[2]) if len(edge_support) == 4 else 0.0
-            net_like_reject = (
+            net_like_flag = (
                 float(self.net_suppress_y_min) <= float(top_y_norm) <= float(self.net_suppress_y_max)
                 and float(tpl_f1) < float(self.tpl_net_reject_max)
-                and float(top_edge_support) < float(self.top_edge_net_reject_max)
             )
             info = {
                 "tpl_f1": float(tpl_f1),
@@ -407,7 +404,7 @@ class CourtDetector:
                 "bottom_y_norm": float(bottom_y_norm),
                 "span_y_norm": float(span_y_norm),
                 "top_edge_support": float(top_edge_support),
-                "net_like_reject_triggered": bool(net_like_reject),
+                "net_like_reject_triggered": bool(net_like_flag),
             }
             record = {
                 "corners": ordered.astype(np.float32).tolist(),

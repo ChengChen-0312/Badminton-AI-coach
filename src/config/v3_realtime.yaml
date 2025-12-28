@@ -24,7 +24,7 @@ vision:
   court_tpl_weight: 0.40              # 更依赖模板匹配，压制发球区矩形
 
   net_suppress_y_min: 0.35
-  net_suppress_y_max: 0.55
+  net_suppress_y_max: 0.60
   net_penalty: 0.60
   tpl_net_reject_max: 0.14
   top_edge_net_reject_max: 0.18
