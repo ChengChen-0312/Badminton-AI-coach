@@ -33,6 +33,7 @@ End-to-end badminton analytics and coaching system. Includes stroke classificati
 ```yaml
 vision:
   yolo_model: "yolov8n.pt"
+  court_detector_method: "heuristic"  # "heuristic" | "farin2005"
   court_model: "court_segmenter.pt"
   pose_model: "yolo-pose-s"
   device: "mps"
@@ -47,6 +48,28 @@ spatial_logic:
 output:
   save_overlay: true
   save_report: true
+```
+
+## Court Detection (v3)
+
+This repo supports **manual** and **auto** court-corner detection. Corners are always ordered **LB, RB, RT, LT** (outer doubles boundary).
+
+- Key files (this feature):
+  - `src/vision/court_detector_farin2005.py`: Farin et al. (2005)-inspired auto detector (line pixels → RANSAC lines → 2H×2V model fitting → quick reject → template match → “nearest court” ranking).
+  - `src/pipeline/analyse_video.py`: chooses manual vs auto; auto samples early frames (`vision.court_detect_samples`, `vision.court_detect_stride`) and keeps the best-confidence result; when `vision.court_detector_method: farin2005`, it also tries a heuristic fallback.
+  - `scripts/debug_court_candidates.py`: renders a single-frame debug image; if the detector provides `metrics.candidates_topk`, it overlays top-K candidate quads.
+  - `src/config/v3.yaml`: minimal v3 example config (includes `vision.court_detector_method`).
+  - `src/config/v3_realtime.yaml`: demo-friendly v3 config (realtime defaults + optional `pose.*`).
+  - `src/config/v3_ai_score.yaml`: v3 config for AI scoring (adds `ai_score.*`).
+
+### Quick usage
+```bash
+# Debug top-K candidates on a chosen frame (writes reports/court_candidates_debug.jpg)
+python scripts/debug_court_candidates.py \
+  --video archive/demo3.mp4 \
+  --frame 0 \
+  --config src/config/v3_realtime.yaml \
+  --topk 5
 ```
 
 ### v3.3 – Landing detection + spatial logic
@@ -555,3 +578,62 @@ LoRA 仅作用于语言头，视觉塔保持原始能力，避免丢失图像理
 若需更显著的分数差异：在 Teacher 标签或 prompt 中加入评分准则（优质动作 80–95；明显错误 40–60），或对标签分布做拉宽，再跑一轮 LoRA。
 可增加训练迭代数或微调学习率/调度（如 cosine + warmup），继续用 pose-aware 数据。
 如需更强容量，可尝试更高 r/alpha 或 DoRA（如果 CLI 支持），注意内存/速度平衡（M4 Max 36GB 目前 32 层、batch=1–2、iters 1200 已验证可跑，峰值 ~8GB）。
+有关识别场地的部分
+Instance-Aware Heuristic Court Detection
+
+
+⸻
+
+Instance-Aware Court Detection (Heuristic)
+
+Motivation
+
+Standard heuristic court detectors often rely on global geometric cues such as line length, edge strength, and template matching. In indoor badminton venues with multiple adjacent courts, this approach frequently fails by:
+	1.	Selecting non-court structures (e.g., net lines) as court boundaries
+	2.	Mixing corners from different court instances
+	3.	Confusing inner service lines with true baselines
+
+To address these issues, we propose an instance-aware heuristic court detector that explicitly models court semantics and spatial consistency.
+
+⸻
+
+Method Overview
+
+Our detector operates in four stages:
+	1.	Floor & Line Mask Extraction
+Morphological operations are applied to obtain a connected floor mask and candidate white line segments.
+	2.	Candidate Quad Generation
+Line intersections are grouped into quadrilateral court candidates.
+	3.	Instance-Aware Filtering (Key Contribution)
+We introduce three domain-specific constraints:
+(a) Net-Line Suppression
+Horizontal lines within a predefined net height band are penalized or rejected to prevent the net from being selected as a court boundary.
+(b) Bottom-Edge Hard Constraint
+The bottom edge of a valid court must correspond to the lowest major horizontal line in the image, preventing inner service lines from being misclassified as baselines.
+(c) Court Instance Consistency
+Using row-wise white pixel density, we detect low-density horizontal gaps that separate adjacent courts. Court candidates crossing such gaps are rejected, ensuring all four corners belong to the same physical court instance.
+	4.	Scoring & Selection
+Remaining candidates are scored using a weighted combination of:
+	•	Edge support
+	•	Area coverage
+	•	Template matching (F1)
+	•	Vertical placement prior
+
+⸻
+
+Advantages
+	•	Robust to multi-court indoor environments
+	•	Explicitly models court semantics (net, baseline, instance)
+	•	Fully explainable via per-candidate debug metrics
+	•	No learning required; suitable for low-data scenarios
+
+⸻
+
+Failure Transparency
+
+Even when detection fails, the system outputs:
+	•	Top-K candidate courts
+	•	Detailed rejection reasons
+	•	Intermediate geometric and semantic metrics
+
+This makes the detector suitable for iterative refinement and downstream debugging.

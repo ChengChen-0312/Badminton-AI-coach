@@ -1,0 +1,1339 @@
+VERSION: CODEBASE_INDEX v1 (checkpoint)
+STATUS: Partial, append-only. PENDING sections intentionally incomplete.
+--------------------------------
+PROJECT OVERVIEW
+--------------------------------
+Badminton-AI-coach is a computer-vision-first badminton analysis pipeline. Given a match video, it detects the court plane, tracks players and the shuttle, estimates a court homography (image → real court coordinates), and infers structured “stroke” events (e.g., contact/landing frames, hitter side/role, regions). It produces shareable outputs (Markdown/JSON/CSV + heatmaps/timelines).
+
+The repo also includes an optional “AI score” layer that uses local MLX models (teacher/student, optional LoRA adapters) to score strokes and generate feedback, plus scripts to distill teacher labels into a student dataset.
+
+--------------------------------
+HIGH-LEVEL PIPELINE
+--------------------------------
+Entry (scripts) →
+1) `src/pipeline/analyse_video.py`: per-frame vision (ball/player detection + tracking), court detection, homography estimation
+2) `src/pipeline/extract_strokes.py`: temporal/spatial reasoning to extract stroke events + regions (contact/landing/hitter)
+3) `src/pipeline/report_generator.py`: aggregate results → Markdown/JSON/CSV + `src/analysis/*` figures (heatmaps/timeline/stats)
+4) Optional: `src/ai_score/*` teacher/student MLX scoring + distillation tooling in `scripts/*`
+
+--------------------------------
+FILE INDEX
+--------------------------------
+
+[File: README.md]
+Role: Primary project documentation (how to run demos, outputs, high-level description).
+Category: documentation
+Key classes / functions: N/A
+Called by: N/A
+Calls: N/A
+Notes: Mentions optional deps (e.g., MediaPipe for pose), demo scripts, and report artifacts.
+
+[File: project_summary.txt]
+Role: Short architectural/project summary for humans/LLMs.
+Category: documentation
+Key classes / functions: N/A
+Called by: N/A
+Calls: N/A
+Notes: Describes the intended pipeline structure (vision → tracking → geometry → spatial logic → reports).
+
+[File: requirements.txt]
+Role: Python dependency list.
+Category: configuration
+Key classes / functions: N/A
+Called by: N/A
+Calls: N/A
+Notes: Optional runtime deps exist (YOLO/ultralytics, mediapipe, MLX stack).
+
+[File: scripts/demo_friend.py]
+Role: End-to-end demo runner (video → analysis → reports; optional LLM compare/scoring).
+Category: CLI / entry point
+Key classes / functions:
+- `parse_args`
+- `main`
+- `_load_yaml`
+- `_resolve_existing_path`
+- `_looks_like_mediapipe_installed`
+- `_read_video_frame_bgr`
+- `_compute_court_roi`
+- `_draw_court_debug`
+- `_llm_compare`
+Called by: user runs directly (`python scripts/demo_friend.py`)
+Calls: `src/pipeline/analyse_video.py`, `src/pipeline/extract_strokes.py`, `src/pipeline/report_generator.py`, `src/ai_score/action_feedback.py`
+Notes: Writes `<match>_court_detect_debug.jpg` by reading `analysis.court_detection` (`source/confidence/reason/method/edge_support/metrics/frame_idx`) and drawing the quad in `LB,RB,RT,LT` order; debug frame defaults to detection `frame_idx` (or 0) unless `--court-debug-frame` is set; optionally draws ROI box when `vision.use_court_roi` is enabled; `--pose auto` disables pose when MediaPipe is missing.
+
+[File: scripts/calibrate_court_corners.py]
+Role: Manual court-corner calibration tool (human clicks corners; outputs config/YAML-ready corner list).
+Category: CLI / utility
+Key classes / functions:
+- `parse_args`
+- `main`
+- `_read_frame`
+- `_draw_overlay`
+Called by: user runs directly
+Calls: (none internal)
+Notes: Expects click order `LB -> RB -> RT -> LT` (outer doubles boundary) matching `CourtHomography.from_corners`; can print YAML snippet for `vision.court_corners`; saves a debug JPG; exits early if fewer than 4 points selected.
+
+[File: scripts/generate_teacher_labels_mlx.py]
+Role: Generates teacher labels for distillation using MLX teacher model on extracted strokes.
+Category: CLI / training-data generation
+Key classes / functions: [PENDING]
+Called by: user runs directly
+Calls: `src/pipeline/analyse_video.py`, `src/pipeline/extract_strokes.py`, `src/ai_score/action_feedback.py`, `src/spatial_logic/pose_quality.py`
+Notes: Produces JSONL labels under `data/distill/` (e.g., `teacher_labels.jsonl`).
+
+[File: src/pipeline/analyse_video.py]
+Role: Main video analysis orchestrator (loads detectors/trackers; runs per-frame; calls court detection + homography).
+Category: orchestration / pipeline
+Key classes / functions:
+- `FrameResult`
+- `AnalyseResult`
+- `analyse_video`
+Called by: `scripts/demo_friend.py`, `scripts/analyse_match.py`, `scripts/test_realtime_fps.py`, `scripts/generate_teacher_labels_mlx.py`
+Calls: `src/vision/detectors.py`, `src/vision/ball_detector.py`, `src/vision/court_detector.py`, `src/vision/pose_estimator.py`, `src/tracking/bytetrack.py`, `src/tracking/ball_track.py`, `src/tracking/player_track.py`, `src/geometry/homography.py`
+Notes: Court corners can be manual (`vision.court_corners`) or auto (samples early frames and selects best `CourtDetector.last_confidence`; records chosen `frame_idx`/metrics; otherwise `source=auto_failed`); builds homography only when 4 corners available; player/role logic falls back to image-space heuristics when homography is missing; optionally filters player detections to the court polygon but keeps originals if filtering removes everything; optional court ROI built from corners (else margin-based fallback); pose init is best-effort (disables when mediapipe missing).
+
+[File: src/pipeline/extract_strokes.py]
+Role: Converts tracking + homography outputs into stroke-level events (contact/landing/hitter + regions).
+Category: orchestration / pipeline
+Key classes / functions: [PENDING]
+Called by: `scripts/demo_friend.py`, `scripts/generate_teacher_labels_mlx.py`
+Calls: `src/spatial_logic/landing_detector.py`, `src/spatial_logic/events.py`, `src/spatial_logic/stroke_reasoner.py`, `src/spatial_logic/hitter_detector.py`, `src/spatial_logic/pose_features.py`, `src/geometry/homography.py`, `src/geometry/region_definitions.py`, `src/tracking/player_track.py`
+Notes: Uses court-region logic (contact/landing regions) and supports predicted landings.
+
+[File: src/pipeline/report_generator.py]
+Role: Generates human-readable and machine-readable reports + plots from extracted strokes.
+Category: visualization / report
+Key classes / functions: [PENDING]
+Called by: `scripts/demo_friend.py`
+Calls: `src/analysis/heatmap.py`, `src/analysis/timeline.py`, `src/analysis/tactical_stats.py`
+Notes: Produces Markdown/JSON/CSV plus PNGs (heatmap + timeline).
+
+[File: src/analysis/heatmap.py]
+Role: Builds court heatmaps for landing/contact distributions in canonical court coordinates.
+Category: visualization / analysis
+Key classes / functions: [PENDING]
+Called by: `src/pipeline/report_generator.py`
+Calls: [PENDING]
+Notes: Heatmap axes are meters on a canonical badminton court.
+
+[File: src/analysis/timeline.py]
+Role: Renders per-stroke timeline plots (e.g., frame index vs near/far).
+Category: visualization / analysis
+Key classes / functions: [PENDING]
+Called by: `src/pipeline/report_generator.py`
+Calls: [PENDING]
+Notes: Used for quick sanity-check of temporal detection (contact/landing frames).
+
+[File: src/analysis/tactical_stats.py]
+Role: Computes aggregate tactical statistics from strokes (counts/regions/etc.).
+Category: core logic (analysis) / reporting
+Key classes / functions: [PENDING]
+Called by: `src/pipeline/report_generator.py`
+Calls: [PENDING]
+Notes: Intended for high-level match summaries.
+
+[File: src/vision/court_detector.py]
+Role: Detects badminton court outer boundary (LB/RB/RT/LT) from a frame using line masks + geometry scoring.
+Category: core logic
+Key classes / functions: `CourtDetector`, `CourtLines`, `detect_court`, `_compute_line_mask`, `_estimate_floor_region`, `_validate_and_score`, `_edge_support_ratios`, `_template_f1_score`, `_ensure_template`
+Called by: `src/pipeline/analyse_video.py`
+Calls: `src/geometry/homography.py`
+Notes: Exposes diagnostics via `last_confidence/last_reason/last_edge_support/last_method/last_metrics` for debug overlays.
+
+[File: src/geometry/homography.py]
+Role: Homography utilities and badminton-court metric constants.
+Category: core logic
+Key classes / functions: `COURT_LENGTH_M`, `COURT_WIDTH_M`, `CourtHomography` (and related helpers) [PENDING]
+Called by: `src/pipeline/analyse_video.py`, `src/pipeline/extract_strokes.py`, `src/vision/court_detector.py`
+Calls: [PENDING]
+Notes: Corner ordering invariant: LB, RB, RT, LT.
+
+[PENDING]
+- File: docs/court_detection_week_plan.md
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/analyse_match.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/download_qwen3_mlx.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/export_court_map.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/full_distill_pipeline.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/prepare_distill_dataset.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/prepare_mlx_data.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/test_realtime_fps.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/train_strokes.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/train_strokes_v2.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: scripts/train_student_distill_mlx.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/ai_score/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/ai_score/action_feedback.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/ai_score/rubric.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/ai_score/student_mlx.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/ai_score/teacher_mlx.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/analysis/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/data/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/data/dataset.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/data/frame_cache.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/data/split.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/data/transforms.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/geometry/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[File: src/geometry/coordinate_mapper.py]
+Role: Coordinate mapping helpers (image point → court point) using a homography matrix.
+Category: utility / helper
+Key classes / functions:
+- `CoordinateMapper`
+- `image_to_court`
+Called by: (none found)
+Calls: (none internal)
+Notes: Defaults to identity homography when unset.
+
+[PENDING]
+- File: src/geometry/metrics.py
+- Reason: Not yet processed
+- To be added later
+
+[File: src/geometry/region_definitions.py]
+Role: Canonical court region classifiers (simple y-bands + 3x3 grid).
+Category: core logic
+Key classes / functions:
+- `CourtRegions`
+- `CourtGrid9`
+- `DEFAULT_REGIONS`
+- `DEFAULT_GRID9`
+- `classify_y`
+- `classify_region`
+Called by: `src/pipeline/extract_strokes.py`, `src/spatial_logic/region_logic.py`
+Calls: (none internal)
+Notes: Provides stable region labels used for contact/landing summaries.
+
+[PENDING]
+- File: src/models/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/models/video_classifier.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/pipeline/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/pipeline/action_feedback_pipeline.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/pipeline/render_overlay.py
+- Reason: Not yet processed
+- To be added later
+[File: src/pipeline/render_overlay.py]
+Role: Lightweight OpenCV drawing helpers for overlaying detections on frames.
+Category: visualization / debug
+Key classes / functions:
+- `render_players`
+- `render_ball`
+Called by: (none found)
+Calls: (none internal)
+Notes: Responsibility is limited to drawing primitives; does not handle court corners/homography.
+
+[PENDING]
+- File: src/spatial_logic/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/events.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/hitter_detector.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/landing_detector.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/pose_features.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/pose_quality.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/region_logic.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/relations.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/stroke_reasoner.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/spatial_logic/temporal_logic.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/tracking/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[File: src/tracking/ball_track.py]
+Role: Single-object shuttle/ball tracking state over time (selects best detection per frame; provides predicted fallback).
+Category: core logic
+Key classes / functions:
+- `BallTrackState`
+- `SingleBallTracker`
+- `update`
+- `predict_only`
+Called by: `src/pipeline/analyse_video.py`
+Calls: `src/vision/detectors.py`, `src/tracking/utils.py`
+Notes: Ages out when detections are missing; `predict_only()` emits `predicted=True` states until `max_age`.
+
+[File: src/tracking/bytetrack.py]
+Role: Minimal multi-object tracker (ByteTrack-style) for detections using IoU matching and track lifecycle management.
+Category: core logic
+Key classes / functions:
+- `Track`
+- `SimpleByteTrack`
+- `update`
+- `predict_only`
+Called by: `src/pipeline/analyse_video.py`
+Calls: `src/vision/detectors.py`, `src/tracking/utils.py`
+Notes: Drops stale tracks (`max_time_since_update`) and filters active tracks by `min_hits`; `predict_only()` advances time without new detections.
+
+[PENDING]
+- File: src/tracking/id_assign.py
+- Reason: Not yet processed
+- To be added later
+[File: src/tracking/id_assign.py]
+Role: Assign simple player roles (near/far) from tracked bounding boxes.
+Category: utility / helper
+Key classes / functions:
+- `assign_player_roles`
+Called by: (none found)
+Calls: `src/tracking/bytetrack.py`
+Notes: Role assignment is heuristic (based on bbox vertical position); independent of court corners/homography.
+
+[File: src/tracking/player_track.py]
+Role: Player state holder + lightweight role management utilities (near/far) for up to two players.
+Category: core logic
+Key classes / functions:
+- `PlayerState`
+- `PlayerTracker`
+- `last_bbox`
+- `update`
+- `get_players_at`
+Called by: `src/pipeline/analyse_video.py`, `src/pipeline/extract_strokes.py`, `src/spatial_logic/hitter_detector.py`
+Calls: `src/tracking/utils.py`
+Notes: Keeps at most two players; duplicates last bbox on missing detections; assigns near/far roles heuristically.
+
+[PENDING]
+- File: src/tracking/utils.py
+- Reason: Not yet processed
+- To be added later
+[File: src/tracking/utils.py]
+Role: Common tracking math helpers.
+Category: utility / helper
+Key classes / functions:
+- `iou_xyxy`
+Called by: `src/tracking/ball_track.py`, `src/tracking/bytetrack.py`, `src/tracking/player_track.py`
+Calls: (none internal)
+Notes: Provides IoU for `[x1,y1,x2,y2]` boxes.
+
+[PENDING]
+- File: src/training/eval.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/training/train.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/training/utils.py
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/vision/__init__.py
+- Reason: Not yet processed
+- To be added later
+
+[File: src/vision/ball_detector.py]
+Role: Shuttlecock/ball detection wrapper (YOLO-based) with basic filtering/fallback behavior.
+Category: core logic
+Key classes / functions:
+- `BallDetector`
+- `detect_balls`
+- `detect`
+- `_filter_inside_player_lower_region`
+- `_fallback_small_objects`
+- `_fallback_motion_ball`
+Called by: `src/pipeline/analyse_video.py`
+Calls: `src/vision/detectors.py`
+Notes: Supports optional player bbox exclusion to reduce false positives.
+
+[File: src/vision/detectors.py]
+Role: Shared detection types and Ultralytics YOLO wrappers (generic + person-only).
+Category: core logic
+Key classes / functions:
+- `Detection`
+- `YoloDetector`
+- `PlayerDetector`
+- `filter_by_class_name`
+Called by: `src/pipeline/analyse_video.py`, `src/tracking/ball_track.py`, `src/tracking/bytetrack.py`, `src/vision/ball_detector.py`
+Calls: (none internal)
+Notes: Imports `ultralytics.YOLO` if available; raises ImportError when missing.
+
+[File: src/vision/pose_estimator.py]
+Role: Optional pose estimation wrapper (MediaPipe) producing per-person keypoints.
+Category: core logic
+Key classes / functions:
+- `PoseKeypoints`
+- `PoseEstimator`
+- `estimate`
+Called by: `src/pipeline/analyse_video.py`
+Calls: (none internal)
+Notes: Raises ImportError when `mediapipe` is missing; `estimate()` returns an empty list when no landmarks are found.
+
+[File: src/vision/utils.py]
+Role: Vision helper stubs (currently placeholders).
+Category: utility / helper
+Key classes / functions:
+- `letterbox`
+- `nms`
+Called by: (none found)
+Calls: (none internal)
+Notes: Placeholder implementations.
+
+[PENDING]
+- File: src/config/default.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v2_highcap.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v2_highcap_fast.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v3.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v3_ai_score.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v3_realtime.yaml
+- Reason: Not yet processed
+- To be added later
+
+[PENDING]
+- File: src/config/v3_realtime_fast.yaml
+- Reason: Not yet processed
+- To be added later
+
+--------------------------------
+KEY INVARIANTS & DESIGN RULES
+--------------------------------
+- Court corner order is always `LB, RB, RT, LT` (manual calibration + homography + detector output must agree).
+- Canonical court coordinates are in meters; `y=0` corresponds to the near baseline (bottom), increasing towards far baseline.
+- Pose is optional: pipeline should still run without MediaPipe (pose features become `null`).
+- Court detection has a hard “reject” path; downstream homography/heatmaps assume corners are valid.
+
+--------------------------------
+CURRENT COMPLEXITY PAIN POINTS
+--------------------------------
+- Court detection is heuristic-heavy (mask thresholds, morphology, candidate generation + scoring) and sensitive to lighting/occlusion.
+- Multiple optional runtime stacks (ultralytics/YOLO, mediapipe, MLX teacher/student) increase environment variability.
+- Some modules appear stale/broken:
+  - `src/spatial_logic/region_logic.py` imports a missing symbol (`zone_from_real_court_pos`) from `src/geometry/region_definitions.py`.
+  - `src/pipeline/action_feedback_pipeline.py` appears mismatched with current `ActionFeedback` constructor/modes.
+
+--------------------------------
+SUGGESTED NEXT IMPROVEMENTS (HIGH LEVEL)
+--------------------------------
+- Add a small evaluation harness (manifest + batch runner) to measure court-detection success/failure reasons and tune thresholds safely.
+- Consolidate/validate configuration paths (court corners, model paths) and expose a single “runtime config” object for scripts.
+- Stabilize public APIs between modules (e.g., `ActionFeedback` construction, region labeling helpers) to reduce breakages.
+- Keep court detection modular: introduce a line-segment candidate generator (FAST/ROBUST stages) as an additional candidate source before CC/hull fallback, reusing existing `_validate_and_score()` and debug metrics.
+
+COURT DEBUG FLOW (10 lines max)
+- `scripts/demo_friend.py` loads video/config, then calls `src/pipeline/analyse_video.py`.
+- `analyse_video` runs detection/tracking and invokes `CourtDetector.detect_court()` (auto) or uses calibrated `vision.court_corners` (manual).
+- `CourtDetector.detect_court()` returns corners in `LB, RB, RT, LT` order or sets `analysis.court_detection` to `auto_failed` with `reason/confidence`.
+- If corners exist, homography is computed (`src/geometry/homography`) and used to map image points to real-court coordinates.
+- When auto court detection fails, downstream court-mapped outputs are gated/disabled (heatmaps/regions depend on valid homography).
+- `scripts/demo_friend.py` selects a debug frame (`--court-debug-frame` → `analysis.court_detection.frame_idx` → 0) and writes `court_detect_debug.jpg` using `analysis.court_detection` fields (`source/method/edge_support/metrics`).
+
+[File: src/geometry/homography.py]
+Role: Computes an image→court (meters) homography and defines standard court size constants.
+Category: core logic
+Key classes / functions:
+- `COURT_LENGTH_M`, `COURT_WIDTH_M`
+- `CourtHomography`, `CourtHomography.from_corners`, `CourtHomography.to_court`
+Called by: `src/pipeline/analyse_video.py`, `src/pipeline/extract_strokes.py`, `src/vision/court_detector.py`
+Calls: (none internal)
+Notes: Expects corner order `LB, RB, RT, LT`; destination court coords use meters with y increasing toward far baseline.
+
+[File: src/geometry/metrics.py]
+Role: Basic geometry metric helpers.
+Category: utility / helper
+Key classes / functions: `distance`, `angle`
+Called by: (none found) [VERIFY]
+Calls: (none internal)
+Notes: Standalone helpers; verify whether currently used.
+
+[File: src/geometry/__init__.py]
+Role: Geometry package marker/docstring.
+Category: utility / helper
+Key classes / functions: (none)
+Called by: [VERIFY]
+Calls: (none internal)
+Notes: N/A
+
+[File: src/vision/__init__.py]
+Role: Vision package marker/docstring.
+Category: utility / helper
+Key classes / functions: (none)
+Called by: [VERIFY]
+Calls: (none internal)
+Notes: N/A
+
+[File: src/data/frame_cache.py]
+Role: Frame IO helpers (uniform sampling + output dir creation).
+Category: utility / helper (FOUNDATIONS)
+Key classes / functions: `extract_frames`, `ensure_dir`
+Called by: (none found) [VERIFY]
+Calls: (none internal)
+Notes: `extract_frames()` uses `cv2.VideoCapture` + `CAP_PROP_POS_FRAMES` seeking and returns stacked RGB frames.
+
+[File: src/vision/utils.py]
+Role: Vision preprocessing/postprocessing helpers.
+Category: utility / helper (FOUNDATIONS)
+Key classes / functions: `letterbox`, `nms`
+Called by: (none found) [VERIFY]
+Calls: (none internal)
+Notes: Both functions are placeholders (no-op); do not rely on them for correctness. [VERIFY usage]
+
+[File: scripts/analyse_match.py]
+Role: CLI wrapper to run full match/video analysis from a YAML config.
+Category: CLI / entry point
+Key classes / functions: `parse_args`, `main`
+Called by: user (shell)
+Calls: `src/pipeline/analyse_video` (`VideoAnalyser` import), `yaml.safe_load`, `argparse`
+Notes: Appears stale: `VideoAnalyser` is not defined in `src/pipeline/analyse_video.py`. [VERIFY]
+
+--------------------------------
+FOUNDATIONS
+--------------------------------
+- Frame IO: `cv2.VideoCapture` reads BGR frames in `src/pipeline/analyse_video.analyse_video`; conversion to RGB via `cv2.cvtColor(..., BGR2RGB)` before calling RGB-expecting vision modules (e.g., `CourtDetector.detect_court()`).
+- Frame sampling: `src/data/frame_cache.extract_frames()` provides random-access uniform sampling via `CAP_PROP_POS_FRAMES` and returns stacked RGB frames.
+- Court keyframe choice: `analyse_video` samples early frames (`vision.court_detect_samples` × `vision.court_detect_stride`) and keeps the highest `CourtDetector.last_confidence`; chosen `frame_idx` is stored in `analysis.court_detection`.
+- Optional deps gating: pose is enabled by config and guarded by a try/except around `PoseEstimator()` init; YOLO-based detectors are instantiated in pipeline (`PlayerDetector`, `BallDetector`) and may raise on missing deps. [VERIFY exact ImportError behavior]
+- Runtime config: scripts load YAML into a dict and pass it into the pipeline; manual court corners are accepted via `vision.court_corners` in `LB, RB, RT, LT` order.
+
+CHECKPOINT: appended files = 7; remaining = 51
+
+[File: src/pipeline/extract_strokes.py]
+Role: Builds stroke-level summaries from `analyse_video` results (ball track → landing/contact → event type → optional hitter + pose features).
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `StrokeSummary`
+- `build_homography_from_analysis`
+- `summarise_strokes_from_analysis`
+- `stroke_summaries_to_dicts`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `AnalyseResult`-like object/dict with `frame_results`, optional `court_corners`, optional `pose_results`; optional `classifier_labels`
+- Output: `List[StrokeSummary]` (currently returns a single summary) and JSON-ready dicts via `stroke_summaries_to_dicts`
+Called by: `scripts/demo_friend.py`, `scripts/generate_teacher_labels_mlx.py`, `src/pipeline/action_feedback_pipeline.py`
+Calls: `src/spatial_logic/landing_detector.py`, `src/spatial_logic/events.py`, `src/spatial_logic/stroke_reasoner.py`, `src/spatial_logic/hitter_detector.py`, `src/spatial_logic/pose_features.py`, `src/geometry/homography.py`, `src/geometry/region_definitions.py`, `src/tracking/player_track.py`
+Notes: Contact/landing are delegated to `infer_landing()`; event type uses `infer_event_from_trajectory()`; optional hitter is “closest player bbox to ball at contact frame” with `hitter_distance_max` (default 200 px); contact/landing regions assume homography maps to meters (`LB,RB,RT,LT`) and `DEFAULT_GRID9.classify_region(x,y)`; failure modes: missing ball detections returns empty landing (`infer_landing=None`) and a dummy 1-point track is used to avoid empty output; `contact_region` may be overwritten by hitter foot-point region when homography exists; only `classifier_labels[0]` is fused.
+
+[File: src/spatial_logic/stroke_reasoner.py]
+Role: Fuses a classifier label (if any) with a trajectory-derived `StrokeEvent` into a final stroke label + confidence.
+Category: core logic
+Key classes / functions: (list)
+- `FinalStroke`
+- `combine_classifier_and_event`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `classifier_label: Optional[str]`, `event: StrokeEvent`
+- Output: `FinalStroke` (`type`, `confidence`, `hitter_role`, `landing_region`, plus source labels)
+Called by: `src/pipeline/extract_strokes.py`
+Calls: `src/spatial_logic/events.py` (`StrokeEvent`)
+Notes: Decision rule is string-based: if both exist and `classifier_label.lower().endswith(event.type)` → confidence 0.9; mismatch → 0.65 (prefers classifier label); classifier-only → 0.7; event-only → 0.6; neither → “unknown” @ 0.3. No coordinate-frame logic here; failures are “unknown” outputs when inputs missing.
+
+[File: src/spatial_logic/landing_detector.py]
+Role: Extracts ball track from frames and infers contact frame + landing point (with optional homography + region classification).
+Category: core logic
+Key classes / functions: (list)
+- `BallState`, `LandingPoint`
+- `extract_ball_track`, `smooth_track`
+- `detect_landing_point` [VERIFY used]
+- `infer_landing`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `frame_results` (sequence of `FrameResult`-like objects/dicts with `frame_idx`, `ball`, `player_states`); optional `HomographyMapper`; optional `RegionClassifier`
+- Output: `LandingPoint` with image coords (`img_x/img_y`), `contact_frame_idx` + `contact_x/contact_y`, optional court coords (`court_x/court_y`), and region labels (`region`, `contact_region`)
+Called by: `src/pipeline/extract_strokes.py`
+Calls: (none internal) + optional `homography.to_court()`, optional `region_classifier.classify_region/classify_y`
+Notes: Contact is inferred as the frame where the smoothed ball center is closest to any player bbox (point→rect distance), no explicit threshold; fallback contact chooses an extremum in y based on total y trend; landing is currently the last observed ball position and `predicted` is set using `missing_window=3` and end-gap heuristics (may mislabel “observed vs predicted” when the ball is continuously seen near the end) [VERIFY]; coordinate assumptions: ball x/y are pixel centers (y increases downward), homography maps to court meters (origin at near-left baseline, y toward far side).
+
+[File: src/spatial_logic/hitter_detector.py]
+Role: Chooses the hitter (near/far player) for a stroke based on proximity to the shuttle at contact.
+Category: core logic
+Key classes / functions: (list)
+- `HitterInfo`
+- `infer_hitter_for_stroke`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `contact_frame` (int), `ball_pos` (pixel x/y), `players_at_contact: List[PlayerState]`, `max_distance` (default 200 px)
+- Output: `Optional[HitterInfo]` (role, track_id, distance)
+Called by: `src/pipeline/extract_strokes.py`
+Calls: `src/tracking/player_track.py` (`PlayerState`)
+Notes: Picks the player whose last bbox minimizes point→bbox distance to the ball; if best distance exceeds `max_distance`, returns `hitter_role="unknown"` + `hitter_track_id=None`; failure modes: no players/bboxes → returns `None`.
+
+[File: src/spatial_logic/events.py]
+Role: Infers a coarse stroke event type from ball trajectory + landing region.
+Category: core logic
+Key classes / functions: (list)
+- `StrokeEvent`
+- `infer_event_from_trajectory`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `track: Sequence[BallState]` (pixel x/y per frame), `landing: Optional[LandingPoint]`, optional `hitter_role`
+- Output: `StrokeEvent` (type, start/end frame, hitter_role, landing_region, landing_point)
+Called by: `src/pipeline/extract_strokes.py`
+Calls: `src/spatial_logic/landing_detector.py` (`BallState`, `LandingPoint`)
+Notes: Heuristic rules: if `landing.region` contains “front” → `net_shot`; if contains “back” → `clear` vs `lift` based on pixel y trend; else `drive` if `abs(dy_total) < 10` else `smash`; coordinate assumption: y is pixel-space (downwards) and region strings come from court-space classifier; failure mode: missing track → `unknown` with start/end=0.
+
+[File: src/spatial_logic/temporal_logic.py]
+Role: Small temporal utilities for event index smoothing and segment slicing.
+Category: utility / helper
+Key classes / functions: (list)
+- `smooth_events`
+- `slice_segments`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: event indices (`Sequence[int]`) and total length / padding
+- Output: deduped indices and `(start,end)` segments
+Called by: (none found) [VERIFY]
+Calls: (none internal)
+Notes: `smooth_events(window=3)` keeps events spaced > window frames apart; `slice_segments(pad=2)` bounds segments within `[0,total_len]`; no coordinate assumptions; failure modes: empty inputs → empty outputs.
+
+[File: src/spatial_logic/region_logic.py]
+Role: Thin wrapper for mapping court coordinates to a named zone label.
+Category: utility / helper (currently broken)
+Key classes / functions: (list)
+- `court_zone`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `(x,y)` in real-court coordinates (meters)
+- Output: zone label (string)
+Called by: (none found) [VERIFY]
+Calls: `src/geometry/region_definitions.py` (`zone_from_real_court_pos`)
+Notes: VERIFIED BROKEN IMPORT: `src/geometry/region_definitions.py` does not define `zone_from_real_court_pos`, so importing `src/spatial_logic/region_logic.py` raises `ImportError`. Suggested fix: either implement `zone_from_real_court_pos(x,y)` in `src/geometry/region_definitions.py` (e.g., delegate to `DEFAULT_GRID9.classify_region`) or update `region_logic.court_zone()` to call `DEFAULT_GRID9.classify_region` directly; also re-check any downstream imports if/when this module is used.
+
+CHECKPOINT P0 DONE: appended_files=7; remaining_pending=[VERIFY]
+CHECKPOINT P0 DONE: appended_files=7; remaining_pending=53
+
+[File: src/pipeline/report_generator.py]
+Role:
+- Generate match reports (Markdown/JSON/CSV) and optional figures (heatmaps, timeline) from `stroke_summaries`.
+Category:
+- orchestration / pipeline
+Key classes / functions: (list)
+- `generate_markdown_report`
+- `generate_json_report`
+- `generate_csv_report`
+- `generate_match_report`
+- `generate_report`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `match_name` + `stroke_summaries: List[Dict[str,Any]]` (+ output dir / flags)
+- Output: report file paths (str) and, for `generate_match_report`, a dict with paths + inline content (best-effort)
+Called by:
+- `scripts/demo_friend.py`
+- `README.md` (usage example) [VERIFY]
+Calls:
+- `src.analysis.tactical_stats.summarize_tactics`
+- `src.analysis.heatmap.create_landing_heatmap`, `src.analysis.heatmap.create_hitter_heatmap`
+- `src.analysis.timeline.create_stroke_timeline`
+Notes:
+- Assumes each stroke dict may contain: `final_type`, `classifier_label`, `event_type`, `hitter_role`, `hitter_track_id`, `landing_region`, `contact_region`, `contact_frame`, `landing_frame`, `confidence`.
+- Failure mode: `generate_csv_report()` raises `ValueError` when `stroke_summaries` is empty; visualization functions may return `None` when no points.
+
+[File: src/analysis/heatmap.py]
+Role:
+- Render badminton-court schematic + heatmaps for landing points and hitter contact points.
+Category:
+- visualization / debug
+Key classes / functions: (list)
+- `_draw_court`
+- `_create_xy_heatmap`
+- `create_landing_heatmap`
+- `create_hitter_heatmap`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `strokes: List[Dict[str,Any]]` with `landing_x/landing_y` or `hitter_x/hitter_y` (meters)
+- Output: saved PNG path (str) or `None` when no usable points
+Called by:
+- `src/pipeline/report_generator.py`
+Calls:
+- `matplotlib` (`pyplot`, `Rectangle`), `numpy`, `pathlib.Path`
+Notes:
+- Coordinate frame: meters in `[0..6.1]x[0..13.4]` (origin at near baseline, y increases to far baseline).
+- Landing heatmap: `landing_predicted=True` points are excluded from density grid and optionally plotted as separate markers.
+
+[File: src/analysis/timeline.py]
+Role:
+- Render a simple stroke timeline plot (contact frame vs hitter role).
+Category:
+- visualization / debug
+Key classes / functions: (list)
+- `create_stroke_timeline`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `strokes` with `contact_frame`, `final_type`, `hitter_role`
+- Output: saved PNG path (str) or `None` if no strokes
+Called by:
+- `src/pipeline/report_generator.py`
+Calls:
+- `matplotlib.pyplot`, `pathlib.Path`
+Notes:
+- Uses y=1 for `near`, y=2 for `far`; labels points with `final_type`.
+
+[File: src/analysis/tactical_stats.py]
+Role:
+- Compute heuristic tactical summaries (offense/defense/neutral) per player role and globally.
+Category:
+- core logic (analysis)
+Key classes / functions: (list)
+- `classify_phase`
+- `summarize_tactics`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `strokes: List[Dict[str,Any]]` (uses `event_type`, `landing_region`, `hitter_role`, `final_type`/`classifier_label`)
+- Output: dict with `per_player` counters and `global` aggregates (including `control_index`)
+Called by:
+- `src/pipeline/report_generator.py`
+Calls:
+- `collections.Counter`, `collections.defaultdict`
+Notes:
+- Offense/defense priors come from `OFFENSIVE_EVENTS` / `DEFENSIVE_EVENTS`; fallback uses `landing_region` row (`front/mid/back`).
+
+[File: scripts/export_court_map.py]
+Role:
+- Export a “court calibration map” artifact (currently a placeholder stub).
+Category:
+- CLI / entry point
+Key classes / functions: (list)
+- `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: none (uses fixed output path)
+- Output: writes `runs/court_map.txt`
+Called by:
+- CLI (`python scripts/export_court_map.py`)
+Calls:
+- `pathlib.Path`
+Notes:
+- Placeholder only; does not currently inspect video/config/court corners.
+
+[File: scripts/test_realtime_fps.py]
+Role:
+- Quick FPS benchmark for `src.pipeline.analyse_video.analyse_video` using a YAML config.
+Category:
+- CLI / entry point
+Key classes / functions: (list)
+- `test`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `video` path + `cfg_path` (YAML)
+- Output: prints processed frames and computed FPS
+Called by:
+- CLI (`python scripts/test_realtime_fps.py`)
+Calls:
+- `yaml.safe_load`
+- `src/pipeline/analyse_video.analyse_video`
+Notes:
+- Adds repo root to `sys.path` to allow `src.*` imports when executed as a script.
+
+[File: docs/court_detection_week_plan.md]
+Role:
+- 3-person, 1-week plan to harden court detection (reduce roof/wall + inner-rectangle false positives; improve debug interpretability).
+Plan steps (mapped):
+- Day 1: baseline + eval set → `src/vision/court_detector.py`, new eval scripts/data (`scripts/eval_court_detector.py`, `tests/court_eval_set/manifest.csv`) [PENDING]
+- Day 2: debug overlay metrics → `scripts/demo_friend.py`, `src/pipeline/render_overlay.py` [VERIFY]
+- Day 3: inner-rectangle rejects (`span_y`, `rel_top`) → `src/vision/court_detector.py`
+- Day 4: corner cross-score (intersection sanity) → `src/vision/court_rules.py` [PENDING] + `src/vision/court_detector.py`
+- Day 5: template matching improvements → `src/vision/court_detector.py` (`_template_f1_score`)
+- Day 6: multi-frame best-corner selection → `src/pipeline/analyse_video.py`
+- Day 7: docs/playbook → `README.md`, `docs/*`
+Notes:
+- Explicit fallback policy: prefer `auto_failed` over producing a wrong homography; manual workflow via `scripts/calibrate_court_corners.py --print-yaml`.
+
+[File: src/config/default.yaml]
+Role:
+- Default training config for stroke classifier training (v2 training pipeline).
+Key config keys: (group by section)
+- `seed`: `seed`
+- `data.*`: `root_dir`, `num_frames`, `frame_size`, `train_val_split`, `frame_step`, `sampling`, `augmentation`, `strong_aug`, `focus_court`, `use_cache`, `cache_dir`
+- `training.*`: `batch_size`, `num_epochs`, `learning_rate`, `weight_decay`, `num_workers`, `device`, `use_channels_last`, `scheduler`, `use_amp`, `grad_clip`, `label_smoothing`, `early_stopping_patience`
+- `model.*`: `backbone`, `pretrained`
+- `logging.*`: `log_interval`, `output_dir`
+Used by: (which scripts/modules read these keys)
+- `scripts/train_strokes.py`, `scripts/train_strokes_v2.py` (via `--config`)
+- `src/training/train.py`, `src/training/eval.py` (CLI arg default)
+Notes:
+- Not used by the runtime court detector; `data.focus_court` may affect dataset cropping/ROI during training [VERIFY].
+
+[File: src/config/v2_highcap.yaml]
+Role:
+- Higher-capacity v2 training config (larger backbone / different sampling + class weighting).
+Key config keys: (group by section)
+- `seed`: `seed`
+- `data.*`: `root_dir`, `num_frames`, `frame_size`, `train_val_split`, `frame_step`, `sampling`, `augmentation`, `strong_aug`, `focus_court`
+- `training.*`: `batch_size`, `num_epochs`, `learning_rate`, `weight_decay`, `num_workers`, `device`, `use_channels_last`, `scheduler`, `use_amp`, `grad_clip`, `label_smoothing`, `early_stopping_patience`, `class_weighting`, `sampler`, `boost_class`, `boost_factor`
+- `model.*`: `backbone`, `pretrained`
+- `logging.*`: `log_interval`, `output_dir`
+Used by: (which scripts/modules read these keys)
+- `scripts/train_strokes.py`, `scripts/train_strokes_v2.py`, `src/training/train.py` (when passed via `--config`) [VERIFY]
+Notes:
+- Training-only config; does not directly affect court detection in `analyse_video`.
+
+[File: src/config/v2_highcap_fast.yaml]
+Role:
+- File missing in repo; intended “fast” variant of v2 high-capacity training config. [VERIFY]
+Key config keys: (group by section)
+- [VERIFY] (file not present at `src/config/v2_highcap_fast.yaml`)
+Used by: (which scripts/modules read these keys)
+- [VERIFY]
+Notes:
+- Repo contains `src/config/v2_highcap_stable.yaml` instead; verify whether this file was renamed or not committed.
+
+[File: src/config/v3.yaml]
+Role:
+- General runtime pipeline config (vision/tracking/geometry/spatial_logic/output) for `scripts/analyse_match.py`.
+Key config keys: (group by section)
+- `vision.*`: `yolo_model`, `court_model`, `pose_model`, `device`
+- `tracking.*`: `player`, `ball`
+- `geometry.*`: `homography`
+- `spatial_logic.*`: `zones`, `detect_events`
+- `output.*`: `save_overlay`, `save_report`
+Used by: (which scripts/modules read these keys)
+- `scripts/analyse_match.py` (default `--config src/config/v3.yaml`) [VERIFY]
+Notes:
+- `src/pipeline/analyse_video.py` primarily reads `cfg["vision"]`, `cfg["tracking"]`, `cfg["pose"]`, `cfg["realtime"]`; some keys in this YAML may be ignored unless wired through. [VERIFY]
+
+[File: src/config/v3_ai_score.yaml]
+Role:
+- Realtime analysis config with AI score settings (student/teacher) and hitter inference knobs.
+Key config keys: (group by section)
+- `device.*`: `yolo_device`, `classifier_device`
+- `vision.*`: `yolo_imgsz`, `yolo_conf`, `use_court_roi`, `yolo_model`, `ball_model`, `ball_allow_all_if_empty`
+- `tracking.*`: `detect_stride`, `max_age`, `ball_max_age`, `iou_thresh`
+- `realtime.*`: `target_fps`, `batch_size`
+- `spatial_logic.*`: `enable_hitter_inference`, `hitter_distance_max`
+- `visualization.*`: `enable_heatmap`, `enable_timeline`, `heatmap_bins`
+- `ai_score.*`: `mode`, `teacher_api`
+Used by: (which scripts/modules read these keys)
+- `src/pipeline/action_feedback_pipeline.py` (default cfg path) [VERIFY]
+- `src/pipeline/analyse_video.py` (when passed as `config=` dict) [VERIFY]
+Notes:
+- Court detection sampling/ROI knobs consumed by `analyse_video`: `vision.use_court_roi`; also supports `vision.detect_court_corners`, `vision.court_detect_samples`, `vision.court_detect_stride`, `vision.court_corners` (manual) even if not present in this YAML (defaults apply).
+
+[File: src/config/v3_realtime.yaml]
+Role:
+- Main demo realtime analysis config (YOLO + tracking + optional pose) used by `demo_friend` and other scripts.
+Key config keys: (group by section)
+- `video.*`: `root_dir`
+- `device.*`: `yolo_device`, `classifier_device`
+- `vision.*`: `yolo_imgsz`, `yolo_conf`, `use_court_roi`, `court_roi_margin`, `yolo_model`, `ball_model`, `ball_allow_all_if_empty`
+- `tracking.*`: `detect_stride`, `max_age`, `ball_max_age`, `iou_thresh`
+- `realtime.*`: `target_fps`, `batch_size`
+- `spatial_logic.*`: `enable_hitter_inference`, `hitter_distance_max`
+- `visualization.*`: `enable_heatmap`, `enable_timeline`, `heatmap_bins`
+- `pose.*`: `enable`, `backend`, `stride`, `window`
+Used by: (which scripts/modules read these keys)
+- `scripts/demo_friend.py` (default `--config src/config/v3_realtime.yaml`)
+- `scripts/test_realtime_fps.py` (default)
+- `scripts/generate_teacher_labels_mlx.py` (default) [VERIFY]
+- `src/pipeline/analyse_video.py` (reads these sections when passed as `config=` dict)
+Notes:
+- Court detection sampling/ROI/confidence knobs in `analyse_video`: `vision.detect_court_corners` (default True), `vision.court_detect_samples` (default 10), `vision.court_detect_stride` (default 5), `vision.court_corners` (manual), `vision.use_court_roi` + `vision.court_roi_margin`.
+
+[File: src/config/v3_realtime_fast.yaml]
+Role:
+- File missing in repo; intended “fast” variant of realtime config. [VERIFY]
+Key config keys: (group by section)
+- [VERIFY] (file not present at `src/config/v3_realtime_fast.yaml`)
+Used by: (which scripts/modules read these keys)
+- [VERIFY]
+Notes:
+- If needed, derive from `src/config/v3_realtime.yaml` by lowering `vision.yolo_imgsz`, increasing `tracking.detect_stride`, disabling `pose.enable`, and disabling `vision.use_court_roi` when court detection is unstable. [VERIFY]
+
+CHECKPOINT P1 DONE: appended_files=14; remaining_pending=53
+
+[File: src/ai_score/__init__.py]
+Role: Package entry for AI scoring backends (re-exports MLX teacher/student + wrapper).
+Category: utility / helper (package init)
+Key classes / functions: (list)
+- `ActionFeedback`, `MLXStudent`, `MLXTeacher`
+Inputs/Outputs: N/A (imports/exports only)
+Called by: `from src.ai_score import ...` consumers (none found) [VERIFY]
+Calls: `src/ai_score/action_feedback.py`, `src/ai_score/student_mlx.py`, `src/ai_score/teacher_mlx.py`
+Notes: MLX-only; intended for local Apple Silicon workflows.
+
+[File: src/ai_score/action_feedback.py]
+Role: Unified interface for running teacher/student LLM scoring + feedback.
+Category: core logic
+Key classes / functions: (list)
+- `ActionFeedback` (`score_motion`, `score_motion_with_image`)
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `description: str`, optional `image_path: str`, optional `stroke_type: str`
+- Output: JSON-like text (or dict-like object) with `mistake/advice/score` (backend-dependent)
+Called by: `scripts/demo_friend.py`, `scripts/generate_teacher_labels_mlx.py`, `src/pipeline/action_feedback_pipeline.py`, `src/ai_score/__init__.py`
+Calls: `src/ai_score/rubric.py`, `src/ai_score/student_mlx.py`, `src/ai_score/teacher_mlx.py`
+Notes: Default model paths are hard-coded to `/Users/chencheng/llm/...` (non-portable); `mode` must be `student_mlx|teacher_mlx` (raises `ValueError` otherwise).
+
+[File: src/ai_score/rubric.py]
+Role: Prompt template used by student model to request JSON scoring output.
+Category: utility / helper
+Key classes / functions: (list)
+- `build_prompt`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `description: str`
+- Output: `prompt: str`
+Called by: `src/ai_score/action_feedback.py`
+Calls: (none internal)
+Notes: Single English rubric string; teacher path bypasses this prompt.
+
+[File: src/ai_score/student_mlx.py]
+Role: MLX VLM “student” backend wrapper (optionally applies LoRA adapters) for JSON feedback generation.
+Category: core logic
+Key classes / functions: (list)
+- `MLXStudent` (`score_motion`, `score_motion_with_image`, `generate_feedback`)
+- `MLXStudent._load_adapters`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `description/prompt: str`, optional `image_path: str`
+- Output: model `generate(...)` text (expected JSON)
+Called by: `src/ai_score/action_feedback.py`, `src/ai_score/__init__.py`
+Calls: external `mlx_vlm` (`load`, `generate`, `apply_chat_template`, `load_config`), optional `safetensors`, `mlx.core`
+Notes: Adapter path expects `adapters.safetensors` or `adapters.npz`; defaults to `/Users/chencheng/llm/qwen3-4b` if not provided.
+
+[File: src/ai_score/teacher_mlx.py]
+Role: MLX VLM “teacher” backend wrapper for richer motion analysis + JSON scoring.
+Category: core logic
+Key classes / functions: (list)
+- `MLXTeacher` (`analyse_motion`)
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `description: str`
+- Output: raw `mlx_vlm.generate(...)` output (caller may need `str(...)` or `.text`) [VERIFY]
+Called by: `src/ai_score/action_feedback.py`, `src/ai_score/__init__.py`
+Calls: external `mlx_vlm` (`load`, `generate`, `apply_chat_template`, `load_config`)
+Notes: Default teacher path is `/Users/chencheng/llm/qwen3-30b` (non-portable).
+
+[File: src/pipeline/action_feedback_pipeline.py]
+Role: Convenience wrapper to run `analyse_video` + stroke summaries + LLM feedback for each stroke.
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `run_action_feedback`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `video_path`, `cfg_path` (YAML), `mode`
+- Output: dict with keys `analysis`, `summaries`, `feedback`
+Called by: (none found) [VERIFY]
+Calls: `src/pipeline/analyse_video.analyse_video`, `src/pipeline/extract_strokes.*`, `src/ai_score/action_feedback.ActionFeedback`, `yaml.safe_load`
+Notes: [BROKEN] Calls `ActionFeedback(mode=\"student\", teacher_api=...)` but `ActionFeedback` expects `mode=\"student_mlx\"|\"teacher_mlx\"` and has no `teacher_api` parameter; fix by wiring config → `teacher_mlx_path/student_mlx_path/adapter_path` and using valid mode strings.
+
+[File: src/pipeline/render_overlay.py]
+Role: Minimal drawing helpers for player boxes and ball position overlays.
+Category: visualization / debug
+Key classes / functions: (list)
+- `render_players`
+- `render_ball`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `frame: np.ndarray`, `players: Iterable[bbox]`, `ball_pos: (x,y)|None`
+- Output: annotated frame (same dtype/shape)
+Called by: (none found) [VERIFY]
+Calls: `cv2`
+Notes: Uses OpenCV colors (BGR); if upstream frames are RGB, overlay colors will appear swapped. [VERIFY call site frame color space]
+
+[File: src/data/__init__.py]
+Role: Data package exports for dataset discovery/splitting.
+Category: utility / helper (package init)
+Key classes / functions: (list)
+- `VideoDataset`, `discover_video_files`, `train_val_split`
+Inputs/Outputs: N/A (imports/exports only)
+Called by: `from src.data import ...` consumers (none found) [VERIFY]
+Calls: `src/data/dataset.py`, `src/data/split.py`
+Notes: Training code imports submodules directly (`src.training.train`), not via this package. [VERIFY]
+
+[File: src/data/dataset.py]
+Role: Folder-based video dataset loader (frame sampling, optional caching, torchvision transforms).
+Category: core logic
+Key classes / functions: (list)
+- `discover_video_files`
+- `VideoDataset` (`__getitem__`, `_load_video_frames`, `_sample_indices`, `_apply_focus_crop`, `_cache_key`)
+- `_default_transform`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `root_dir/<class_name>/*.mp4` style dataset; sampling params in ctor
+- Output: `__getitem__` → `(video_tensor[T,C,H,W], label_idx, label_name, video_path)`
+Called by: `src/training/train.py`
+Calls: `cv2.VideoCapture`, `torchvision.transforms`, `src/data/frame_cache.ensure_dir`
+Notes: Reads BGR frames and converts to RGB; optional `.npy` caching stores sampled RGB frames; `focus_court={full,far,near}` crops before transform/resize.
+
+[File: src/data/split.py]
+Role: Dataset split + class weighting helpers for imbalanced training.
+Category: utility / helper
+Key classes / functions: (list)
+- `train_val_split`, `compute_class_counts`, `compute_class_weights`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `samples: Sequence[(path,class_name)]`, `class_to_idx`
+- Output: `(train_samples, val_samples)` and `weights: List[float]`
+Called by: `src/training/train.py`
+Calls: Python `random`
+Notes: `compute_class_weights` uses inverse-frequency weighting and normalizes weight scale.
+
+[File: src/data/transforms.py]
+Role: Torchvision transform presets (train augmentation + val preprocessing).
+Category: utility / helper
+Key classes / functions: (list)
+- `get_train_transforms`, `get_val_transforms`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `frame_size`, augmentation flags
+- Output: `torchvision.transforms.Compose`
+Called by: `src/training/train.py`
+Calls: `torchvision.transforms`, `src/data/dataset.py` (`IMAGENET_MEAN/STD`)
+Notes: Includes random crop/flip/rotation/jitter; val uses resize + center crop.
+
+[File: src/training/train.py]
+Role: Train loop for stroke video classifier from a YAML config (data → model → checkpoints).
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `load_config`, `build_dataloaders`, `train`
+- `_validate`, `_build_scheduler`
+- `_parse_args`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: config dict/YAML (`data.*`, `training.*`, `model.*`, `logging.*`)
+- Output: writes `best_model.pt` checkpoint to `logging.output_dir`; prints per-epoch metrics
+Called by: `scripts/train_strokes.py`, `scripts/train_strokes_v2.py`, `src/training/eval.py`
+Calls: `src/data/*`, `src/models/video_classifier.py`, `src/training/utils.py`, `torch`, `yaml`
+Notes: Supports weighted sampler (`training.sampler=weighted`), optional AMP (`training.use_amp`), schedulers (`cosine|onecycle`), early stopping (`training.early_stopping_patience`).
+
+[File: src/training/eval.py]
+Role: Evaluate a trained classifier checkpoint and export reports (confusion matrix, per-class acc).
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `evaluate_model`
+- `run_eval`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `config_path`, `checkpoint_path`
+- Output: saves `confusion_matrix.png` + `predictions.csv` under `logging.output_dir`; returns metrics dict
+Called by: user CLI (`python -m src.training.eval --config ... --checkpoint ...`)
+Calls: `src/training/train` (`load_config`, `build_dataloaders`), `src/models/video_classifier.py`, `src/training/utils.py`, `matplotlib`, `pandas`
+Notes: Uses `checkpoint["classes"]` to keep label ordering aligned between training and evaluation.
+
+[File: src/training/utils.py]
+Role: Training utilities (seed/device selection, checkpoint IO, tensor/device transfer helpers).
+Category: utility / helper
+Key classes / functions: (list)
+- `set_seed`, `set_num_threads`, `accuracy`
+- `save_checkpoint`, `load_checkpoint`
+- `get_device`, `move_to_device`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: tensors + device flags; checkpoint dicts
+- Output: tensors moved/reshaped; checkpoint metadata dict
+Called by: `src/training/train.py`, `src/training/eval.py`
+Calls: `torch`, `numpy`, `random`
+Notes: Prefers MPS on macOS; `move_to_device` can convert to `channels_last_3d` for 3D backbones.
+
+[File: src/models/__init__.py]
+Role: Model package exports (currently just `VideoClassifier`).
+Category: utility / helper (package init)
+Key classes / functions: (list)
+- `VideoClassifier`
+Inputs/Outputs: N/A (imports/exports only)
+Called by: `from src.models import VideoClassifier` consumers (none found) [VERIFY]
+Calls: `src/models/video_classifier.py`
+Notes: Training code imports `VideoClassifier` from `src.models.video_classifier` directly.
+
+[File: src/models/video_classifier.py]
+Role: Torch `nn.Module` wrapper around torchvision 2D/3D video backbones for classification.
+Category: core logic
+Key classes / functions: (list)
+- `_infer_feature_dim`, `_build_backbone`
+- `VideoClassifier` (`forward`)
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `x: torch.Tensor` of shape `(B,T,C,H,W)` (or `(B,C,T,H,W)` for 3D)
+- Output: `logits: torch.Tensor` of shape `(B,num_classes)`
+Called by: `src/training/train.py`, `src/training/eval.py`, `src/models/__init__.py`
+Calls: `torchvision.models` (ResNet18/50, r3d/mc3, optional x3d/slowfast), `torch.nn`
+Notes: Optional backbones fall back (e.g., x3d → r3d_34) when torchvision build lacks them; SlowFast uses a 2-pathway forward.
+
+[File: scripts/generate_teacher_labels_mlx.py]
+Role: CLI to run video analysis + generate teacher LLM labels for distillation (writes JSONL items).
+Category: CLI / entry point
+Key classes / functions: (list)
+- `build_prompt_from_summary`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `--videos-glob`, `--config` (analyse_video YAML), `--teacher-model-path`, `--max-videos`
+- Output: `data/distill/teacher_labels.jsonl` lines with `{video_path, summary, prompt, teacher_output}`
+Called by: user (shell); referenced by `README.md` / `project_summary.txt`
+Calls: `src/pipeline/analyse_video.analyse_video`, `src/pipeline/extract_strokes.*`, `src/ai_score/action_feedback.ActionFeedback`, `src/spatial_logic/pose_quality.pose_features_to_prompt`, `yaml.safe_load`
+Notes: Teacher output is stored as string (raw MLX output normalized); defaults to `/Users/chencheng/llm/qwen3-30b` (non-portable).
+
+[File: scripts/download_qwen3_mlx.py]
+Role: One-shot HuggingFace downloader for MLX Qwen3 teacher/student model weights.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: none (hard-coded model IDs and output dirs)
+- Output: downloads repos to local dirs
+Called by: user (shell)
+Calls: external `huggingface_hub.snapshot_download`
+Notes: [BROKEN] Hard-coded `local_dir=/Users/chencheng/llm/...`; make paths CLI args and document auth/network requirements.
+
+[File: scripts/full_distill_pipeline.py]
+Role: Helper script to assemble/run MLX distillation commands (data prep → LoRA train → fuse).
+Category: CLI / entry point
+Key classes / functions: (list)
+- `run_cmd`, `prepare_data`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: chat dataset JSONL (`--data`), student model path, training hyperparams
+- Output: writes `data/mlx_train/{train,valid}.jsonl`; produces adapters + fused model under `outputs/`
+Called by: user (shell)
+Calls: `subprocess.run`, `json`, `pathlib`
+Notes: Requires external `mlx_lm` CLI/module; uses `shell=True`; not wired into Python training pipeline.
+
+[File: scripts/prepare_distill_dataset.py]
+Role: Convert `teacher_labels.jsonl` into chat-style JSONL (`messages` format) for distillation.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `teacher_output_to_text`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `--input data/distill/teacher_labels.jsonl`
+- Output: `--output data/distill/distill_data_chat.jsonl` (lines with `{"messages":[...]}`)
+Called by: user (shell); referenced by `README.md` / `project_summary.txt`
+Calls: `json`, `argparse`, `pathlib`
+Notes: Skips invalid JSON and empty prompt/teacher output; serializes non-string teacher outputs via `json.dumps(...)` fallback to `str(...)`.
+
+[File: scripts/prepare_mlx_data.py]
+Role: Convert chat-style distill dataset into an MLX-friendly train/valid split (flat `text` records).
+Category: CLI / entry point
+Key classes / functions: (list)
+- `load_data`, `convert_to_mlx_format`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `data/distill/distill_data_chat.jsonl` (fixed path)
+- Output: `data/mlx_train/{train,valid}.jsonl` (lines with `{"text": "USER: ...\\nASSISTANT: ..."}`)
+Called by: user (shell) [VERIFY]
+Calls: `json`, `pathlib`
+Notes: Duplicates `prepare_data()` logic in `scripts/full_distill_pipeline.py`; verify which format your `mlx_lm` version expects (`messages` vs `text`). [VERIFY]
+
+[File: scripts/train_strokes.py]
+Role: CLI entrypoint to train the stroke classifier using `src/training/train.py`.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `parse_args`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `--config` + optional overrides (`--epochs`, `--batch-size`, `--learning-rate`, `--device`)
+- Output: training artifacts under `logging.output_dir` (e.g., `runs/.../best_model.pt`)
+Called by: user (shell); referenced by `README.md`
+Calls: `src/training/train.load_config`, `src/training/train.train`
+Notes: Prepends repo root to `sys.path` for script execution.
+
+[File: scripts/train_strokes_v2.py]
+Role: CLI entrypoint for training with extra overrides (scheduler/backbone).
+Category: CLI / entry point
+Key classes / functions: (list)
+- `parse_args`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: same as `train_strokes.py` + `--scheduler`, `--backbone`
+- Output: training artifacts under `logging.output_dir`
+Called by: user (shell); referenced by `README.md`
+Calls: `src/training/train.load_config`, `src/training/train.train`
+Notes: Overrides `training.scheduler` and `model.backbone` in the loaded YAML config.
+
+[File: scripts/train_student_distill_mlx.py]
+Role: Placeholder CLI for MLX-based student finetuning from distillation data.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `--data` (JSONL), `--save_dir`, optional `--base_model`
+- Output: none (raises)
+Called by: user (shell)
+Calls: `json`, `argparse`, `pathlib`
+Notes: [BROKEN] Always raises `NotImplementedError`; intended to be replaced by an MLX finetuning implementation or use `mlx_lm lora` via `scripts/full_distill_pipeline.py`.
+
+[File: scripts/analyse_match.py]
+Role: CLI wrapper for match/video analysis using a YAML config (v3 placeholder).
+Category: CLI / entry point
+Key classes / functions: (list)
+- `parse_args`, `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `--video`, `--config`
+- Output: prints analysis summary to stdout
+Called by: user (shell)
+Calls: `yaml.safe_load`, `src/pipeline/analyse_video` (`VideoAnalyser` import)
+Notes: [BROKEN] Imports `VideoAnalyser` from `src/pipeline/analyse_video.py`, but that module defines `analyse_video(...)` (function) and `AnalyseResult` dataclass; fix by calling `analyse_video(args.video, config=config)` or adding a `VideoAnalyser` wrapper class.
+
+CHECKPOINT P2 DONE: appended_files=25; remaining_pending=53
+
+[File: scripts/debug_court_candidates.py]
+Role: CLI tool to visualize court detection output and (optionally) top-K candidates on a single frame.
+Category: visualization / debug
+Key classes / functions: (list)
+- `parse_args`, `main`, `_load_yaml`, `_read_frame`, `_draw_quad`, `_draw_text`
+Called by: user (shell) [VERIFY]
+Calls: `cv2`, `numpy`, `yaml`; `src.vision.court_detector.CourtDetector`; `src.vision.court_detector_farin2005.CourtDetectorFarin2005`
+Notes: Reads `vision.court_detector_method`; runs one detector on `--frame`; draws corners in LB,RB,RT,LT order; if `last_metrics["candidates_topk"]` exists, overlays additional quads and annotates `near_score`/`tpl_f1`; writes `reports/court_candidates_debug.jpg` by default.
+
+[File: src/config/v3.yaml]
+Role: Minimal baseline config (v3) for pipeline orchestration defaults.
+Category: configuration
+Key classes / functions: (list)
+- (none; YAML config)
+Called by: [VERIFY] scripts that load YAML and pass dict into `src/pipeline/analyse_video.analyse_video`
+Calls: (none; data file)
+Notes: Includes `vision.court_detector_method` switch (`heuristic` | `farin2005`), plus coarse defaults under `vision.*`, `tracking.*`, `geometry.*`, `spatial_logic.*`, `output.*`.
+
+[File: src/config/v3_ai_score.yaml]
+Role: v3 config tuned for running `analyse_video` with AI scoring enabled/expected.
+Category: configuration
+Key classes / functions: (list)
+- (none; YAML config)
+Called by: [VERIFY] scripts that load YAML and pass dict into `src/pipeline/analyse_video.analyse_video`
+Calls: (none; data file)
+Notes: Defines `device.yolo_device`/`device.classifier_device`; `vision.*` (incl. `court_detector_method`, `use_court_roi`); `tracking.*`; `realtime.*`; `spatial_logic.*`; `visualization.*`; `ai_score.*` connection settings.
+
+[File: src/config/v3_realtime.yaml]
+Role: v3 config tuned for the realtime demo pipeline (video root + optional pose).
+Category: configuration
+Key classes / functions: (list)
+- (none; YAML config)
+Called by: [VERIFY] scripts that load YAML and pass dict into `src/pipeline/analyse_video.analyse_video`
+Calls: (none; data file)
+Notes: Adds `video.root_dir`; includes `vision.court_detector_method`, `vision.use_court_roi`, `vision.court_roi_margin`; enables `pose.*` (backend/stride/window) for optional pose extraction.
+
+[File: src/pipeline/analyse_video.py]
+Role: End-to-end video analysis orchestrator (read frames, detect players/ball, optional court ROI, optional pose; returns `AnalyseResult`).
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `FrameResult`, `AnalyseResult`, `analyse_video`, `_filter_player_detections_to_court`, `_roles_for_tracks`
+Called by: [VERIFY] `scripts/demo_friend.py`, `scripts/analyse_match.py`
+Calls: `src.vision.detectors.PlayerDetector`; `src.vision.ball_detector.BallDetector`; `src.vision.court_detector.CourtDetector`; `src.vision.court_detector_farin2005.CourtDetectorFarin2005`; `src.tracking.bytetrack.SimpleByteTrack`; `src.tracking.ball_track.SingleBallTracker`; `src.vision.pose_estimator.PoseEstimator`; (optional) `src.geometry.homography.CourtHomography.from_corners`
+Notes: Court selection: manual via `vision.court_corners` (len==4) → `court_detection.source="manual"`; else auto sampling via `vision.court_detect_samples`/`vision.court_detect_stride` picking max `last_confidence` across early frames; if `vision.court_detector_method=="farin2005"`, tries `CourtDetectorFarin2005` then `CourtDetector` as `"heuristic_fallback"`; failure sets `court_detection.source="auto_failed"` and preserves best failure meta. Homography gating: only builds `CourtHomography` if `court_corners` exists and len==4; roles use homography when available, else fallback median-y heuristic. ROI gating: when `vision.use_court_roi` true and corners available, crops frames for detection and offsets bboxes back to full-frame coordinates.
+
+[File: src/vision/court_detector_farin2005.py]
+Role: Farin et al. (2005)-inspired auto court detector producing outer court corners (LB,RB,RT,LT) for homography.
+Category: core logic
+Key classes / functions: (list)
+- `_LineModel`, `_CourtCandidate`, `CourtDetectorFarin2005`, `detect_court`
+- `_line_pixel_mask`, `_ransac_extract_lines`, `_dominant_directions`, `_build_candidates_from_lines`, `_rank_candidate`, `_quick_reject`, `_template_f1_score`, `_edge_support_ratios`
+Called by: `src/pipeline/analyse_video.analyse_video`; `scripts/debug_court_candidates.py`
+Calls: `src.vision.court_detector.CourtDetector` (mask helper); `src.vision.court_detector.CourtLines`; `src.geometry.homography` (court dimensions); `cv2`, `numpy`
+Notes: Produces multiple quad candidates from 2 horizontal + 2 vertical line combinations; uses quick reject (convex/area/aspect), edge support thresholding, and template F1 (`tpl_f1`) to rank; selects nearest court via `near_score` (larger quad + lower near-baseline y + higher support + higher tpl). Exposes `last_confidence/last_reason/last_method/last_edge_support/last_metrics`; `last_metrics` includes `tpl_f1`, `model_error`, `near_score`, `near_baseline_y`, `num_candidates`, `chosen_idx`, `candidate_lines`, and `candidates_topk` (for optional debug overlays). Failure reasons include: `invalid_frame`, `frame_too_small`, `not_enough_line_pixels`, `not_enough_lines`, `no_valid_candidate`, `low_confidence`.

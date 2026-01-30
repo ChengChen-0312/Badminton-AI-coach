@@ -108,6 +108,11 @@ def analyse_video(
     detect_court_corners = bool(vision_cfg.get("detect_court_corners", True))
     court_method = str(vision_cfg.get("court_detector_method", "heuristic")).lower()
     use_model_fit = court_method in ("model_fit", "model_fit_bwf")
+    model_fit_method = vision_cfg.get("model_fit_method", "lsd")
+    allow_fallback_lsd = vision_cfg.get("model_fit_allow_fallback_lsd", True)
+    print("[CFG] court_detector_method =", vision_cfg.get("court_detector_method"))
+    print("[CFG] model_fit_method      =", vision_cfg.get("model_fit_method"))
+    print("[CFG] allow_fallback_lsd    =", vision_cfg.get("model_fit_allow_fallback_lsd", True))
     court_detector = (
         CourtDetector(
             edge_top_min=edge_top_min,
@@ -164,8 +169,8 @@ def analyse_video(
                 samples = 1
                 stride = 1
 
-            best = None  # (confidence, corners, meta, debug_img, white_mask)
-            best_fail = None  # (confidence, meta, debug_img, white_mask)
+            best = None  # (confidence, corners, meta, fit)
+            best_fail = None  # (confidence, meta, fit)
             for i in range(samples):
                 fi = int(i * stride)
                 if fi == 0:
@@ -176,7 +181,31 @@ def analyse_video(
                     if not ok_i or bgr_i is None:
                         break
                 if use_model_fit:
-                    fit = fit_court_homography(bgr_i)
+                    fit = fit_court_homography(
+                        bgr_i,
+                        method=model_fit_method,
+                        allow_fallback_lsd=allow_fallback_lsd,
+                    )
+                    print("[FIT] method_used =", fit.method_used, "reason =", fit.reason)
+                    metrics = fit.metrics if isinstance(fit.metrics, dict) else {}
+                    print(
+                        "[FIT] raw_full_ratio=",
+                        metrics.get("white_mask_raw_full_ratio"),
+                        "raw_floor_ratio=",
+                        metrics.get("white_mask_raw_floor_ratio"),
+                        "clean_ratio=",
+                        metrics.get("white_mask_clean_ratio"),
+                        "floor_roi_ratio=",
+                        metrics.get("floor_roi_ratio"),
+                        "floor_bbox=",
+                        metrics.get("floor_bbox"),
+                        "fallback_floor_roi=",
+                        metrics.get("fallback_floor_roi"),
+                        "fallback_mode=",
+                        metrics.get("fallback_mode"),
+                        "floor_y_cut=",
+                        metrics.get("floor_y_cut"),
+                    )
                     conf = float(fit.confidence)
                     reason = str(fit.reason)
                     metrics = fit.metrics
@@ -189,11 +218,11 @@ def analyse_video(
                     }
                     if fit.corners is None:
                         if best_fail is None or conf > float(best_fail[0]):
-                            best_fail = (conf, meta_i, fit.debug_image, fit.white_mask)
+                            best_fail = (conf, meta_i, fit)
                         continue
                     corners_i = fit.corners.tolist()
                     if best is None or conf > float(best[0]):
-                        best = (conf, corners_i, meta_i, fit.debug_image, fit.white_mask)
+                        best = (conf, corners_i, meta_i, fit)
                 else:
                     rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
                     lines = court_detector.detect_court(rgb) if court_detector is not None else None
@@ -219,14 +248,14 @@ def analyse_video(
                     }
                     if lines is None or lines.corners is None:
                         if best_fail is None or conf > float(best_fail[0]):
-                            best_fail = (conf, meta_i)
+                            best_fail = (conf, meta_i, None)
                         continue
                     corners_i = lines.corners.tolist()
                     if best is None or conf > float(best[0]):
-                        best = (conf, corners_i, meta_i, None, None)
+                        best = (conf, corners_i, meta_i, None)
 
             if best is not None:
-                conf, corners_i, meta_i, debug_img, white_mask = best
+                conf, corners_i, meta_i, fit = best
                 if use_model_fit:
                     debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                     debug_path = vision_cfg.get("model_fit_debug_path", None)
@@ -239,19 +268,155 @@ def analyse_video(
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         path = debug_dir / f"{Path(video_path).stem}_court_fit_debug.jpg"
                     metrics = meta_i.get("metrics") if isinstance(meta_i, dict) else None
-                    if isinstance(metrics, dict) and isinstance(debug_img, np.ndarray):
-                        cv2.imwrite(str(path), debug_img)
-                        metrics["debug_image_path"] = str(path)
-                    if isinstance(metrics, dict) and isinstance(white_mask, np.ndarray):
-                        mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask.png")
-                        cv2.imwrite(str(mask_path), white_mask)
-                        metrics["white_mask_path"] = str(mask_path)
+                    if isinstance(metrics, dict) and fit is not None:
+                        if isinstance(fit.debug_image, np.ndarray):
+                            cv2.imwrite(str(path), fit.debug_image)
+                            metrics["debug_image_path"] = str(path)
+                        if isinstance(fit.debug_image_init, np.ndarray):
+                            init_path = path.with_name(f"{Path(video_path).stem}_court_fit_init_overlay.jpg")
+                            cv2.imwrite(str(init_path), fit.debug_image_init)
+                            metrics["debug_init_path"] = str(init_path)
+                        raw_full = fit.white_mask_raw_full if isinstance(fit.white_mask_raw_full, np.ndarray) else fit.white_mask_raw
+                        if isinstance(raw_full, np.ndarray):
+                            raw_full_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_raw_full.png")
+                            cv2.imwrite(str(raw_full_path), raw_full)
+                            metrics["white_mask_raw_full_path"] = str(raw_full_path)
+                            metrics["white_mask_raw_path"] = str(raw_full_path)
+                        if isinstance(fit.white_mask_raw_floor, np.ndarray):
+                            raw_floor_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_raw_floor.png")
+                            cv2.imwrite(str(raw_floor_path), fit.white_mask_raw_floor)
+                            metrics["white_mask_raw_floor_path"] = str(raw_floor_path)
+                        if isinstance(fit.white_mask_raw_floor_preblob, np.ndarray):
+                            preblob_path = path.with_name(
+                                f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_preblob.png"
+                            )
+                            cv2.imwrite(str(preblob_path), fit.white_mask_raw_floor_preblob)
+                            metrics["white_mask_raw_floor_preblob_path"] = str(preblob_path)
+                        if isinstance(fit.white_mask_raw_floor_postblob, np.ndarray):
+                            postblob_path = path.with_name(
+                                f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_postblob.png"
+                            )
+                            cv2.imwrite(str(postblob_path), fit.white_mask_raw_floor_postblob)
+                            metrics["white_mask_raw_floor_postblob_path"] = str(postblob_path)
+                        if isinstance(fit.white_mask_raw_floor_noblob, np.ndarray):
+                            noblob_path = path.with_name(
+                                f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_noblob.png"
+                            )
+                            cv2.imwrite(str(noblob_path), fit.white_mask_raw_floor_noblob)
+                            metrics["white_mask_raw_floor_noblob_path"] = str(noblob_path)
+                        if isinstance(fit.floor_roi_mask, np.ndarray):
+                            floor_roi_path = path.with_name(f"{Path(video_path).stem}_court_fit_floor_roi.png")
+                            cv2.imwrite(str(floor_roi_path), fit.floor_roi_mask)
+                            metrics["floor_roi_path"] = str(floor_roi_path)
+                        if isinstance(fit.floor_roi_overlay, np.ndarray):
+                            floor_roi_overlay_path = path.with_name(
+                                f"{Path(video_path).stem}_court_fit_floor_roi_overlay.jpg"
+                            )
+                            cv2.imwrite(str(floor_roi_overlay_path), fit.floor_roi_overlay)
+                            metrics["floor_roi_overlay_path"] = str(floor_roi_overlay_path)
+                        if isinstance(fit.seed_bottom_mask, np.ndarray):
+                            seed_path = path.with_name(f"{Path(video_path).stem}_court_fit_seed_bottom_mask.png")
+                            cv2.imwrite(str(seed_path), fit.seed_bottom_mask)
+                            metrics["seed_bottom_path"] = str(seed_path)
+                        if isinstance(fit.green_mask, np.ndarray):
+                            green_path = path.with_name(f"{Path(video_path).stem}_court_fit_green_mask.png")
+                            cv2.imwrite(str(green_path), fit.green_mask)
+                            metrics["green_mask_path"] = str(green_path)
+                        if isinstance(fit.largest_cc_mask, np.ndarray):
+                            cc_path = path.with_name(f"{Path(video_path).stem}_court_fit_largest_cc_mask.png")
+                            cv2.imwrite(str(cc_path), fit.largest_cc_mask)
+                            metrics["largest_cc_path"] = str(cc_path)
+                        if isinstance(fit.exg_row_plot, np.ndarray):
+                            exg_path = path.with_name(f"{Path(video_path).stem}_court_fit_exg_row.png")
+                            cv2.imwrite(str(exg_path), fit.exg_row_plot)
+                            metrics["exg_row_path"] = str(exg_path)
+                        if isinstance(fit.white_mask_clean, np.ndarray):
+                            clean_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_clean.png")
+                            cv2.imwrite(str(clean_path), fit.white_mask_clean)
+                            metrics["white_mask_clean_path"] = str(clean_path)
+                            metrics["white_mask_path"] = str(clean_path)
+                        if isinstance(fit.lsd_lines_a, np.ndarray):
+                            lsd_path = path.with_name(f"{Path(video_path).stem}_court_fit_lsd_dirA.png")
+                            cv2.imwrite(str(lsd_path), fit.lsd_lines_a)
+                            metrics["lsd_dirA_path"] = str(lsd_path)
+                        if isinstance(fit.lsd_lines_b, np.ndarray):
+                            lsd_path = path.with_name(f"{Path(video_path).stem}_court_fit_lsd_dirB.png")
+                            cv2.imwrite(str(lsd_path), fit.lsd_lines_b)
+                            metrics["lsd_dirB_path"] = str(lsd_path)
+                        if isinstance(fit.dt_debug, np.ndarray):
+                            dt_path = path.with_name(f"{Path(video_path).stem}_court_fit_dt.png")
+                            cv2.imwrite(str(dt_path), fit.dt_debug)
+                            metrics["dt_debug_path"] = str(dt_path)
+                        if isinstance(fit.ori_mask_a, np.ndarray):
+                            ori_path = path.with_name(f"{Path(video_path).stem}_court_fit_ori_maskA.png")
+                            cv2.imwrite(str(ori_path), fit.ori_mask_a)
+                            metrics["ori_maskA_path"] = str(ori_path)
+                        if isinstance(fit.ori_mask_b, np.ndarray):
+                            ori_path = path.with_name(f"{Path(video_path).stem}_court_fit_ori_maskB.png")
+                            cv2.imwrite(str(ori_path), fit.ori_mask_b)
+                            metrics["ori_maskB_path"] = str(ori_path)
+                        if isinstance(fit.hough_lines_img, np.ndarray):
+                            hough_path = path.with_name(f"{Path(video_path).stem}_court_fit_hough_lines.png")
+                            cv2.imwrite(str(hough_path), fit.hough_lines_img)
+                            metrics["hough_lines_path"] = str(hough_path)
+                        if isinstance(fit.raw_floor_hough_lines_img, np.ndarray):
+                            hough_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines.png")
+                            cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_img)
+                            metrics["raw_floor_hough_lines_path"] = str(hough_path)
+                        if isinstance(fit.raw_floor_hough_lines_a, np.ndarray):
+                            hough_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines_A.png")
+                            cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_a)
+                            metrics["raw_floor_hough_lines_a_path"] = str(hough_path)
+                        if isinstance(fit.raw_floor_hough_lines_b, np.ndarray):
+                            hough_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines_B.png")
+                            cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_b)
+                            metrics["raw_floor_hough_lines_b_path"] = str(hough_path)
+                        if isinstance(fit.raw_floor_dt_debug, np.ndarray):
+                            dt_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_dt.png")
+                            cv2.imwrite(str(dt_path), fit.raw_floor_dt_debug)
+                            metrics["raw_floor_dt_path"] = str(dt_path)
+                        if isinstance(fit.raw_floor_preprocessed, np.ndarray):
+                            prep_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_preprocessed.png")
+                            cv2.imwrite(str(prep_path), fit.raw_floor_preprocessed)
+                            metrics["raw_floor_preprocessed_path"] = str(prep_path)
+                        if isinstance(fit.raw_floor_edges, np.ndarray):
+                            edge_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_edges.png")
+                            cv2.imwrite(str(edge_path), fit.raw_floor_edges)
+                            metrics["raw_floor_edges_path"] = str(edge_path)
+                        if isinstance(fit.linepix_mask, np.ndarray):
+                            lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix.png")
+                            cv2.imwrite(str(lp_path), fit.linepix_mask)
+                            metrics["linepix_path"] = str(lp_path)
+                        if isinstance(fit.linepix_overlay, np.ndarray):
+                            lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix_overlay.jpg")
+                            cv2.imwrite(str(lp_path), fit.linepix_overlay)
+                            metrics["linepix_overlay_path"] = str(lp_path)
+                        if isinstance(fit.linepix_mask, np.ndarray):
+                            lp_mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix.png")
+                            cv2.imwrite(str(lp_mask_path), fit.linepix_mask)
+                            metrics["linepix_mask_path"] = str(lp_mask_path)
+                        if isinstance(fit.ransac_lines_img, np.ndarray):
+                            lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_ransac_lines.jpg")
+                            cv2.imwrite(str(lp_path), fit.ransac_lines_img)
+                            metrics["ransac_lines_path"] = str(lp_path)
+                        if isinstance(fit.raw_floor_top5_overlay, np.ndarray):
+                            ov_path = path.with_name(f"{Path(video_path).stem}_court_fit_top5_candidate_overlays.png")
+                            cv2.imwrite(str(ov_path), fit.raw_floor_top5_overlay)
+                            metrics["raw_floor_top5_overlay_path"] = str(ov_path)
+                        if isinstance(fit.raw_floor_model_overlay, np.ndarray):
+                            ov_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_overlay.png")
+                            cv2.imwrite(str(ov_path), fit.raw_floor_model_overlay)
+                            metrics["raw_floor_overlay_path"] = str(ov_path)
+                        if isinstance(fit.frame_model_overlay, np.ndarray):
+                            ov_path = path.with_name(f"{Path(video_path).stem}_court_fit_frame_overlay.jpg")
+                            cv2.imwrite(str(ov_path), fit.frame_model_overlay)
+                            metrics["raw_floor_frame_overlay_path"] = str(ov_path)
                 court_corners = corners_i
                 court_detection = meta_i
             else:
                 # Auto detector rejected all candidates.
                 if best_fail is not None:
-                    _conf, _meta, debug_img, white_mask = best_fail
+                    _conf, _meta, fit = best_fail
                     if use_model_fit:
                         debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                         debug_path = vision_cfg.get("model_fit_debug_path", None)
@@ -264,13 +429,157 @@ def analyse_video(
                             debug_dir.mkdir(parents=True, exist_ok=True)
                             path = debug_dir / f"{Path(video_path).stem}_court_fit_debug.jpg"
                         metrics = _meta.get("metrics") if isinstance(_meta, dict) else None
-                        if isinstance(metrics, dict) and isinstance(debug_img, np.ndarray):
-                            cv2.imwrite(str(path), debug_img)
-                            metrics["debug_image_path"] = str(path)
-                        if isinstance(metrics, dict) and isinstance(white_mask, np.ndarray):
-                            mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask.png")
-                            cv2.imwrite(str(mask_path), white_mask)
-                            metrics["white_mask_path"] = str(mask_path)
+                        if isinstance(metrics, dict) and fit is not None:
+                            if isinstance(fit.debug_image, np.ndarray):
+                                cv2.imwrite(str(path), fit.debug_image)
+                                metrics["debug_image_path"] = str(path)
+                            if isinstance(fit.debug_image_init, np.ndarray):
+                                init_path = path.with_name(f"{Path(video_path).stem}_court_fit_init_overlay.jpg")
+                                cv2.imwrite(str(init_path), fit.debug_image_init)
+                                metrics["debug_init_path"] = str(init_path)
+                            raw_full = fit.white_mask_raw_full if isinstance(fit.white_mask_raw_full, np.ndarray) else fit.white_mask_raw
+                            if isinstance(raw_full, np.ndarray):
+                                raw_full_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_raw_full.png")
+                                cv2.imwrite(str(raw_full_path), raw_full)
+                                metrics["white_mask_raw_full_path"] = str(raw_full_path)
+                                metrics["white_mask_raw_path"] = str(raw_full_path)
+                            if isinstance(fit.white_mask_raw_floor, np.ndarray):
+                                raw_floor_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_raw_floor.png")
+                                cv2.imwrite(str(raw_floor_path), fit.white_mask_raw_floor)
+                                metrics["white_mask_raw_floor_path"] = str(raw_floor_path)
+                            if isinstance(fit.white_mask_raw_floor_preblob, np.ndarray):
+                                preblob_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_preblob.png"
+                                )
+                                cv2.imwrite(str(preblob_path), fit.white_mask_raw_floor_preblob)
+                                metrics["white_mask_raw_floor_preblob_path"] = str(preblob_path)
+                            if isinstance(fit.white_mask_raw_floor_postblob, np.ndarray):
+                                postblob_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_postblob.png"
+                                )
+                                cv2.imwrite(str(postblob_path), fit.white_mask_raw_floor_postblob)
+                                metrics["white_mask_raw_floor_postblob_path"] = str(postblob_path)
+                            if isinstance(fit.white_mask_raw_floor_noblob, np.ndarray):
+                                noblob_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_white_mask_raw_floor_noblob.png"
+                                )
+                                cv2.imwrite(str(noblob_path), fit.white_mask_raw_floor_noblob)
+                                metrics["white_mask_raw_floor_noblob_path"] = str(noblob_path)
+                            if isinstance(fit.floor_roi_mask, np.ndarray):
+                                floor_roi_path = path.with_name(f"{Path(video_path).stem}_court_fit_floor_roi.png")
+                                cv2.imwrite(str(floor_roi_path), fit.floor_roi_mask)
+                                metrics["floor_roi_path"] = str(floor_roi_path)
+                            if isinstance(fit.floor_roi_overlay, np.ndarray):
+                                floor_roi_overlay_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_floor_roi_overlay.jpg"
+                                )
+                                cv2.imwrite(str(floor_roi_overlay_path), fit.floor_roi_overlay)
+                                metrics["floor_roi_overlay_path"] = str(floor_roi_overlay_path)
+                            if isinstance(fit.seed_bottom_mask, np.ndarray):
+                                seed_path = path.with_name(f"{Path(video_path).stem}_court_fit_seed_bottom_mask.png")
+                                cv2.imwrite(str(seed_path), fit.seed_bottom_mask)
+                                metrics["seed_bottom_path"] = str(seed_path)
+                            if isinstance(fit.green_mask, np.ndarray):
+                                green_path = path.with_name(f"{Path(video_path).stem}_court_fit_green_mask.png")
+                                cv2.imwrite(str(green_path), fit.green_mask)
+                                metrics["green_mask_path"] = str(green_path)
+                            if isinstance(fit.largest_cc_mask, np.ndarray):
+                                cc_path = path.with_name(f"{Path(video_path).stem}_court_fit_largest_cc_mask.png")
+                                cv2.imwrite(str(cc_path), fit.largest_cc_mask)
+                                metrics["largest_cc_path"] = str(cc_path)
+                            if isinstance(fit.exg_row_plot, np.ndarray):
+                                exg_path = path.with_name(f"{Path(video_path).stem}_court_fit_exg_row.png")
+                                cv2.imwrite(str(exg_path), fit.exg_row_plot)
+                                metrics["exg_row_path"] = str(exg_path)
+                            if isinstance(fit.white_mask_clean, np.ndarray):
+                                clean_path = path.with_name(f"{Path(video_path).stem}_court_fit_white_mask_clean.png")
+                                cv2.imwrite(str(clean_path), fit.white_mask_clean)
+                                metrics["white_mask_clean_path"] = str(clean_path)
+                                metrics["white_mask_path"] = str(clean_path)
+                            if isinstance(fit.lsd_lines_a, np.ndarray):
+                                lsd_path = path.with_name(f"{Path(video_path).stem}_court_fit_lsd_dirA.png")
+                                cv2.imwrite(str(lsd_path), fit.lsd_lines_a)
+                                metrics["lsd_dirA_path"] = str(lsd_path)
+                            if isinstance(fit.lsd_lines_b, np.ndarray):
+                                lsd_path = path.with_name(f"{Path(video_path).stem}_court_fit_lsd_dirB.png")
+                                cv2.imwrite(str(lsd_path), fit.lsd_lines_b)
+                                metrics["lsd_dirB_path"] = str(lsd_path)
+                            if isinstance(fit.dt_debug, np.ndarray):
+                                dt_path = path.with_name(f"{Path(video_path).stem}_court_fit_dt.png")
+                                cv2.imwrite(str(dt_path), fit.dt_debug)
+                                metrics["dt_debug_path"] = str(dt_path)
+                            if isinstance(fit.ori_mask_a, np.ndarray):
+                                ori_path = path.with_name(f"{Path(video_path).stem}_court_fit_ori_maskA.png")
+                                cv2.imwrite(str(ori_path), fit.ori_mask_a)
+                                metrics["ori_maskA_path"] = str(ori_path)
+                            if isinstance(fit.ori_mask_b, np.ndarray):
+                                ori_path = path.with_name(f"{Path(video_path).stem}_court_fit_ori_maskB.png")
+                                cv2.imwrite(str(ori_path), fit.ori_mask_b)
+                                metrics["ori_maskB_path"] = str(ori_path)
+                            if isinstance(fit.hough_lines_img, np.ndarray):
+                                hough_path = path.with_name(f"{Path(video_path).stem}_court_fit_hough_lines.png")
+                                cv2.imwrite(str(hough_path), fit.hough_lines_img)
+                                metrics["hough_lines_path"] = str(hough_path)
+                            if isinstance(fit.raw_floor_hough_lines_img, np.ndarray):
+                                hough_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines.png"
+                                )
+                                cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_img)
+                                metrics["raw_floor_hough_lines_path"] = str(hough_path)
+                            if isinstance(fit.raw_floor_hough_lines_a, np.ndarray):
+                                hough_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines_A.png"
+                                )
+                                cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_a)
+                                metrics["raw_floor_hough_lines_a_path"] = str(hough_path)
+                            if isinstance(fit.raw_floor_hough_lines_b, np.ndarray):
+                                hough_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_raw_floor_hough_lines_B.png"
+                                )
+                                cv2.imwrite(str(hough_path), fit.raw_floor_hough_lines_b)
+                                metrics["raw_floor_hough_lines_b_path"] = str(hough_path)
+                            if isinstance(fit.raw_floor_dt_debug, np.ndarray):
+                                dt_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_dt.png")
+                                cv2.imwrite(str(dt_path), fit.raw_floor_dt_debug)
+                                metrics["raw_floor_dt_path"] = str(dt_path)
+                            if isinstance(fit.raw_floor_preprocessed, np.ndarray):
+                                prep_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_preprocessed.png")
+                                cv2.imwrite(str(prep_path), fit.raw_floor_preprocessed)
+                                metrics["raw_floor_preprocessed_path"] = str(prep_path)
+                            if isinstance(fit.raw_floor_edges, np.ndarray):
+                                edge_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_edges.png")
+                                cv2.imwrite(str(edge_path), fit.raw_floor_edges)
+                                metrics["raw_floor_edges_path"] = str(edge_path)
+                            if isinstance(fit.linepix_mask, np.ndarray):
+                                lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix.png")
+                                cv2.imwrite(str(lp_path), fit.linepix_mask)
+                                metrics["linepix_path"] = str(lp_path)
+                            if isinstance(fit.linepix_overlay, np.ndarray):
+                                lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix_overlay.jpg")
+                                cv2.imwrite(str(lp_path), fit.linepix_overlay)
+                                metrics["linepix_overlay_path"] = str(lp_path)
+                            if isinstance(fit.linepix_mask, np.ndarray):
+                                lp_mask_path = path.with_name(f"{Path(video_path).stem}_court_fit_linepix.png")
+                                cv2.imwrite(str(lp_mask_path), fit.linepix_mask)
+                                metrics["linepix_mask_path"] = str(lp_mask_path)
+                            if isinstance(fit.ransac_lines_img, np.ndarray):
+                                lp_path = path.with_name(f"{Path(video_path).stem}_court_fit_ransac_lines.jpg")
+                                cv2.imwrite(str(lp_path), fit.ransac_lines_img)
+                                metrics["ransac_lines_path"] = str(lp_path)
+                            if isinstance(fit.raw_floor_top5_overlay, np.ndarray):
+                                ov_path = path.with_name(
+                                    f"{Path(video_path).stem}_court_fit_top5_candidate_overlays.png"
+                                )
+                                cv2.imwrite(str(ov_path), fit.raw_floor_top5_overlay)
+                                metrics["raw_floor_top5_overlay_path"] = str(ov_path)
+                            if isinstance(fit.raw_floor_model_overlay, np.ndarray):
+                                ov_path = path.with_name(f"{Path(video_path).stem}_court_fit_raw_floor_overlay.png")
+                                cv2.imwrite(str(ov_path), fit.raw_floor_model_overlay)
+                                metrics["raw_floor_overlay_path"] = str(ov_path)
+                            if isinstance(fit.frame_model_overlay, np.ndarray):
+                                ov_path = path.with_name(f"{Path(video_path).stem}_court_fit_frame_overlay.jpg")
+                                cv2.imwrite(str(ov_path), fit.frame_model_overlay)
+                                metrics["raw_floor_frame_overlay_path"] = str(ov_path)
                     court_detection = {**_meta, "source": "auto_failed"}
                 else:
                     court_detection = {"source": "auto_failed", "confidence": None, "reason": "no_valid_candidate"}

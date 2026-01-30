@@ -13,6 +13,8 @@ vision:
   edge_min_floor: 0.10
 
   court_detector_method: "model_fit"  # "heuristic" | "farin2005" | "model_fit"
+  model_fit_method: "hough_orient"
+  model_fit_allow_fallback_lsd: false
 
   top_crop_ratio: 0.05
   floor_close_kernel: 45              # 比 35 更容易桥接网导致的断裂

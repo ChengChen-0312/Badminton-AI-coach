@@ -44,3 +44,7 @@ Badminton AI Coach 项目总结（截至 v3.7）
 补充：场地标定（影响 heatmap/击球点区域）
 - 如果自动场地角点检测在多场地/遮挡场景下不稳定，可在配置里手动提供 `vision.court_corners`（顺序：LB, RB, RT, LT）。
 - 交互式标定脚本：`python scripts/calibrate_court_corners.py --video <path> --print-yaml`
+
+`reports/demo_friend/demo_friend_heatmap.png`：Landing Heatmap，显示每个 stroke 的球落点分布（用 `landing_x/landing_y`，单位米，映射到标准 6.1×13.4m 场地）。红点=观测到的落点；黄 x= `landing_predicted=true` 的“预测落点”（不计入热度网格，只单独标出来）。代码：`src/analysis/heatmap.py:create_landing_heatmap`。
+`reports/demo_friend/demo_friend_hitter_heatmap.png`：Hitter (Contact) Heatmap，显示击球者在触球帧时的场上站位（取击球者 bbox 底部中心“脚点”并做单应映射得到 `hitter_x/hitter_y`）。红点=每个 stroke 的击球站位。代码：`src/analysis/heatmap.py:create_hitter_heatmap`。
+两张图用同一坐标系：x=场地宽方向（0→6.1m），y=场地长方向（0→13.4m，y=0 为近端底线）。

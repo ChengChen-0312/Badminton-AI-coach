@@ -1,12 +1,121 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+import json
+import math
+import os
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from src.vision.court_model_bwf import MODEL_ID, get_bwf_corners, get_bwf_lines, sample_model_points
+
+# Mixer weights for candidate legitimacy scoring (lower is better).
+MIXER_WEIGHTS = {
+    "dt": 1.0,
+    "aspect": 0.8,
+    "vp": 0.5,
+    "floor": 2.0,
+    "cover": 2.0,
+    "pos": 0.3,
+    "area": 8.0,
+}
+
+CANONICAL_POINTS_NORM = {
+    "y_net": 0.5,
+    "y_short_near": 0.352239,
+    "y_short_far": 0.647761,
+    "x_center": 0.5,
+    "x_singles_L": 0.075410,
+    "x_singles_R": 0.924590,
+    "SSN_L_out": (0.0, 0.352239),
+    "SSN_R_out": (1.0, 0.352239),
+    "SSF_L_out": (0.0, 0.647761),
+    "SSF_R_out": (1.0, 0.647761),
+    "C_SSN": (0.5, 0.352239),
+    "C_SSF": (0.5, 0.647761),
+    "NetPost_L": (0.0, 0.5),
+    "NetPost_R": (1.0, 0.5),
+    "NetMid": (0.5, 0.5),
+    "SSN_L_in": (0.075410, 0.352239),
+    "SSN_R_in": (0.924590, 0.352239),
+    "SSF_L_in": (0.075410, 0.647761),
+    "SSF_R_in": (0.924590, 0.647761),
+    "corners_lb_rb_rt_lt": (
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+    ),
+    "service_short_sideline_intersections": (
+        (0.0, 0.352238806),
+        (1.0, 0.352238806),
+        (0.0, 0.647761194),
+        (1.0, 0.647761194),
+    ),
+    "service_short_center_intersections": (
+        (0.5, 0.352238806),
+        (0.5, 0.647761194),
+    ),
+    "net_posts": (
+        (0.0, 0.5),
+        (1.0, 0.5),
+    ),
+    "net_mid": (0.5, 0.5),
+}
+
+
+def get_canonical_points_norm() -> Dict[str, Any]:
+    """Return canonical court points in normalized coordinates for debug/metrics."""
+    points: Dict[str, Any] = {}
+    for key, val in CANONICAL_POINTS_NORM.items():
+        if isinstance(val, (tuple, list)):
+            if val and isinstance(val[0], (tuple, list)):
+                points[key] = [[float(p[0]), float(p[1])] for p in val]  # type: ignore[index]
+            else:
+                points[key] = [float(val[0]), float(val[1])]  # type: ignore[index]
+        else:
+            points[key] = float(val)
+    return points
+
+
+# ---------- Raw-floor Hough env knobs ----------
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _seg_len_px(seg) -> float:
+    x1, y1, x2, y2 = seg
+    return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+
+
+def _filter_segments_minlen(segments, min_len_px: float, max_keep: int = 0):
+    """Filter segments by minimum pixel length; optionally keep only the longest max_keep."""
+    if segments is None:
+        return []
+    segs = [s for s in segments if _seg_len_px(s) >= float(min_len_px)]
+    if max_keep and max_keep > 0 and len(segs) > max_keep:
+        segs.sort(key=_seg_len_px, reverse=True)
+        segs = segs[:max_keep]
+    return segs
+
+
+_RAW_HOUGH_THRESHOLD = _env_int("BADC_RAW_HOUGH_THRESHOLD", 45)
+_RAW_HOUGH_MINLEN_RT = _env_float("BADC_RAW_HOUGH_MINLEN_RATIO", 0.05)
+_RAW_SEG_MINLEN_PX = _env_float("BADC_RAW_SEG_MINLEN_PX", 40.0)
+_RAW_SEG_MAX_KEEP = _env_int("BADC_RAW_SEG_MAX_KEEP", 0)
+# -----------------------------------------------
 
 try:  # optional SciPy-based LM refine
     from scipy.optimize import least_squares
@@ -36,13 +145,79 @@ class CourtFitResult:
     confidence: float
     metrics: Dict[str, Any]
     reason: str
+    method_used: Optional[str] = None
     debug_image: Optional[np.ndarray] = None
     white_mask: Optional[np.ndarray] = None
+    debug_image_init: Optional[np.ndarray] = None
+    white_mask_raw: Optional[np.ndarray] = None
+    white_mask_clean: Optional[np.ndarray] = None
+    white_mask_raw_full: Optional[np.ndarray] = None
+    white_mask_raw_floor: Optional[np.ndarray] = None
+    white_mask_raw_floor_noblob: Optional[np.ndarray] = None
+    white_mask_raw_floor_preblob: Optional[np.ndarray] = None
+    white_mask_raw_floor_postblob: Optional[np.ndarray] = None
+    floor_roi_mask: Optional[np.ndarray] = None
+    floor_roi_overlay: Optional[np.ndarray] = None
+    seed_bottom_mask: Optional[np.ndarray] = None
+    green_mask: Optional[np.ndarray] = None
+    largest_cc_mask: Optional[np.ndarray] = None
+    exg_row_plot: Optional[np.ndarray] = None
+    raw_floor_hough_lines_img: Optional[np.ndarray] = None
+    raw_floor_hough_lines_a: Optional[np.ndarray] = None
+    raw_floor_hough_lines_b: Optional[np.ndarray] = None
+    raw_floor_dt_debug: Optional[np.ndarray] = None
+    raw_floor_model_overlay: Optional[np.ndarray] = None
+    raw_floor_top5_overlay: Optional[np.ndarray] = None
+    raw_floor_preprocessed: Optional[np.ndarray] = None
+    raw_floor_edges: Optional[np.ndarray] = None
+    frame_model_overlay: Optional[np.ndarray] = None
+    linepix_mask: Optional[np.ndarray] = None
+    linepix_mask_pre: Optional[np.ndarray] = None
+    floor_gate_mask: Optional[np.ndarray] = None
+    linepix_overlay: Optional[np.ndarray] = None
+    ransac_lines_img: Optional[np.ndarray] = None
+    lsd_lines_a: Optional[np.ndarray] = None
+    lsd_lines_b: Optional[np.ndarray] = None
+    dt_debug: Optional[np.ndarray] = None
+    ori_mask_a: Optional[np.ndarray] = None
+    ori_mask_b: Optional[np.ndarray] = None
+    hough_lines_img: Optional[np.ndarray] = None
+
+
+@dataclass
+class LineSeg:
+    p1: np.ndarray
+    p2: np.ndarray
+    theta: float
+    length: float
+    support: float
+    weight: float
+    line: Tuple[float, float, float]
+
+
+@dataclass
+class RansacLineSeg:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    a: float
+    b: float
+    c: float
+    support: int
+    length: float
 
 
 def _order_corners_lb_rb_rt_lt(pts_xy: np.ndarray) -> np.ndarray:
     pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
     idx = np.argsort(pts[:, 1])
+    ys = pts[idx, 1]
+    y_span = float(np.max(ys) - np.min(ys))
+    mid_gap = float(abs(ys[1] - ys[2]))
+    if y_span < 1e-3 or mid_gap < max(5.0, 0.10 * y_span):
+        tltrbrbl = _order_corners_tl_tr_br_bl(pts)
+        tl, tr, br, bl = tltrbrbl
+        return np.stack([bl, br, tr, tl], axis=0)
     top = pts[idx[:2]]
     bottom = pts[idx[2:]]
     bottom = bottom[np.argsort(bottom[:, 0])]
@@ -52,9 +227,224 @@ def _order_corners_lb_rb_rt_lt(pts_xy: np.ndarray) -> np.ndarray:
     return np.stack([lb, rb, rt, lt], axis=0)
 
 
+def _quad_span_ok(
+    pts_xy: np.ndarray,
+    img_w: int,
+    img_h: int,
+    *,
+    min_w_ratio: float = 0.18,
+    min_h_ratio: float = 0.10,
+    min_edge_ratio: float = 0.06,
+) -> Tuple[bool, Dict[str, float]]:
+    pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
+    minx = float(np.min(pts[:, 0]))
+    maxx = float(np.max(pts[:, 0]))
+    miny = float(np.min(pts[:, 1]))
+    maxy = float(np.max(pts[:, 1]))
+    bbox_w = float(maxx - minx)
+    bbox_h = float(maxy - miny)
+    edges = [
+        float(np.linalg.norm(pts[i] - pts[(i + 1) % 4]))
+        for i in range(4)
+    ]
+    min_edge = float(min(edges)) if edges else 0.0
+    ok = True
+    if bbox_w < float(min_w_ratio) * float(img_w):
+        ok = False
+    if bbox_h < float(min_h_ratio) * float(img_h):
+        ok = False
+    if min_edge < float(min_edge_ratio) * float(img_w):
+        ok = False
+    return ok, {"quad_bbox_w": bbox_w, "quad_bbox_h": bbox_h, "quad_min_edge": min_edge}
+
+
 def _quad_area(pts_xy: np.ndarray) -> float:
     pts = np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
     return float(abs(cv2.contourArea(pts)))
+
+
+def _quad_edges(pts_xy: np.ndarray) -> np.ndarray:
+    pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
+    d = pts - np.roll(pts, -1, axis=0)
+    return np.sqrt(np.sum(d * d, axis=1))
+
+
+def _edge_vp_angle(p1: np.ndarray, p2: np.ndarray, vp: Optional[np.ndarray]) -> Optional[float]:
+    if vp is None or not isinstance(vp, np.ndarray):
+        return None
+    v_edge = p2 - p1
+    v_edge_norm = float(np.linalg.norm(v_edge))
+    if v_edge_norm < 1e-6:
+        return None
+    mid = 0.5 * (p1 + p2)
+    v_vp = vp.astype(np.float32) - mid
+    v_vp_norm = float(np.linalg.norm(v_vp))
+    if v_vp_norm < 1e-6:
+        return None
+    cosang = abs(float(np.dot(v_edge, v_vp)) / float(v_edge_norm * v_vp_norm))
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    return float(math.degrees(math.acos(cosang)))
+
+
+def _aspect_penalty(ordered_xy: np.ndarray) -> float:
+    pts = np.array(ordered_xy, dtype=np.float32).reshape(4, 2)
+    lb, rb, rt, lt = pts[0], pts[1], pts[2], pts[3]
+    w1 = float(np.linalg.norm(rb - lb))
+    w2 = float(np.linalg.norm(rt - lt))
+    h1 = float(np.linalg.norm(lt - lb))
+    h2 = float(np.linalg.norm(rt - rb))
+    width = max(1e-6, 0.5 * (w1 + w2))
+    height = max(1e-6, 0.5 * (h1 + h2))
+    ratio = height / width
+    target = 13.4 / 6.1
+    return float(math.log(max(ratio, 1e-6) / target) ** 2)
+
+
+def _vanishing_point_penalty(
+    ordered_xy: np.ndarray,
+    vp_long: Optional[np.ndarray],
+    vp_short: Optional[np.ndarray],
+) -> float:
+    pts = np.array(ordered_xy, dtype=np.float32).reshape(4, 2)
+    edges = [
+        (pts[0], pts[1]),
+        (pts[1], pts[2]),
+        (pts[2], pts[3]),
+        (pts[3], pts[0]),
+    ]
+    angles = []
+    for p1, p2 in edges:
+        a1 = _edge_vp_angle(p1, p2, vp_long)
+        a2 = _edge_vp_angle(p1, p2, vp_short)
+        cand = [a for a in [a1, a2] if a is not None]
+        if cand:
+            angles.append(min(cand))
+    if not angles:
+        return 0.0
+    return float(np.mean(angles) / 45.0)
+
+
+def _out_of_floor_penalty(sample_uv: Optional[np.ndarray], floor_bbox: Sequence[int]) -> float:
+    if sample_uv is None or len(sample_uv) == 0:
+        return 1.0
+    x0, y0, x1, y1 = [float(v) for v in floor_bbox]
+    xs = sample_uv[:, 0]
+    ys = sample_uv[:, 1]
+    inside = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+    return float(1.0 - float(np.mean(inside)))
+
+
+def _bottom_support_from_loss(
+    loss_info: Dict[str, Any],
+    ymax_ratio: float,
+    img_h: int,
+    tau_px: float,
+) -> float:
+    uv = loss_info.get("sample_uv")
+    dists = loss_info.get("sample_dists")
+    if (
+        isinstance(uv, np.ndarray)
+        and isinstance(dists, np.ndarray)
+        and uv.ndim == 2
+        and dists.ndim == 1
+        and uv.shape[0] == dists.shape[0]
+        and uv.shape[0] > 0
+    ):
+        inlier = dists < float(tau_px)
+        if np.any(inlier):
+            bottom = uv[inlier, 1] > (0.55 * float(img_h))
+            return float(np.mean(bottom))
+    return float(max(0.0, min(1.0, (float(ymax_ratio) - 0.55) / 0.45)))
+
+
+def _position_penalty(ordered_xy: np.ndarray, floor_bbox: Sequence[int], target_ratio: float = 0.75) -> float:
+    pts = np.array(ordered_xy, dtype=np.float32).reshape(4, 2)
+    x0, y0, x1, y1 = [float(v) for v in floor_bbox]
+    floor_h = max(1.0, y1 - y0)
+    bottom_y = float(np.max(pts[:, 1]))
+    bottom_norm = (bottom_y - y0) / floor_h
+    return float(max(0.0, float(target_ratio) - float(bottom_norm)))
+
+
+def _area_soft_penalty(area_ratio: float, min_ratio: float = 0.08) -> float:
+    if float(area_ratio) >= float(min_ratio):
+        return 0.0
+    safe_ratio = max(float(area_ratio), 1e-6)
+    scale = float(min_ratio) / safe_ratio
+    return float((scale - 1.0) ** 2)
+
+
+def _mixer_score_candidate(
+    ordered_xy: np.ndarray,
+    loss_info: Dict[str, Any],
+    floor_bbox: Sequence[int],
+    *,
+    vp_long: Optional[np.ndarray] = None,
+    vp_short: Optional[np.ndarray] = None,
+    weights: Optional[Dict[str, float]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    w = weights or MIXER_WEIGHTS
+    dt_mean = float(loss_info.get("sample_dist_mean") or 0.0)
+    dt_p90 = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 0.0)
+    dt_score = float(dt_mean + 0.5 * dt_p90)
+    cover_ratio = float(loss_info.get("cover_ratio", loss_info.get("inlier_ratio", 0.0)))
+    aspect_pen = _aspect_penalty(ordered_xy)
+    vp_pen = _vanishing_point_penalty(ordered_xy, vp_long, vp_short)
+    out_floor = _out_of_floor_penalty(loss_info.get("sample_uv"), floor_bbox)
+    cover_pen = float(1.0 - cover_ratio)
+    pos_pen = _position_penalty(ordered_xy, floor_bbox)
+    area_pen = _area_soft_penalty(float(loss_info.get("area_ratio", 0.0)))
+
+    mixer = (
+        float(w.get("dt", 1.0)) * dt_score
+        + float(w.get("aspect", 0.0)) * aspect_pen
+        + float(w.get("vp", 0.0)) * vp_pen
+        + float(w.get("floor", 0.0)) * out_floor
+        + float(w.get("cover", 0.0)) * cover_pen
+        + float(w.get("pos", 0.0)) * pos_pen
+        + float(w.get("area", 0.0)) * area_pen
+    )
+    parts = {
+        "mixer_dt": dt_score,
+        "mixer_aspect": aspect_pen,
+        "mixer_vp": vp_pen,
+        "mixer_floor": out_floor,
+        "mixer_cover": cover_pen,
+        "mixer_pos": pos_pen,
+        "mixer_area": area_pen,
+        "mixer_score": float(mixer),
+    }
+    return float(mixer), parts
+
+
+def _passes_geom_gates(
+    quad_xy: np.ndarray,
+    floor_bbox: Sequence[int],
+    *,
+    min_edge_px: float = 2.0,
+) -> Tuple[bool, str, Dict[str, float]]:
+    pts = np.array(quad_xy, dtype=np.float32).reshape(4, 2)
+    minx, miny = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
+    maxx, maxy = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
+    bbox_w = maxx - minx
+    bbox_h = maxy - miny
+
+    area = _quad_area(pts)
+    edges = _quad_edges(pts)
+    min_edge = float(np.min(edges)) if edges.size else 0.0
+
+    metrics = {
+        "cand_bbox_w": float(bbox_w),
+        "cand_bbox_h": float(bbox_h),
+        "cand_min_edge": float(min_edge),
+    }
+    if not np.isfinite(area) or area < 1.0:
+        return False, "area_degenerate", metrics
+    if not np.isfinite(bbox_w) or not np.isfinite(bbox_h):
+        return False, "bbox_invalid", metrics
+    if min_edge < float(min_edge_px):
+        return False, "min_edge_too_small", metrics
+    return True, "OK", metrics
 
 
 def _is_convex_quad(pts_xy: np.ndarray) -> bool:
@@ -67,28 +457,1376 @@ def build_distance_transform(white_mask: np.ndarray) -> np.ndarray:
     return cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
 
 
+def build_white_mask_raw(
+    frame_bgr: np.ndarray,
+    white_s_max: int = 140,
+    white_v_min: int = 155,
+    l_min: int = 170,
+    chroma_max: int = 55,
+    roi_mask_u8: Optional[np.ndarray] = None,
+    soft_s_max: int = 120,
+    soft_chroma_max: int = 45,
+    soft_v_margin: int = 12,
+    soft_l_margin: int = 6,
+) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    hsv_mask = cv2.inRange(hsv, (0, 0, white_v_min), (180, white_s_max, 255))
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    chroma = np.abs(a.astype(np.int16) - 128) + np.abs(b.astype(np.int16) - 128)
+    lab_mask = (l >= int(l_min)) & (chroma <= int(chroma_max))
+    strict = cv2.bitwise_and(hsv_mask, lab_mask.astype(np.uint8) * 255)
+    if roi_mask_u8 is None or int(np.count_nonzero(roi_mask_u8)) == 0:
+        return strict
+    roi = roi_mask_u8 > 0
+    if not np.any(roi):
+        return strict
+    v_p90 = float(np.percentile(v[roi], 90))
+    l_p90 = float(np.percentile(l[roi], 90))
+    v_soft = int(np.clip(v_p90 - int(soft_v_margin), 145, white_v_min))
+    l_soft = int(np.clip(l_p90 - int(soft_l_margin), 170, 200))
+    soft_hsv = (s <= int(soft_s_max)) & (v >= v_soft)
+    soft_lab = (l >= l_soft) & (chroma <= int(soft_chroma_max))
+    soft = (soft_hsv & soft_lab & roi).astype(np.uint8) * 255
+    return cv2.bitwise_or(strict, soft)
+
+
+def filter_blobs_keep_lines(
+    mask_u8: np.ndarray,
+    min_blob_area_ratio: float = 0.002,
+    max_aspect_for_blob: float = 2.0,
+    min_fill_ratio: float = 0.6,
+    line_kernel_len: int = 31,
+    line_kernel_thickness: int = 1,
+    line_thickness_max: float = 4.0,
+    close_kernel_lens: Tuple[int, ...] = (9, 13),
+    open_kernel_lens: Tuple[int, ...] = (15, 21, 31),
+    close_thickness: int = 2,
+    speckle_area: int = 12,
+    blocky_extent: float = 0.55,
+    blocky_aspect_max: float = 2.3,
+    blocky_area: int = 80,
+    return_stats: bool = False,
+) -> np.ndarray:
+    """Remove blocky blobs while preserving line-like structures."""
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(mask_u8, 127, 255, cv2.THRESH_BINARY)
+    lens = (max(15, int(line_kernel_len // 2)), int(line_kernel_len))
+    line_like = _line_like_mask(bw, lengths=lens, thickness=int(line_kernel_thickness)) > 0
+    dt = cv2.distanceTransform((bw > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dt_dil = cv2.dilate(dt, np.ones((3, 3), np.uint8))
+    ridge = (dt >= 1.0) & (dt >= (dt_dil - 0.01))
+    line_like = line_like & ridge & (dt <= float(line_thickness_max))
+    h, w = bw.shape[:2]
+    min_blob_area = float(min_blob_area_ratio) * float(h * w)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    removed = np.zeros_like(bw)
+    removed_stats: list[Dict[str, float]] = []
+    for idx in range(1, num):
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        bw_cc = float(stats[idx, cv2.CC_STAT_WIDTH])
+        bh_cc = float(stats[idx, cv2.CC_STAT_HEIGHT])
+        if bw_cc <= 0.0 or bh_cc <= 0.0 or area <= 0.0:
+            continue
+        aspect = max(bw_cc, bh_cc) / max(min(bw_cc, bh_cc), 1.0)
+        fill = area / max(bw_cc * bh_cc, 1.0)
+        is_blob = (area >= min_blob_area) and (fill >= float(min_fill_ratio)) and (
+            aspect <= float(max_aspect_for_blob)
+        )
+        cc_mask = labels == idx
+        cc_line_like = bool(np.any(line_like & cc_mask))
+        if area < int(speckle_area):
+            if not cc_line_like:
+                removed[cc_mask] = 255
+                removed_stats.append(
+                    {
+                        "area": float(area),
+                        "aspect": float(aspect),
+                        "fill": float(fill),
+                        "bbox_w": float(bw_cc),
+                        "bbox_h": float(bh_cc),
+                        "kind": "speckle",
+                    }
+                )
+            continue
+        if is_blob:
+            cc_line_pixels = int(np.count_nonzero(line_like & cc_mask))
+            if cc_line_pixels < int(0.02 * area):
+                removed[cc_mask] = 255
+                removed_stats.append(
+                    {
+                        "area": float(area),
+                        "aspect": float(aspect),
+                        "fill": float(fill),
+                        "bbox_w": float(bw_cc),
+                        "bbox_h": float(bh_cc),
+                        "kind": "blob_drop_full",
+                    }
+                )
+            else:
+                # Remove only the non-line-like portion if blob is connected to lines.
+                removed_part = cc_mask & (~line_like)
+                if np.any(removed_part):
+                    removed[removed_part] = 255
+                    removed_stats.append(
+                        {
+                            "area": float(area),
+                            "aspect": float(aspect),
+                            "fill": float(fill),
+                            "bbox_w": float(bw_cc),
+                            "bbox_h": float(bh_cc),
+                            "kind": "blob_drop_core",
+                        }
+                    )
+    removed_stats.sort(key=lambda item: item["area"], reverse=True)
+    keep = cv2.bitwise_and(bw, cv2.bitwise_not(removed))
+    if return_stats:
+        return keep, {
+            "removed_count": int(np.count_nonzero(removed > 0)),
+            "removed_topk": removed_stats[:5],
+        }
+    return keep
+
+
+def detect_thin_white_line_pixels(
+    frame_bgr: np.ndarray,
+    roi_mask_u8: np.ndarray,
+    *,
+    y_thr: int = 200,
+    dark_thr: int = 25,
+    tau: int = 6,
+    floor_bbox: Optional[Tuple[int, int, int, int]] = None,
+    floor_y_cut: Optional[int] = None,
+    enable_green_support: bool = False,
+    enable_green_floor_gate: bool = False,
+) -> np.ndarray:
+    y_channel = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)[:, :, 0]
+    h, w = y_channel.shape[:2]
+    roi = np.zeros((h, w), dtype=bool)
+    if floor_bbox is not None:
+        x0, y0, x1, y1 = floor_bbox
+        y0 = int(np.clip(y0, 0, h - 1))
+        y1 = int(np.clip(y1, y0 + 1, h))
+        x0 = int(np.clip(x0, 0, w - 1))
+        x1 = int(np.clip(x1, x0 + 1, w))
+        roi[y0:y1, x0:x1] = True
+    elif roi_mask_u8 is not None:
+        roi = roi_mask_u8 > 0
+    else:
+        roi[:, :] = True
+    if floor_y_cut is not None:
+        roi[: int(floor_y_cut), :] = False
+    if np.any(roi):
+        sigma_l = float(np.percentile(y_channel[roi], 75))
+    else:
+        sigma_l = float(y_thr)
+    sigma_l = float(np.clip(sigma_l, 160.0, 235.0))
+    bright = (y_channel >= sigma_l) & roi
+    y = y_channel.astype(np.int16)
+    b, g, r = cv2.split(frame_bgr)
+    green_score = g.astype(np.int16) - np.maximum(r, b).astype(np.int16)
+    g_delta = 20
+    green = (green_score > g_delta) & roi
+    green_left = np.zeros((h, w), dtype=bool)
+    green_right = np.zeros((h, w), dtype=bool)
+    green_up = np.zeros((h, w), dtype=bool)
+    green_down = np.zeros((h, w), dtype=bool)
+    for d in range(1, int(tau) + 1):
+        green_left[:, d:] |= green[:, :-d]
+        green_right[:, :-d] |= green[:, d:]
+        green_up[d:, :] |= green[:-d, :]
+        green_down[:-d, :] |= green[d:, :]
+    green_support = green_left | green_right | green_up | green_down
+    min_left = np.full((h, w), 255, dtype=np.int16)
+    min_right = np.full((h, w), 255, dtype=np.int16)
+    min_up = np.full((h, w), 255, dtype=np.int16)
+    min_down = np.full((h, w), 255, dtype=np.int16)
+    for d in range(1, int(tau) + 1):
+        min_left[:, d:] = np.minimum(min_left[:, d:], y[:, :-d])
+        min_right[:, :-d] = np.minimum(min_right[:, :-d], y[:, d:])
+        min_up[d:, :] = np.minimum(min_up[d:, :], y[:-d, :])
+        min_down[:-d, :] = np.minimum(min_down[:-d, :], y[d:, :])
+    delta = int(dark_thr)
+    y_minus = y - delta
+    cond_any = (min_left <= y_minus) | (min_right <= y_minus) | (min_up <= y_minus) | (min_down <= y_minus)
+    line = bright & cond_any
+    if enable_green_support:
+        line &= green_support
+    if enable_green_floor_gate:
+        green_mask = (green_score > g_delta).astype(np.uint8) * 255
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        d = int(tau) + 3
+        k = np.ones((2 * d + 1, 2 * d + 1), np.uint8)
+        green_dil = cv2.dilate(green_mask, k, iterations=1)
+        if roi_mask_u8 is not None:
+            green_dil = cv2.bitwise_and(green_dil, roi_mask_u8)
+        if int(np.count_nonzero(green_dil)) > 0:
+            line &= green_dil > 0
+    pad = int(tau) + 2
+    if pad > 0:
+        line[:pad, :] = False
+        line[-pad:, :] = False
+        line[:, :pad] = False
+        line[:, -pad:] = False
+    line_u8 = (line.astype(np.uint8) * 255).astype(np.uint8)
+    line_u8 = cv2.morphologyEx(line_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return line_u8
+
+
+def _person_mask_from_boxes(
+    shape: Tuple[int, int],
+    boxes: Sequence[Sequence[float]],
+    pad: int = 10,
+) -> Optional[np.ndarray]:
+    if not boxes:
+        return None
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for box in boxes:
+        if box is None or len(box) < 4:
+            continue
+        x1, y1, x2, y2 = box[:4]
+        x1 = int(round(float(x1))) - pad
+        y1 = int(round(float(y1))) - pad
+        x2 = int(round(float(x2))) + pad
+        y2 = int(round(float(y2))) + pad
+        x1 = max(0, min(w - 1, x1))
+        x2 = max(0, min(w - 1, x2))
+        y1 = max(0, min(h - 1, y1))
+        y2 = max(0, min(h - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        mask[y1 : y2 + 1, x1 : x2 + 1] = 255
+    if int(np.count_nonzero(mask)) == 0:
+        return None
+    return mask
+
+
+def _foot_points_from_boxes(
+    boxes: Optional[Sequence[Sequence[float]]],
+    img_h: Optional[int] = None,
+    offset: float = 2.0,
+) -> list[Tuple[float, float]]:
+    """Return foot points (center of bottom edge) for person boxes."""
+    pts: list[Tuple[float, float]] = []
+    if boxes is None:
+        return pts
+    for box in boxes:
+        if box is None or len(box) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        except Exception:
+            continue
+        cx = 0.5 * (x1 + x2)
+        fy = float(y2 + float(offset))
+        if img_h is not None:
+            fy = float(np.clip(fy, 0.0, float(max(img_h - 1, 0))))
+        pts.append((cx, fy))
+    return pts
+
+
+def _count_points_inside_quad(
+    quad_xy: np.ndarray,
+    points_xy: Sequence[Tuple[float, float]],
+) -> Tuple[int, list[bool]]:
+    if quad_xy is None or len(points_xy) == 0:
+        return 0, []
+    quad = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+    pts = []
+    for pt in points_xy:
+        if pt is None or len(pt) < 2:
+            continue
+        try:
+            px, py = float(pt[0]), float(pt[1])
+        except Exception:
+            continue
+        pts.append((px, py))
+    if not pts:
+        return 0, []
+    contour = quad.reshape(-1, 1, 2)
+    inside_flags: list[bool] = []
+    for px, py in pts:
+        res = cv2.pointPolygonTest(contour, (float(px), float(py)), measureDist=False)
+        inside_flags.append(bool(res >= 0))
+    count = sum(inside_flags)
+    return int(count), inside_flags
+
+
+def _filter_lines_for_completion(
+    lines: list[Tuple[float, float, float, float]],
+    line_ids: list[Optional[int]],
+    quad_xy: np.ndarray,
+    *,
+    margin_px: float = 8.0,
+) -> Tuple[list[Tuple[float, float, float, float]], list[Optional[int]]]:
+    if quad_xy is None or quad_xy.size == 0 or not lines:
+        return lines, line_ids
+    quad = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+    xs = quad[:, 0]
+    ys = quad[:, 1]
+    x0 = float(np.min(xs)) - float(margin_px)
+    x1 = float(np.max(xs)) + float(margin_px)
+    y0 = float(np.min(ys)) - float(margin_px)
+    y1 = float(np.max(ys)) + float(margin_px)
+    bbox = (x0, y0, x1, y1)
+    filtered_lines: list[Tuple[float, float, float, float]] = []
+    filtered_ids: list[Optional[int]] = []
+    for seg, lid in zip(lines, line_ids):
+        x1s, y1s, x2s, y2s = seg
+        mx = 0.5 * (float(x1s) + float(x2s))
+        my = 0.5 * (float(y1s) + float(y2s))
+        if mx < bbox[0] or mx > bbox[2] or my < bbox[1] or my > bbox[3]:
+            continue
+        filtered_lines.append(seg)
+        filtered_ids.append(lid)
+    if not filtered_lines:
+        return lines, line_ids
+    return filtered_lines, filtered_ids
+
+
+def _fit_line_tls(points: np.ndarray) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=np.float64)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] < 2:
+        v = np.array([1.0, 0.0], dtype=np.float64)
+        mean = np.array([0.0, 0.0], dtype=np.float64)
+        return 0.0, 1.0, 0.0, v, mean
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+    cov = centered.T @ centered
+    if not np.isfinite(cov).all():
+        v = np.array([1.0, 0.0], dtype=np.float64)
+        return 0.0, 1.0, 0.0, v, mean
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    v = eigvecs[:, int(np.argmax(eigvals))]
+    norm_v = float(np.linalg.norm(v))
+    if not math.isfinite(norm_v) or norm_v < 1e-6:
+        v = np.array([1.0, 0.0], dtype=np.float64)
+        return 0.0, 1.0, 0.0, v, mean
+    v = v / norm_v
+    a = -float(v[1])
+    b = float(v[0])
+    c = -(a * float(mean[0]) + b * float(mean[1]))
+    norm = math.hypot(a, b)
+    if norm > 1e-6 and math.isfinite(norm):
+        a /= norm
+        b /= norm
+        c /= norm
+    return a, b, c, v, mean
+
+
+def ransac_line_segments_from_mask(
+    line_mask_u8: np.ndarray,
+    floor_mask_u8: np.ndarray,
+    *,
+    max_lines: int = 30,
+    iters: int = 800,
+    inlier_thr: float = 2.0,
+    min_inliers: int = 250,
+    min_length_ratio: float = 0.08,
+    seed: int = 0,
+) -> Tuple[list[RansacLineSeg], Dict[str, int]]:
+    ys, xs = np.where((line_mask_u8 > 0) & (floor_mask_u8 > 0))
+    if xs.size == 0:
+        return [], {"tls_num_input_pts": 0, "tls_num_finite_pts": 0, "tls_skipped_degenerate": 0}
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    rng = np.random.default_rng(int(seed))
+    max_points = 20000
+    if pts.shape[0] > max_points:
+        idx = rng.choice(pts.shape[0], size=max_points, replace=False)
+        pts = pts[idx]
+    h, w = line_mask_u8.shape[:2]
+    min_len = float(min(h, w)) * float(min_length_ratio)
+    active = np.ones((pts.shape[0],), dtype=bool)
+    segments: list[RansacLineSeg] = []
+    tls_num_input_pts = 0
+    tls_num_finite_pts = 0
+    tls_skipped_degenerate = 0
+    for _ in range(int(max_lines)):
+        active_idx = np.where(active)[0]
+        if active_idx.size < int(min_inliers):
+            break
+        pts_active = pts[active_idx]
+        best_inliers = None
+        best_count = 0
+        best_line = None
+        for _ in range(int(iters)):
+            if pts_active.shape[0] < 2:
+                break
+            idx = rng.choice(pts_active.shape[0], size=2, replace=False)
+            p1 = pts_active[idx[0]]
+            p2 = pts_active[idx[1]]
+            if float(np.linalg.norm(p1 - p2)) < 1.0:
+                continue
+            a = float(p1[1] - p2[1])
+            b = float(p2[0] - p1[0])
+            c = float(p1[0] * p2[1] - p2[0] * p1[1])
+            norm = math.hypot(a, b)
+            if norm < 1e-6:
+                continue
+            a /= norm
+            b /= norm
+            c /= norm
+            dist = np.abs(a * pts_active[:, 0] + b * pts_active[:, 1] + c)
+            inliers = dist < float(inlier_thr)
+            count = int(np.count_nonzero(inliers))
+            if count > best_count:
+                best_count = count
+                best_inliers = inliers
+                best_line = (a, b, c)
+        if best_inliers is None or best_count < int(min_inliers):
+            break
+        inlier_pts = pts_active[best_inliers]
+        tls_num_input_pts += int(inlier_pts.shape[0])
+        a, b, c, v, mean = _fit_line_tls(inlier_pts)
+        pts64 = np.asarray(inlier_pts, dtype=np.float64)
+        pts64 = pts64[np.isfinite(pts64).all(axis=1)]
+        tls_num_finite_pts += int(pts64.shape[0])
+        if pts64.shape[0] < 2 or not np.isfinite(mean).all() or not np.isfinite(v).all():
+            tls_skipped_degenerate += 1
+            continue
+        centered = pts64 - mean
+        if not np.isfinite(centered).all():
+            tls_skipped_degenerate += 1
+            continue
+        max_abs = float(np.max(np.abs(centered))) if centered.size > 0 else 0.0
+        if not math.isfinite(max_abs) or max_abs > 1e6:
+            tls_skipped_degenerate += 1
+            continue
+        with np.errstate(all="ignore"):
+            proj = centered @ v
+        t_min = float(np.min(proj))
+        t_max = float(np.max(proj))
+        p1 = mean + t_min * v
+        p2 = mean + t_max * v
+        x1 = float(np.clip(p1[0], 0.0, float(w - 1)))
+        y1 = float(np.clip(p1[1], 0.0, float(h - 1)))
+        x2 = float(np.clip(p2[0], 0.0, float(w - 1)))
+        y2 = float(np.clip(p2[1], 0.0, float(h - 1)))
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        support = int(best_count)
+        active[active_idx[best_inliers]] = False
+        if length < float(min_len):
+            continue
+        segments.append(
+            RansacLineSeg(
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                a=a,
+                b=b,
+                c=c,
+                support=support,
+                length=length,
+            )
+        )
+    return segments, {
+        "tls_num_input_pts": int(tls_num_input_pts),
+        "tls_num_finite_pts": int(tls_num_finite_pts),
+        "tls_skipped_degenerate": int(tls_skipped_degenerate),
+    }
+
+
 def build_white_mask(
     frame_bgr: np.ndarray,
     white_s_max: int = 80,
     white_v_min: int = 180,
-    close_kernel: int = 5,
+    close_kernel: int = 2,
     open_kernel: int = 3,
     close_iter: int = 1,
     open_iter: int = 1,
-) -> np.ndarray:
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    hsv_mask = cv2.inRange(hsv, (0, 0, white_v_min), (180, white_s_max, 255))
-    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    lab_mask = (l > 200) & ((np.abs(a.astype(np.int16) - 128) + np.abs(b.astype(np.int16) - 128)) < 25)
-    white = cv2.bitwise_and(hsv_mask, lab_mask.astype(np.uint8) * 255)
+    floor_y_min_ratio: float = 0.45,
+    floor_x_max_ratio: float = 0.92,
+    max_blob_area_ratio: float = 0.002,
+    min_aspect_ratio: float = 6.0,
+    max_line_width_px: int = 20,
+    max_fill_ratio: float = 0.6,
+    green_delta_min: int = 12,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int], int, int]:
+    white_raw = build_white_mask_raw(frame_bgr, white_s_max=white_s_max, white_v_min=white_v_min)
+    h, w = white_raw.shape[:2]
+    y1 = int(round(float(h) * float(floor_y_min_ratio)))
+    x2 = int(round(float(w) * float(floor_x_max_ratio)))
+    y1 = int(np.clip(y1, 0, h - 1))
+    x2 = int(np.clip(x2, 1, w))
+    roi_mask = np.zeros_like(white_raw)
+    roi_mask[y1:h, 0:x2] = 255
+    white = cv2.bitwise_and(white_raw, roi_mask)
+    bgr_blur = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
+    b, g, r = cv2.split(bgr_blur)
+    green_score = g.astype(np.int16) - np.maximum(r, b).astype(np.int16)
+    green_mask = (green_score > int(green_delta_min)).astype(np.uint8) * 255
+    green_mask = cv2.bitwise_and(green_mask, roi_mask)
+    white = cv2.bitwise_and(white, green_mask)
+    if int(np.count_nonzero(white)) == 0:
+        white = cv2.bitwise_and(white_raw, roi_mask)
     kernel_open = np.ones((open_kernel, open_kernel), np.uint8)
-    kernel_close = np.ones((close_kernel, close_kernel), np.uint8)
     if open_iter > 0:
         white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel_open, iterations=open_iter)
+    kernel_dilate = np.ones((close_kernel, close_kernel), np.uint8)
     if close_iter > 0:
-        white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel_close, iterations=close_iter)
-    return white
+        white = cv2.dilate(white, kernel_dilate, iterations=close_iter)
+    roi_area = float(max(1, (h - y1) * x2))
+    max_area = float(max_blob_area_ratio) * roi_area
+    max_cc_area_raw = 0
+    max_cc_area_clean = 0
+    if max_area > 0:
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+        keep = np.zeros_like(white)
+        for idx in range(1, num):
+            area = float(stats[idx, cv2.CC_STAT_AREA])
+            max_cc_area_raw = max(max_cc_area_raw, int(area))
+            if area <= 0:
+                continue
+            bw = float(stats[idx, cv2.CC_STAT_WIDTH])
+            bh = float(stats[idx, cv2.CC_STAT_HEIGHT])
+            aspect = float(max(bw, bh)) / float(max(min(bw, bh), 1.0))
+            min_side = float(min(bw, bh))
+            fill = float(area) / float(max(bw * bh, 1.0))
+            is_line_like = aspect >= float(min_aspect_ratio) and min_side <= float(max_line_width_px)
+            keep_blob = area <= float(max_area) and fill <= float(max_fill_ratio)
+            if is_line_like or keep_blob:
+                keep[labels == idx] = 255
+                max_cc_area_clean = max(max_cc_area_clean, int(area))
+        white = keep
+    floor_bbox = (0, y1, x2 - 1, h - 1)
+    return white_raw, white, floor_bbox, int(max_cc_area_raw), int(max_cc_area_clean)
+
+
+def _render_exg_row_plot(exg_row: np.ndarray, y_cut: Optional[int]) -> Optional[np.ndarray]:
+    if exg_row is None or exg_row.size == 0:
+        return None
+    h = int(exg_row.size)
+    w = 120
+    vmin = float(np.percentile(exg_row, 5))
+    vmax = float(np.percentile(exg_row, 95))
+    denom = max(vmax - vmin, 1e-6)
+    norm = np.clip((exg_row - vmin) / denom, 0.0, 1.0)
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    for y in range(h):
+        val = int(round(norm[y] * 255.0))
+        img[y, :] = (val, val, val)
+    if y_cut is not None:
+        y_cut_i = int(np.clip(y_cut, 0, h - 1))
+        cv2.line(img, (0, y_cut_i), (w - 1, y_cut_i), (0, 0, 255), 2)
+    return img
+
+
+def _floor_mask_from_seed_lab(
+    frame_bgr: np.ndarray,
+    *,
+    seed_ratio: float = 0.40,
+    patch: int = 9,
+    delta_lab: float = 18.0,
+    min_area_ratio: float = 0.06,
+    seed_x_ratios: Sequence[float] = (0.2, 0.4, 0.5, 0.6, 0.8),
+    dilate_ksize: int = 19,
+    bbox_pad_ratio: float = 0.02,
+) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]], Dict[str, Any]]:
+    h, w = frame_bgr.shape[:2]
+    roi_y0 = int(round(float(h) * float(seed_ratio)))
+    roi_y0 = max(0, min(h - 1, roi_y0))
+    bgr_roi = frame_bgr[roi_y0:h, :]
+    if bgr_roi.size == 0:
+        return None, None, {"lab_seed_ok": False}
+    lab = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2LAB).astype(np.int16)
+    rh, rw = lab.shape[:2]
+    sy_full = int(np.clip(int(round(0.95 * float(h))), 0, h - 1))
+    sy = int(np.clip(sy_full - roi_y0, 0, rh - 1))
+    r = max(1, int(patch) // 2)
+    sx_vals: list[int] = []
+    for rx in seed_x_ratios:
+        try:
+            sx_vals.append(int(np.clip(int(round(float(rx) * float(w))), 0, rw - 1)))
+        except Exception:
+            continue
+    if not sx_vals:
+        sx_vals = [int(np.clip(w // 2, 0, rw - 1))]
+    seeds = []
+    for sx in sx_vals:
+        x0 = max(0, sx - r)
+        x1 = min(rw, sx + r + 1)
+        y0 = max(0, sy - r)
+        y1 = min(rh, sy + r + 1)
+        seeds.append(lab[y0:y1, x0:x1].mean(axis=(0, 1)))
+    seed = np.mean(np.stack(seeds, axis=0), axis=0)
+    d = lab - seed[None, None, :]
+    dist = np.sqrt((d * d).sum(axis=2)).astype(np.float32)
+    mask = dist < float(delta_lab)
+    mask &= (lab[..., 0] < 245)
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, k, iterations=1)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, k, iterations=1)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    label_set = set()
+    for sx in sx_vals:
+        if 0 <= sy < rh and 0 <= sx < rw:
+            lbl = int(labels[sy, sx])
+            if lbl != 0:
+                label_set.add(lbl)
+    if not label_set:
+        return None, None, {"lab_seed_ok": False}
+    cc = np.zeros((rh, rw), dtype=np.uint8)
+    for lbl in label_set:
+        cc[labels == lbl] = 1
+    area = int(cc.sum())
+    if area < int(min_area_ratio * float(rw * rh)):
+        return None, None, {"lab_seed_ok": False, "lab_seed_area": area}
+    mask_full = np.zeros((h, w), dtype=np.uint8)
+    mask_full[roi_y0:h, :] = cc.astype(np.uint8) * 255
+    if int(dilate_ksize) > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(dilate_ksize), int(dilate_ksize)))
+        mask_full = cv2.dilate(mask_full, k, iterations=1)
+    ys, xs = np.where(mask_full > 0)
+    if xs.size == 0:
+        return None, None, {"lab_seed_ok": False}
+    pad = int(round(float(bbox_pad_ratio) * float(w)))
+    x_min = max(0, int(xs.min()) - pad)
+    x_max = min(w - 1, int(xs.max()) + pad)
+    y_min = max(0, int(ys.min()) - pad)
+    y_max = min(h - 1, int(ys.max()) + pad)
+    bbox = (x_min, y_min, x_max, y_max)
+    return mask_full, bbox, {
+        "lab_seed_ok": True,
+        "lab_seed_bbox": [int(x_min), int(y_min), int(x_max), int(y_max)],
+        "lab_seed_y0": int(roi_y0),
+    }
+
+
+def _load_manual_vp_corners(path: str) -> Optional[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _line_point_dist(line: Tuple[float, float, float], pt: Tuple[float, float]) -> float:
+    a, b, c = line
+    x, y = pt
+    return float(abs(a * x + b * y + c))
+
+
+def _format_predicted_corners(
+    corners_uv: np.ndarray,
+    width: int,
+    height: int,
+) -> list[Dict[str, Any]]:
+    labels = ["LB", "RB", "RT", "LT"]
+    out: list[Dict[str, Any]] = []
+    for idx, lab in enumerate(labels):
+        x = float(corners_uv[idx, 0])
+        y = float(corners_uv[idx, 1])
+        visible = 0.0 <= x < float(width) and 0.0 <= y < float(height)
+        out.append({"label": lab, "x": x, "y": y, "visible": bool(visible)})
+    return out
+
+
+def _corner_errors_to_manual(
+    corners_uv: np.ndarray,
+    manual_pts: Dict[str, Any],
+) -> Dict[str, Optional[float]]:
+    if corners_uv is None or manual_pts is None:
+        return {"err_LT": None, "err_RT": None, "err_RB": None}
+    mapping = {"LT": 3, "RT": 2, "RB": 1}
+    out: Dict[str, Optional[float]] = {"err_LT": None, "err_RT": None, "err_RB": None}
+    for key, idx in mapping.items():
+        pt = manual_pts.get(key)
+        if not isinstance(pt, dict):
+            continue
+        try:
+            x = float(pt.get("x"))
+            y = float(pt.get("y"))
+        except Exception:
+            continue
+        dx = float(corners_uv[idx, 0]) - x
+        dy = float(corners_uv[idx, 1]) - y
+        out[f"err_{key}"] = float(math.hypot(dx, dy))
+    return out
+
+def _tighten_floor_roi_xrange(
+    green_mask: np.ndarray,
+    floor_mask: np.ndarray,
+    *,
+    strip_ratio: float = 0.06,
+    min_density: float = 0.20,
+    min_width_ratio: float = 0.20,
+    margin_ratio: float = 0.02,
+    support_mask: Optional[np.ndarray] = None,
+    min_keep_ratio: float = 0.60,
+    min_abs_width_ratio: float = 0.60,
+    court_corners: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    h, w = floor_mask.shape[:2]
+    green_work = green_mask
+    floor_roi_source = "floor_mask"
+    court_bbox = None
+    court_bbox_pad = None
+    if court_corners is not None:
+        try:
+            cc = np.asarray(court_corners, dtype=np.float32).reshape(-1, 2)
+        except Exception:
+            cc = None
+        if cc is not None and cc.shape == (4, 2) and np.isfinite(cc).all():
+            in_bounds = (
+                (cc[:, 0] >= 0.0)
+                & (cc[:, 0] <= float(w - 1))
+                & (cc[:, 1] >= 0.0)
+                & (cc[:, 1] <= float(h - 1))
+            )
+            if bool(np.all(in_bounds)):
+                lb, rb, rt, lt = cc
+                court_w = float(np.linalg.norm(rb - lb))
+                court_h = float(np.linalg.norm(lt - lb))
+                mx = 0.25 * court_w
+                my = 0.20 * court_h
+                minx = float(np.min(cc[:, 0]) - mx)
+                maxx = float(np.max(cc[:, 0]) + mx)
+                miny = float(np.min(cc[:, 1]) - my)
+                maxy = float(np.max(cc[:, 1]) + my)
+                x0c = max(0, int(round(minx)))
+                x1c = min(w - 1, int(round(maxx)))
+                y0c = max(0, int(round(miny)))
+                y1c = min(h - 1, int(round(maxy)))
+                court_bbox = (x0c, y0c, x1c, y1c)
+                court_bbox_pad = (float(mx), float(my))
+                floor_roi_source = "corners_bbox"
+                floor_mask = floor_mask.copy()
+                floor_mask[:y0c, :] = 0
+                floor_mask[y1c + 1 :, :] = 0
+                floor_mask[:, :x0c] = 0
+                floor_mask[:, x1c + 1 :] = 0
+                if green_mask is not None:
+                    green_work = green_mask.copy()
+                    green_work[:y0c, :] = 0
+                    green_work[y1c + 1 :, :] = 0
+                    green_work[:, :x0c] = 0
+                    green_work[:, x1c + 1 :] = 0
+    ys, xs = np.where(floor_mask > 0)
+    if xs.size == 0:
+        return floor_mask, {
+            "floor_x_tightened": False,
+            "floor_roi_source": floor_roi_source,
+            "court_bbox": list(court_bbox) if court_bbox is not None else None,
+            "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+        }
+    orig_x0 = int(xs.min())
+    orig_x1 = int(xs.max())
+    orig_w = max(1, int(orig_x1 - orig_x0 + 1))
+    y_top = int(ys.min())
+    y_bot = int(ys.max())
+    strip_h1 = max(3, int(round((y_bot - y_top + 1) * float(strip_ratio))))
+    strip_h2 = max(3, int(round((y_bot - y_top + 1) * 0.08)))
+    y_strip1 = max(y_top, y_bot - strip_h1 + 1)
+    y_strip0 = max(y_top, y_bot - strip_h1 - strip_h2 + 1)
+    strip1 = green_work[y_strip1 : y_bot + 1, :]
+    strip2 = green_work[y_strip0:y_strip1, :]
+    if strip1.size == 0:
+        return floor_mask, {
+            "floor_x_tightened": False,
+            "floor_strip_y0": int(y_strip0),
+            "floor_strip_y1": int(y_strip1),
+            "floor_roi_source": floor_roi_source,
+            "court_bbox": list(court_bbox) if court_bbox is not None else None,
+            "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+        }
+    density1 = (strip1 > 0).mean(axis=0)
+    if strip2.size > 0:
+        density2 = (strip2 > 0).mean(axis=0)
+    else:
+        density2 = np.zeros_like(density1)
+    col_density = 0.6 * density1 + 0.4 * density2
+    thr = float(np.percentile(col_density, 70.0))
+    thr = max(thr, float(min_density))
+    keep = col_density >= thr
+    best_len = 0
+    best_a = best_b = None
+    run_a = None
+    for i, v in enumerate(keep):
+        if v and run_a is None:
+            run_a = i
+        if (not v or i == len(keep) - 1) and run_a is not None:
+            run_b = i if not v else i + 1
+            run_len = run_b - run_a
+            if run_len > best_len:
+                best_len = run_len
+                best_a, best_b = run_a, run_b
+            run_a = None
+    min_width = int(round(float(min_width_ratio) * float(w)))
+    if best_a is None or best_b is None or best_len < max(5, min_width):
+        fallback_bbox = court_bbox
+        if fallback_bbox is None:
+            fallback_bbox = (orig_x0, y_top, orig_x1, y_bot)
+        x0f, y0f, x1f, y1f = fallback_bbox
+        fallback = np.zeros_like(floor_mask)
+        fallback[y0f : y1f + 1, x0f : x1f + 1] = 255
+        return fallback, {
+            "floor_x_tightened": False,
+            "floor_x_range": [int(x0f), int(x1f)],
+            "floor_strip_thr": float(thr),
+            "floor_strip_y0": int(y_strip0),
+            "floor_strip_y1": int(y_strip1),
+            "floor_x_reject_reason": "width_too_narrow_keep_bbox",
+            "floor_roi_source": floor_roi_source,
+            "court_bbox": list(court_bbox) if court_bbox is not None else None,
+            "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+        }
+    margin = int(round(float(margin_ratio) * float(w)))
+    x0 = max(0, best_a - margin)
+    x1 = min(w - 1, best_b - 1 + margin)
+    cand_w = max(1, int(x1 - x0 + 1))
+    min_width_abs = int(round(float(min_abs_width_ratio) * float(w)))
+    min_width_orig = int(round(float(min_keep_ratio) * float(orig_w)))
+    if cand_w < max(min_width_abs, min_width_orig):
+        fallback_bbox = court_bbox
+        if fallback_bbox is None:
+            fallback_bbox = (orig_x0, y_top, orig_x1, y_bot)
+        x0f, y0f, x1f, y1f = fallback_bbox
+        fallback = np.zeros_like(floor_mask)
+        fallback[y0f : y1f + 1, x0f : x1f + 1] = 255
+        return fallback, {
+            "floor_x_tightened": False,
+            "floor_x_range": [int(x0f), int(x1f)],
+            "floor_strip_thr": float(thr),
+            "floor_strip_y0": int(y_strip0),
+            "floor_strip_y1": int(y_strip1),
+            "floor_x_reject_reason": "width_too_narrow_keep_bbox",
+            "floor_roi_source": floor_roi_source,
+            "court_bbox": list(court_bbox) if court_bbox is not None else None,
+            "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+        }
+    tightened = floor_mask.copy()
+    if x0 > 0:
+        tightened[:, :x0] = 0
+    if x1 + 1 < w:
+        tightened[:, x1 + 1 :] = 0
+    floor_x_support_ratio = None
+    if support_mask is not None:
+        support_total = int(np.count_nonzero((support_mask > 0) & (floor_mask > 0)))
+        support_keep = int(np.count_nonzero((support_mask > 0) & (tightened > 0)))
+        keep_ratio = float(support_keep) / float(max(support_total, 1))
+        floor_x_support_ratio = float(keep_ratio)
+        if support_total > 0 and keep_ratio < float(min_keep_ratio):
+            fallback_bbox = court_bbox
+            if fallback_bbox is None:
+                fallback_bbox = (orig_x0, y_top, orig_x1, y_bot)
+            x0f, y0f, x1f, y1f = fallback_bbox
+            fallback = np.zeros_like(floor_mask)
+            fallback[y0f : y1f + 1, x0f : x1f + 1] = 255
+            return fallback, {
+                "floor_x_tightened": False,
+                "floor_x_range": [int(x0f), int(x1f)],
+                "floor_strip_thr": float(thr),
+                "floor_strip_y0": int(y_strip0),
+                "floor_strip_y1": int(y_strip1),
+                "floor_x_support_ratio": float(keep_ratio),
+                "floor_x_reject_reason": "support_drop_keep_bbox",
+                "floor_roi_source": floor_roi_source,
+                "court_bbox": list(court_bbox) if court_bbox is not None else None,
+                "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+            }
+    return tightened, {
+        "floor_x_tightened": True,
+        "floor_x_range": [int(x0), int(x1)],
+        "floor_strip_thr": float(thr),
+        "floor_strip_y0": int(y_strip0),
+        "floor_strip_y1": int(y_strip1),
+        "floor_x_support_ratio": floor_x_support_ratio,
+        "floor_roi_source": floor_roi_source,
+        "court_bbox": list(court_bbox) if court_bbox is not None else None,
+        "court_bbox_pad": list(court_bbox_pad) if court_bbox_pad is not None else None,
+    }
+
+
+def get_floor_roi_mask_debug(
+    frame_bgr: np.ndarray,
+    fallback_y_ratio: float = 0.55,
+    seed_ratio: float = 0.40,
+    min_cc_ratio: float = 0.04,
+    green_threshold_percentile: float = 56.0,
+    morphology_kernel_size: int = 11,
+    closing_iterations: int = 4,
+    court_corners: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    h, w = frame_bgr.shape[:2]
+    b, g, r = cv2.split(frame_bgr)
+    green_score = g.astype(np.float32) - np.maximum(r, b).astype(np.float32)
+    white_support = build_white_mask_raw(frame_bgr)
+    prepass_corners = None
+    prepass_area_ratio = None
+    prepass_ymax_ratio = None
+    prepass_bottom_support = None
+    prepass_gate_passed = False
+    prepass_line = white_support.copy()
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        k = int(max(21, round(min(h, w) * 0.03)))
+        if k % 2 == 0:
+            k += 1
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))
+        tophat_h = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_h)
+        tophat_v = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_v)
+        tophat = cv2.max(tophat_h, tophat_v)
+        roi_vals = tophat[white_support > 0]
+        if roi_vals.size > 0:
+            thresh = max(float(np.percentile(roi_vals, 75.0)), 10.0)
+            thin_line_pre = (tophat >= thresh).astype(np.uint8) * 255
+            prepass_line = cv2.bitwise_and(white_support, thin_line_pre)
+        else:
+            prepass_line = white_support.copy()
+        full_mask = np.ones((h, w), dtype=np.uint8) * 255
+        pre_H, _pre_metrics, _pre_debug = _fit_court_homography_from_raw_floor_debug(
+            prepass_line,
+            frame_bgr.shape,
+            floor_roi_mask=full_mask,
+        )
+        if pre_H is not None and np.all(np.isfinite(pre_H)):
+            pre_uv = project_points(pre_H, get_bwf_corners())
+            if np.all(np.isfinite(pre_uv)):
+                pre_ordered = _order_corners_lb_rb_rt_lt(pre_uv)
+                area = float(_quad_area(pre_ordered))
+                bbox_w = float(np.max(pre_ordered[:, 0]) - np.min(pre_ordered[:, 0]))
+                bbox_h = float(np.max(pre_ordered[:, 1]) - np.min(pre_ordered[:, 1]))
+                min_edge = float(np.min(_quad_edges(pre_ordered)))
+                if bbox_w < 0.08 * float(w) or bbox_h < 0.06 * float(h) or min_edge < 0.05 * float(min(h, w)):
+                    prepass_area_ratio = None
+                    prepass_ymax_ratio = None
+                    prepass_gate_passed = False
+                else:
+                    pre_clamp = pre_ordered.copy()
+                    pre_clamp[:, 0] = np.clip(pre_clamp[:, 0], 0.0, float(w - 1))
+                    pre_clamp[:, 1] = np.clip(pre_clamp[:, 1], 0.0, float(h - 1))
+                    prepass_area_ratio = float(_quad_area(pre_clamp)) / float(max(h * w, 1))
+                    y_max = float(np.max(pre_ordered[:, 1]))
+                    prepass_ymax_ratio = max(0.0, min(1.0, y_max / float(max(h - 1, 1))))
+                    prepass_bottom_support = max(
+                        0.0,
+                        min(1.0, (prepass_ymax_ratio - 0.55) / 0.45),
+                    )
+                    if prepass_area_ratio >= 0.06 and (prepass_bottom_support or 0.0) >= 0.35:
+                        prepass_gate_passed = True
+                        prepass_corners = pre_ordered
+                    prepass_gate_passed = True
+                    prepass_corners = pre_ordered
+    except Exception:
+        prepass_corners = None
+        prepass_gate_passed = False
+
+    def _select_top_components(
+        mask_u8: np.ndarray,
+        support_u8: np.ndarray,
+        top_k: int = 2,
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]], list[Dict[str, float]]]:
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+        comps = []
+        for idx in range(1, num):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+            support_cnt = int(np.count_nonzero(support_u8[labels == idx]))
+            score = float(area) * (1.0 + float(support_cnt) / float(max(area, 1)))
+            comps.append({"idx": idx, "area": float(area), "support": float(support_cnt), "score": score})
+        if not comps:
+            return None, None, []
+        comps.sort(key=lambda item: item["score"], reverse=True)
+        keep = comps[: max(1, int(top_k))]
+        keep_ids = [int(item["idx"]) for item in keep]
+        union = np.isin(labels, keep_ids).astype(np.uint8) * 255
+        ys_u, xs_u = np.where(union > 0)
+        if xs_u.size == 0:
+            return None, None, keep
+        bbox = (int(xs_u.min()), int(ys_u.min()), int(xs_u.max()), int(ys_u.max()))
+        return union, bbox, keep
+    seed_y = int(round(float(h) * float(seed_ratio)))
+    seed = np.zeros((h, w), dtype=np.uint8)
+    seed[seed_y:h, :] = 255
+    bottom_scores = green_score[seed > 0]
+    fallback_floor_roi = False
+    fallback_mode = "cc"
+    floor_y_cut = None
+    largest_cc_mask = np.zeros((h, w), dtype=np.uint8)
+    lab_mask, lab_bbox, lab_debug = _floor_mask_from_seed_lab(
+        frame_bgr,
+        seed_ratio=seed_ratio,
+        patch=9,
+        delta_lab=18.0,
+        min_area_ratio=0.06,
+    )
+    if lab_mask is not None and lab_bbox is not None:
+        cc_scores = []
+        union_mask, union_bbox, cc_scores = _select_top_components(
+            (lab_mask > 0).astype(np.uint8) * 255,
+            white_support,
+            top_k=2,
+        )
+        if union_mask is not None and union_bbox is not None:
+            x1, y1, x2, y2 = union_bbox
+            margin = int(0.03 * float(min(h, w)))
+            x1 = max(0, x1 - margin)
+            y1 = max(0, y1 - margin)
+            x2 = min(w - 1, x2 + margin)
+            y2 = min(h - 1, y2 + margin)
+            floor_mask = np.zeros((h, w), dtype=np.uint8)
+            floor_mask[y1 : y2 + 1, x1 : x2 + 1] = 255
+            floor_y_cut = int(y1)
+        else:
+            floor_mask = (lab_mask > 0).astype(np.uint8) * 255
+            ys_cc, xs_cc = np.where(floor_mask > 0)
+            if xs_cc.size > 0:
+                floor_y_cut = int(ys_cc.min())
+        fallback_mode = "lab_seed"
+        if bottom_scores.size > 0:
+            thr = float(np.percentile(bottom_scores, float(green_threshold_percentile)))
+            green_mask = (green_score > thr).astype(np.uint8) * 255
+            kernel = np.ones((int(morphology_kernel_size), int(morphology_kernel_size)), np.uint8)
+            green_mask = cv2.morphologyEx(
+                green_mask,
+                cv2.MORPH_CLOSE,
+                kernel,
+                iterations=int(closing_iterations),
+            )
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        else:
+            green_mask = np.zeros((h, w), dtype=np.uint8)
+        floor_mask, tighten_info = _tighten_floor_roi_xrange(
+            green_mask,
+            floor_mask,
+            support_mask=white_support,
+            court_corners=prepass_corners if prepass_gate_passed else court_corners,
+            min_density=0.09,
+            min_keep_ratio=0.45,
+            margin_ratio=0.075,
+        )
+        return floor_mask, {
+            "green_mask": green_mask,
+            "seed_bottom_mask": seed,
+            "largest_cc_mask": lab_mask,
+            "fallback_floor_roi": False,
+            "fallback_mode": fallback_mode,
+            "floor_y_cut": int(floor_y_cut),
+            "exg_row_plot": None,
+            "floor_cc_scores": cc_scores,
+            "prepass_area_ratio": prepass_area_ratio,
+            "prepass_ymax_ratio": prepass_ymax_ratio,
+            "prepass_gate_passed": prepass_gate_passed,
+            **lab_debug,
+            **tighten_info,
+        }
+    if bottom_scores.size == 0:
+        fallback_floor_roi = True
+        fallback_mode = "bottom_band"
+        floor_y_cut = int(round(float(h) * float(fallback_y_ratio)))
+        floor_mask = np.zeros((h, w), dtype=np.uint8)
+        floor_mask[floor_y_cut:h, :] = 255
+        floor_mask, tighten_info = _tighten_floor_roi_xrange(
+            np.zeros((h, w), dtype=np.uint8),
+            floor_mask,
+            support_mask=white_support,
+            court_corners=prepass_corners if prepass_gate_passed else court_corners,
+            min_density=0.09,
+            min_keep_ratio=0.45,
+            margin_ratio=0.075,
+        )
+        return floor_mask, {
+            "green_mask": np.zeros((h, w), dtype=np.uint8),
+            "seed_bottom_mask": seed,
+            "largest_cc_mask": largest_cc_mask,
+            "fallback_floor_roi": fallback_floor_roi,
+            "fallback_mode": fallback_mode,
+            "floor_y_cut": int(floor_y_cut),
+            "exg_row_plot": None,
+            "prepass_area_ratio": prepass_area_ratio,
+            "prepass_ymax_ratio": prepass_ymax_ratio,
+            "prepass_gate_passed": prepass_gate_passed,
+            **tighten_info,
+        }
+    thr = float(np.percentile(bottom_scores, float(green_threshold_percentile)))
+    green_mask = (green_score > thr).astype(np.uint8) * 255
+    kernel = np.ones((int(morphology_kernel_size), int(morphology_kernel_size)), np.uint8)
+    green_mask = cv2.morphologyEx(
+        green_mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=int(closing_iterations),
+    )
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+    union_mask, union_bbox, cc_scores = _select_top_components(green_mask, white_support, top_k=2)
+    if union_mask is None or union_bbox is None:
+        fallback_floor_roi = True
+        fallback_mode = "bottom_band"
+        floor_y_cut = int(round(float(h) * float(fallback_y_ratio)))
+        floor_mask = np.zeros((h, w), dtype=np.uint8)
+        floor_mask[floor_y_cut:h, :] = 255
+        floor_mask, tighten_info = _tighten_floor_roi_xrange(
+            green_mask,
+            floor_mask,
+            support_mask=white_support,
+            court_corners=prepass_corners if prepass_gate_passed else court_corners,
+            min_density=0.09,
+            min_keep_ratio=0.45,
+            margin_ratio=0.075,
+        )
+        return floor_mask, {
+            "green_mask": green_mask,
+            "seed_bottom_mask": seed,
+            "largest_cc_mask": largest_cc_mask,
+            "fallback_floor_roi": fallback_floor_roi,
+            "fallback_mode": fallback_mode,
+            "floor_y_cut": int(floor_y_cut),
+            "exg_row_plot": None,
+            "floor_cc_scores": cc_scores,
+            "prepass_area_ratio": prepass_area_ratio,
+            "prepass_ymax_ratio": prepass_ymax_ratio,
+            "prepass_gate_passed": prepass_gate_passed,
+            **tighten_info,
+        }
+    largest_cc_mask = union_mask
+    cc_area = int(np.count_nonzero(union_mask))
+    cc_ratio = float(cc_area) / float(max(h * w, 1))
+    if cc_ratio < float(min_cc_ratio):
+        fallback_floor_roi = True
+        fallback_mode = "bottom_band"
+        floor_y_cut = int(round(float(h) * float(fallback_y_ratio)))
+        floor_mask = np.zeros((h, w), dtype=np.uint8)
+        floor_mask[floor_y_cut:h, :] = 255
+    else:
+        ys_cc, xs_cc = np.where(largest_cc_mask > 0)
+        if xs_cc.size > 0:
+            x1 = int(xs_cc.min())
+            x2 = int(xs_cc.max())
+            y1 = int(ys_cc.min())
+            y2 = int(ys_cc.max())
+            margin = int(0.03 * float(min(h, w)))
+            x1 = max(0, x1 - margin)
+            y1 = max(0, y1 - margin)
+            x2 = min(w - 1, x2 + margin)
+            y2 = min(h - 1, y2 + margin)
+            floor_mask = np.zeros((h, w), dtype=np.uint8)
+            floor_mask[y1 : y2 + 1, x1 : x2 + 1] = 255
+            floor_y_cut = int(y1)
+        else:
+            floor_mask = largest_cc_mask
+    floor_mask, tighten_info = _tighten_floor_roi_xrange(
+        green_mask,
+        floor_mask,
+        support_mask=white_support,
+        court_corners=prepass_corners if prepass_gate_passed else court_corners,
+        min_density=0.09,
+        min_keep_ratio=0.45,
+        margin_ratio=0.075,
+    )
+    return floor_mask, {
+        "green_mask": green_mask,
+        "seed_bottom_mask": seed,
+        "largest_cc_mask": largest_cc_mask,
+        "fallback_floor_roi": fallback_floor_roi,
+        "fallback_mode": fallback_mode,
+        "floor_y_cut": int(floor_y_cut) if floor_y_cut is not None else None,
+        "exg_row_plot": None,
+        "floor_cc_scores": cc_scores,
+        "prepass_area_ratio": prepass_area_ratio,
+        "prepass_ymax_ratio": prepass_ymax_ratio,
+        "prepass_gate_passed": prepass_gate_passed,
+        **tighten_info,
+    }
+
+
+def get_floor_roi_mask(
+    frame_bgr: np.ndarray,
+    fallback_y_ratio: float = 0.55,
+) -> np.ndarray:
+    floor_mask, _ = get_floor_roi_mask_debug(
+        frame_bgr,
+        fallback_y_ratio=fallback_y_ratio,
+    )
+    return floor_mask
+
+
+def hough_lines(
+    mask: np.ndarray,
+    floor_mask: np.ndarray,
+    min_length_ratio: float = 0.08,
+    threshold: int = 80,
+) -> list[Tuple[float, float, float, float]]:
+    h, w = mask.shape[:2]
+    edges = cv2.Canny(mask, 50, 150)
+    min_len = max(1, int(float(w) * float(min_length_ratio)))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold, minLineLength=min_len, maxLineGap=20)
+    segs: list[Tuple[float, float, float, float]] = []
+    if lines is None:
+        return segs
+    for ln in lines:
+        x1, y1, x2, y2 = [float(v) for v in ln[0]]
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        if length < float(min_len):
+            continue
+        mx = int(round(0.5 * (x1 + x2)))
+        my = int(round(0.5 * (y1 + y2)))
+        if mx < 0 or mx >= w or my < 0 or my >= h:
+            continue
+        if floor_mask[my, mx] == 0:
+            continue
+        segs.append((x1, y1, x2, y2))
+    return segs
+
+
+def _line_support(
+    seg: Tuple[float, float, float, float],
+    mask: np.ndarray,
+    samples: int = 30,
+) -> float:
+    x1, y1, x2, y2 = seg
+    h, w = mask.shape[:2]
+    t = np.linspace(0.0, 1.0, int(samples), dtype=np.float32)
+    xs = x1 + (x2 - x1) * t
+    ys = y1 + (y2 - y1) * t
+    xi = np.clip(np.rint(xs).astype(np.int32), 0, w - 1)
+    yi = np.clip(np.rint(ys).astype(np.int32), 0, h - 1)
+    return float(np.mean(mask[yi, xi] > 0))
+
+
+def candidate_outer_pairs(
+    lines: list[Tuple[float, float, float, float]],
+    mask: np.ndarray,
+    angle_ref: float,
+    top_k: int = 6,
+    max_angle_deg: float = 15.0,
+    max_pairs: int = 3,
+) -> list[Tuple[Tuple[Tuple[float, float, float], Tuple[float, float, float]], float]]:
+    if not lines:
+        return []
+    max_angle = math.radians(float(max_angle_deg))
+    scored = []
+    for seg in lines:
+        x1, y1, x2, y2 = seg
+        angle = math.atan2(y2 - y1, x2 - x1) % math.pi
+        if _angle_distance(angle, float(angle_ref)) > max_angle:
+            continue
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        support = _line_support(seg, mask)
+        score = float(length * (0.5 + 0.5 * support))
+        line = _line_from_points((x1, y1), (x2, y2))
+        scored.append((score, line, angle))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top = scored[: max(2, int(top_k))]
+    pairs = []
+    for i in range(len(top)):
+        for j in range(i + 1, len(top)):
+            si, li, ai = top[i]
+            sj, lj, aj = top[j]
+            if _angle_distance(ai, aj) > max_angle:
+                continue
+            dist = abs(li[2] - lj[2])
+            pair_score = float(si + sj)
+            pairs.append(((li, lj), pair_score, dist))
+    pairs.sort(key=lambda item: (item[2], item[1]), reverse=True)
+    return [(pair, score) for pair, score, _ in pairs[: max_pairs]]
+
+
+def _x_at_y(line: Tuple[float, float, float], y: float) -> Optional[float]:
+    a, b, c = line
+    if abs(a) < 1e-6:
+        return None
+    return float(-(b * y + c) / a)
+
+
+def _y_at_x(line: Tuple[float, float, float], x: float) -> Optional[float]:
+    a, b, c = line
+    if abs(b) < 1e-6:
+        return None
+    return float(-(a * x + c) / b)
+
+
+def candidate_outer_pairs_vp(
+    lines: list[Tuple[float, float, float, float]],
+    mask: np.ndarray,
+    floor_bbox: Tuple[int, int, int, int],
+    frame_shape: Tuple[int, int],
+    top_k: int = 8,
+    max_pairs: int = 3,
+) -> list[Tuple[Tuple[Tuple[float, float, float], Tuple[float, float, float]], float]]:
+    if not lines:
+        return []
+    scored = []
+    for seg in lines:
+        x1, y1, x2, y2 = seg
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        support = _line_support(seg, mask)
+        score = float(length * (0.5 + 0.5 * support))
+        line = _line_from_points((x1, y1), (x2, y2))
+        scored.append((score, line))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top = scored[: max(2, int(top_k))]
+    x0, y0, x1b, y1b = floor_bbox
+    h, w = frame_shape
+    y_ref = float(y0 + 0.75 * max(1.0, (y1b - y0)))
+    x_ref = float(x0 + 0.50 * max(1.0, (x1b - x0)))
+    pairs = []
+    for i in range(len(top)):
+        for j in range(i + 1, len(top)):
+            si, li = top[i]
+            sj, lj = top[j]
+            vp = _intersect_lines(li, lj)
+            if vp is None or not np.all(np.isfinite(vp)):
+                continue
+            if vp[1] > float(y0 + 0.20 * max(1.0, (y1b - y0))):
+                continue
+            if vp[0] < -0.5 * float(w) or vp[0] > 1.5 * float(w):
+                continue
+            sep = None
+            if abs(li[0]) > abs(li[1]) and abs(lj[0]) > abs(lj[1]):
+                xi = _x_at_y(li, y_ref)
+                xj = _x_at_y(lj, y_ref)
+                if xi is not None and xj is not None:
+                    sep = abs(xi - xj)
+            else:
+                yi = _y_at_x(li, x_ref)
+                yj = _y_at_x(lj, x_ref)
+                if yi is not None and yj is not None:
+                    sep = abs(yi - yj)
+            if sep is None:
+                continue
+
+            # Prefer geometrically plausible "outer" pairs:
+            # - reject pairs that are too close (often inner+outer parallel lines on the same side)
+            # - make separation dominate; support acts as a weak tie-breaker
+            if abs(li[0]) > abs(li[1]) and abs(lj[0]) > abs(lj[1]):
+                sep_scale = float(max(1.0, (x1b - x0)))  # vertical-ish -> x separation
+            else:
+                sep_scale = float(max(1.0, (y1b - y0)))  # horizontal-ish -> y separation
+            sep_norm = float(sep) / sep_scale
+            if sep_norm < 0.08:
+                continue
+
+            pair_score = float(10.0 * sep_norm + 0.05 * math.sqrt(max(si, 0.0) * max(sj, 0.0)) / sep_scale)
+            pairs.append(((li, lj), pair_score))
+    pairs.sort(key=lambda item: item[1], reverse=True)
+    return pairs[: max_pairs]
+
+
+def _intersections_from_pairs(
+    pair_a: Tuple[Tuple[float, float, float], Tuple[float, float, float]],
+    pair_b: Tuple[Tuple[float, float, float], Tuple[float, float, float]],
+) -> Optional[np.ndarray]:
+    a1, a2 = pair_a
+    b1, b2 = pair_b
+    p00 = _intersect_lines(a1, b1)
+    p01 = _intersect_lines(a1, b2)
+    p10 = _intersect_lines(a2, b1)
+    p11 = _intersect_lines(a2, b2)
+    if p00 is None or p01 is None or p10 is None or p11 is None:
+        return None
+    return np.stack([p00, p01, p10, p11], axis=0)
 
 
 def _white_mask_stats(white_mask: np.ndarray) -> Tuple[int, float, Tuple[int, int, int, int]]:
@@ -120,6 +1858,662 @@ def _sample_white_points(
     return pts
 
 
+def _point_in_bbox(pt_xy: Tuple[float, float], bbox: Tuple[int, int, int, int]) -> bool:
+    x1, y1, x2, y2 = bbox
+    x, y = pt_xy
+    return (float(x1) <= float(x) <= float(x2)) and (float(y1) <= float(y) <= float(y2))
+
+
+def _line_from_points(p1: Tuple[float, float], p2: Tuple[float, float]) -> Tuple[float, float, float]:
+    x1, y1 = p1
+    x2, y2 = p2
+    a = float(y1 - y2)
+    b = float(x2 - x1)
+    c = float(x1 * y2 - x2 * y1)
+    norm = math.hypot(a, b)
+    if norm > 1e-6:
+        a /= norm
+        b /= norm
+        c /= norm
+    return a, b, c
+
+
+def _angle_distance(a: float, b: float) -> float:
+    d = abs(float(a) - float(b))
+    return float(min(d, math.pi - d))
+
+
+def _mean_angle(lines: list[LineSeg]) -> Optional[float]:
+    if not lines:
+        return None
+    angles = np.array([ln.theta for ln in lines], dtype=np.float32)
+    weights = np.array([ln.weight for ln in lines], dtype=np.float32)
+    s = float(np.sum(weights * np.sin(2.0 * angles)))
+    c = float(np.sum(weights * np.cos(2.0 * angles)))
+    if abs(s) < 1e-6 and abs(c) < 1e-6:
+        return None
+    ang = 0.5 * math.atan2(s, c)
+    if ang < 0:
+        ang += math.pi
+    return float(ang)
+
+
+def _detect_lsd_lines(
+    edge_mask: np.ndarray,
+    support_mask: np.ndarray,
+    floor_bbox: Tuple[int, int, int, int],
+    min_length: float = 20.0,
+    support_thresh: float = 0.08,
+    support_thresh_long: float = 0.03,
+    long_length: float = 80.0,
+    support_samples: int = 30,
+) -> Tuple[list[LineSeg], int]:
+    edges = cv2.Canny(edge_mask, 50, 150)
+    lsd = cv2.createLineSegmentDetector(0)
+    lines = lsd.detect(edges)[0]
+    segs: list[LineSeg] = []
+    num_raw = 0
+    if lines is None:
+        return segs, num_raw
+    num_raw = int(len(lines))
+    h, w = support_mask.shape[:2]
+    for ln in lines:
+        x1, y1, x2, y2 = [float(v) for v in ln[0]]
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        if length < float(min_length):
+            continue
+        mx = 0.5 * (x1 + x2)
+        my = 0.5 * (y1 + y2)
+        if floor_bbox is not None and not _point_in_bbox((mx, my), floor_bbox):
+            continue
+        t = np.linspace(0.0, 1.0, int(support_samples), dtype=np.float32)
+        xs = x1 + (x2 - x1) * t
+        ys = y1 + (y2 - y1) * t
+        xi = np.clip(np.rint(xs).astype(np.int32), 0, w - 1)
+        yi = np.clip(np.rint(ys).astype(np.int32), 0, h - 1)
+        support = float(np.mean(support_mask[yi, xi] > 0))
+        keep = support > float(support_thresh) or (
+            length > float(long_length) and support > float(support_thresh_long)
+        )
+        if not keep:
+            continue
+        theta = math.atan2(y2 - y1, x2 - x1)
+        theta = float(theta % math.pi)
+        line = _line_from_points((x1, y1), (x2, y2))
+        weight = float(length * (0.5 + 0.5 * support))
+        segs.append(
+            LineSeg(
+                p1=np.array([x1, y1], dtype=np.float32),
+                p2=np.array([x2, y2], dtype=np.float32),
+                theta=theta,
+                length=length,
+                support=support,
+                weight=weight,
+                line=line,
+            )
+        )
+    return segs, num_raw
+
+
+def _cluster_lines_by_angle(
+    lines: list[LineSeg],
+    min_ratio: float = 0.25,
+    fallback_angle_deg: float = 15.0,
+) -> Tuple[list[LineSeg], list[LineSeg], Dict[str, Any]]:
+    if not lines:
+        return [], [], {"mean_angle_a": None, "mean_angle_b": None, "cluster_ratio": 0.0}
+    angles = np.array([ln.theta for ln in lines], dtype=np.float32)
+    weights = np.array([ln.weight for ln in lines], dtype=np.float32)
+    bins = 36
+    hist, edges = np.histogram(angles, bins=bins, range=(0.0, math.pi), weights=weights)
+    idx = np.argsort(hist)[::-1]
+    idx1 = int(idx[0])
+    idx2 = int(idx[1]) if idx.size > 1 and hist[idx[1]] > 0 else int(idx[0])
+    mu1 = float((edges[idx1] + edges[idx1 + 1]) * 0.5)
+    if idx2 == idx1:
+        mu2 = float((mu1 + math.pi * 0.5) % math.pi)
+    else:
+        mu2 = float((edges[idx2] + edges[idx2 + 1]) * 0.5)
+    cluster_a: list[LineSeg] = []
+    cluster_b: list[LineSeg] = []
+    for ln in lines:
+        if _angle_distance(ln.theta, mu1) <= _angle_distance(ln.theta, mu2):
+            cluster_a.append(ln)
+        else:
+            cluster_b.append(ln)
+    sum_a = float(np.sum([ln.weight for ln in cluster_a])) if cluster_a else 0.0
+    sum_b = float(np.sum([ln.weight for ln in cluster_b])) if cluster_b else 0.0
+    denom = max(sum_a, sum_b, 1e-6)
+    ratio = float(min(sum_a, sum_b) / denom)
+
+    if ratio < float(min_ratio):
+        main = cluster_a if sum_a >= sum_b else cluster_b
+        main_angle = _mean_angle(main)
+        if main_angle is None:
+            main_angle = mu1
+        perp = float((main_angle + math.pi * 0.5) % math.pi)
+        alt = [ln for ln in lines if _angle_distance(ln.theta, perp) < math.radians(float(fallback_angle_deg))]
+        if not alt:
+            alt = [ln for ln in lines if _angle_distance(ln.theta, perp) < math.radians(25.0)]
+        if alt:
+            if sum_a >= sum_b:
+                cluster_b = alt
+            else:
+                cluster_a = alt
+            sum_a = float(np.sum([ln.length for ln in cluster_a])) if cluster_a else 0.0
+            sum_b = float(np.sum([ln.length for ln in cluster_b])) if cluster_b else 0.0
+            denom = max(sum_a, sum_b, 1e-6)
+            ratio = float(min(sum_a, sum_b) / denom)
+
+    return cluster_a, cluster_b, {
+        "mean_angle_a": _mean_angle(cluster_a),
+        "mean_angle_b": _mean_angle(cluster_b),
+        "sum_len_a": sum_a,
+        "sum_len_b": sum_b,
+        "cluster_ratio": ratio,
+    }
+
+
+def _assign_cluster_roles(
+    cluster_a: list[LineSeg],
+    cluster_b: list[LineSeg],
+) -> Tuple[Optional[list[LineSeg]], Optional[list[LineSeg]], Dict[str, Any]]:
+    mean_a = _mean_angle(cluster_a)
+    mean_b = _mean_angle(cluster_b)
+    if mean_a is None or mean_b is None:
+        return None, None, {"mean_angle_a": mean_a, "mean_angle_b": mean_b}
+    score_a = abs(float(mean_a) - math.pi * 0.5)
+    score_b = abs(float(mean_b) - math.pi * 0.5)
+    if score_a < score_b:
+        vert = cluster_a
+        horiz = cluster_b
+    else:
+        vert = cluster_b
+        horiz = cluster_a
+    return horiz, vert, {"mean_angle_a": mean_a, "mean_angle_b": mean_b}
+
+
+def _line_signed_distance(line: Tuple[float, float, float], center: Tuple[float, float]) -> float:
+    a, b, c = line
+    x, y = center
+    return float(a * x + b * y + c)
+
+
+def _quad_inside_ratio(quad_xy: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = bbox
+    inside = 0
+    for x, y in quad_xy:
+        if float(x1) <= float(x) <= float(x2) and float(y1) <= float(y) <= float(y2):
+            inside += 1
+    return float(inside) / 4.0
+
+
+def _points_inside_ratio(points_xy: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    x1, y1, x2, y2 = bbox
+    inside = 0
+    for x, y in points_xy:
+        if float(x1) <= float(x) <= float(x2) and float(y1) <= float(y) <= float(y2):
+            inside += 1
+    return float(inside) / float(max(points_xy.shape[0], 1))
+
+
+def _corners_inside_floor_roi(
+    corners_xy: np.ndarray,
+    floor_bbox_xyxy: Tuple[int, int, int, int],
+    margin: int = 10,
+    margin_x: Optional[int] = None,
+    margin_y: Optional[int] = None,
+) -> bool:
+    x0, y0, x1, y1 = floor_bbox_xyxy
+    xs = corners_xy[:, 0]
+    ys = corners_xy[:, 1]
+    if margin_x is None:
+        margin_x = margin
+    if margin_y is None:
+        margin_y = margin
+    return (
+        float(xs.min()) >= float(x0 - margin_x)
+        and float(xs.max()) <= float(x1 + margin_x)
+        and float(ys.min()) >= float(y0 - margin_y)
+        and float(ys.max()) <= float(y1 + margin_y)
+    )
+
+
+def _bottom_corners_in_roi(
+    quad_xy: np.ndarray,
+    roi_mask: Optional[np.ndarray] = None,
+    roi_rect: Optional[Tuple[int, int, int, int]] = None,
+    margin: int = 6,
+) -> bool:
+    pts = np.asarray(quad_xy, dtype=np.float32).reshape(-1, 2)
+    idx = np.argsort(pts[:, 1])[::-1][:2]
+    bottoms = pts[idx]
+    if roi_mask is not None:
+        h, w = roi_mask.shape[:2]
+        for x, y in bottoms:
+            xi = int(np.clip(round(float(x)), 0, w - 1))
+            yi = int(np.clip(round(float(y)), 0, h - 1))
+            if roi_mask[yi, xi] == 0:
+                return False
+        return True
+    if roi_rect is not None:
+        x0, y0, x1, y1 = roi_rect
+        x0 -= margin
+        y0 -= margin
+        x1 += margin
+        y1 += margin
+        for x, y in bottoms:
+            if not (float(x0) <= float(x) <= float(x1) and float(y0) <= float(y) <= float(y1)):
+                return False
+        return True
+    return True
+
+
+def _quad_height_ratio(quad_xy: np.ndarray, h: int) -> float:
+    pts = np.asarray(quad_xy, dtype=np.float32).reshape(-1, 2)
+    height = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+    return height / float(max(h, 1))
+
+
+def _filter_hough_segments_for_scoring(
+    segments: list[Tuple[float, float, float, float]],
+    roi_rect: Tuple[int, int, int, int],
+    upper_band: Tuple[float, float] = (0.05, 0.40),
+    near_horiz_deg: float = 10.0,
+    min_len: float = 50.0,
+) -> list[Tuple[float, float, float, float]]:
+    if not segments:
+        return []
+    x0, y0, x1, y1 = roi_rect
+    roi_h = max(1.0, float(y1 - y0))
+    y_a = float(y0) + float(upper_band[0]) * roi_h
+    y_b = float(y0) + float(upper_band[1]) * roi_h
+    th = math.tan(math.radians(float(near_horiz_deg)))
+    out = []
+    for x1s, y1s, x2s, y2s in segments:
+        dx = float(x2s - x1s)
+        dy = float(y2s - y1s)
+        seg_len = math.hypot(dx, dy)
+        if seg_len < float(min_len):
+            continue
+        y_mid = 0.5 * (float(y1s) + float(y2s))
+        near_horiz = abs(dx) > 1e-6 and abs(dy / dx) < th
+        in_upper = y_a <= y_mid <= y_b
+        if in_upper and near_horiz:
+            continue
+        out.append((x1s, y1s, x2s, y2s))
+    return out
+
+
+def _suppress_bright_band_on_edges(
+    edges: np.ndarray,
+    floor_y0: int,
+    search_height_frac: float = 0.25,
+    row_white_ratio_thr: float = 0.22,
+    min_run: int = 12,
+    pad: int = 6,
+) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+    e = edges.copy()
+    h, w = e.shape[:2]
+    y1 = max(0, int(floor_y0))
+    y2 = min(h, int(floor_y0 + (h - floor_y0) * float(search_height_frac)))
+    if y2 <= y1 + 5:
+        return e, None
+    roi = e[y1:y2, :]
+    row_ratio = (roi > 0).mean(axis=1)
+    if row_ratio.size > 0:
+        perc = float(np.percentile(row_ratio, 90))
+        thr = max(float(row_white_ratio_thr), perc)
+    else:
+        thr = float(row_white_ratio_thr)
+    bad = row_ratio >= float(thr)
+    best_len = 0
+    best_a = None
+    best_b = None
+    a = None
+    for i, v in enumerate(bad):
+        if v and a is None:
+            a = i
+        if (not v or i == len(bad) - 1) and a is not None:
+            b = i if not v else i + 1
+            length = b - a
+            if length > best_len:
+                best_len = length
+                best_a, best_b = a, b
+            a = None
+    if best_len >= int(min_run):
+        yy1 = max(y1, y1 + int(best_a) - int(pad))
+        yy2 = min(y2, y1 + int(best_b) + int(pad))
+        e[yy1:yy2, :] = 0
+        return e, (yy1, yy2)
+    return e, None
+
+
+def _segment_y_weight(seg_mid_y: float, floor_y0: int, h: int, gamma: float = 2.5) -> float:
+    t = (float(seg_mid_y) - float(floor_y0)) / float(max(1.0, h - floor_y0))
+    t = float(np.clip(t, 0.0, 1.0))
+    return float(t**float(gamma))
+
+
+def _edge_aligns_vp(p1: np.ndarray, p2: np.ndarray, vp: Optional[np.ndarray], max_angle_deg: float = 15.0) -> bool:
+    if vp is None or not isinstance(vp, np.ndarray):
+        return True
+    v_edge = p2 - p1
+    v_edge_norm = float(np.linalg.norm(v_edge))
+    if v_edge_norm < 1e-6:
+        return False
+    mid = 0.5 * (p1 + p2)
+    v_vp = vp.astype(np.float32) - mid
+    v_vp_norm = float(np.linalg.norm(v_vp))
+    if v_vp_norm < 1e-6:
+        return False
+    cosang = abs(float(np.dot(v_edge, v_vp)) / float(v_edge_norm * v_vp_norm))
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    angle = math.degrees(math.acos(cosang))
+    return angle <= float(max_angle_deg)
+
+
+def _draw_lsd_clusters(
+    frame_bgr: np.ndarray,
+    lines_a: list[LineSeg],
+    lines_b: list[LineSeg],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if frame_bgr is None:
+        return None, None
+    img_a = frame_bgr.copy()
+    img_b = frame_bgr.copy()
+    for ln in lines_a:
+        p1 = (int(round(float(ln.p1[0]))), int(round(float(ln.p1[1]))))
+        p2 = (int(round(float(ln.p2[0]))), int(round(float(ln.p2[1]))))
+        cv2.line(img_a, p1, p2, (0, 0, 255), 2, lineType=cv2.LINE_AA)
+    for ln in lines_b:
+        p1 = (int(round(float(ln.p1[0]))), int(round(float(ln.p1[1]))))
+        p2 = (int(round(float(ln.p2[0]))), int(round(float(ln.p2[1]))))
+        cv2.line(img_b, p1, p2, (0, 255, 255), 2, lineType=cv2.LINE_AA)
+    return img_a, img_b
+
+
+def _draw_lsd_segment_lists(
+    frame_bgr: np.ndarray,
+    lines_a: Optional[list],
+    lines_b: Optional[list],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if frame_bgr is None:
+        return None, None
+    img_a = frame_bgr.copy()
+    img_b = frame_bgr.copy()
+    if isinstance(lines_a, list):
+        for seg in lines_a:
+            if not isinstance(seg, (list, tuple)) or len(seg) != 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in seg]
+            cv2.line(
+                img_a,
+                (int(round(x1)), int(round(y1))),
+                (int(round(x2)), int(round(y2))),
+                (0, 0, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+    if isinstance(lines_b, list):
+        for seg in lines_b:
+            if not isinstance(seg, (list, tuple)) or len(seg) != 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in seg]
+            cv2.line(
+                img_b,
+                (int(round(x1)), int(round(y1))),
+                (int(round(x2)), int(round(y2))),
+                (0, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+    return img_a, img_b
+
+
+def _detect_blob_mask(
+    mask_u8: np.ndarray,
+    roi_mask: Optional[np.ndarray] = None,
+    dt_thr: float = 5.5,
+    min_core_area: int = 800,
+    dilate_ksize: int = 17,
+) -> np.ndarray:
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    bw = (mask_u8 > 127).astype(np.uint8)
+    if roi_mask is not None:
+        bw = bw & (roi_mask > 0).astype(np.uint8)
+    dt = cv2.distanceTransform(bw, cv2.DIST_L2, 3)
+    core = (dt >= float(dt_thr)).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(core, 8)
+    core_f = np.zeros_like(core)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= int(min_core_area):
+            core_f[labels == i] = 1
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(dilate_ksize), int(dilate_ksize)))
+    blob = cv2.dilate(core_f, k, iterations=1)
+    blob = (blob & bw).astype(np.uint8) * 255
+    if roi_mask is not None:
+        blob = cv2.bitwise_and(blob, roi_mask)
+    return blob
+
+
+def _keep_thin_structures_in_blob(
+    mask_u8: np.ndarray,
+    blob_mask_u8: np.ndarray,
+) -> np.ndarray:
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    bw = (mask_u8 > 127).astype(np.uint8) * 255
+    in_blob = cv2.bitwise_and(bw, blob_mask_u8)
+    keep = np.zeros_like(in_blob)
+    for ang in [0, 45, 90, 135]:
+        k = _line_kernel(length=31, thickness=1, angle_deg=ang)
+        opened = cv2.morphologyEx(in_blob, cv2.MORPH_OPEN, k)
+        keep = cv2.bitwise_or(keep, opened)
+    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8), iterations=1)
+    return keep
+
+
+def _line_kernel(length: int, thickness: int, angle_deg: float) -> np.ndarray:
+    k = np.zeros((length, length), np.uint8)
+    c = length // 2
+    rad = np.deg2rad(angle_deg)
+    dx = int(round(np.cos(rad) * (length // 2 - 1)))
+    dy = int(round(np.sin(rad) * (length // 2 - 1)))
+    cv2.line(k, (c - dx, c - dy), (c + dx, c + dy), 1, thickness=thickness)
+    return k
+
+
+def _line_like_mask(
+    mask_u8: np.ndarray,
+    *,
+    lengths: Tuple[int, ...] = (9, 15),
+    thickness: int = 1,
+    angles: Tuple[int, ...] = (0, 45, 90, 135),
+) -> np.ndarray:
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(mask_u8, 127, 255, cv2.THRESH_BINARY)
+    out = np.zeros_like(bw)
+    for length in lengths:
+        for ang in angles:
+            k = _line_kernel(int(length), int(thickness), float(ang))
+            opened = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k)
+            out = cv2.bitwise_or(out, opened)
+    return out
+
+
+def _remove_small_speckles(
+    mask_u8: np.ndarray,
+    *,
+    min_area: int = 8,
+    min_aspect: float = 3.0,
+    min_long: int = 10,
+) -> np.ndarray:
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(mask_u8, 127, 255, cv2.THRESH_BINARY)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    keep = np.zeros_like(bw)
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        x, y, bw_cc, bh_cc, _ = stats[idx]
+        bw_cc = max(1, int(bw_cc))
+        bh_cc = max(1, int(bh_cc))
+        aspect = float(max(bw_cc, bh_cc)) / float(max(1, min(bw_cc, bh_cc)))
+        long_side = max(bw_cc, bh_cc)
+        if area < int(min_area) and aspect < float(min_aspect) and long_side < int(min_long):
+            continue
+        keep[labels == idx] = 255
+    return keep
+
+
+def _filter_postblob_non_line(
+    mask_u8: np.ndarray,
+    *,
+    line_lengths: Tuple[int, ...] = (15, 21, 31),
+    thickness_thr: float = 3.5,
+    speckle_area: int = 8,
+    min_aspect: float = 3.0,
+    min_long: int = 10,
+    density_win: int = 15,
+    dense_soft: float = 0.35,
+    dense_hard: float = 0.60,
+    line_density_max: float = 0.35,
+) -> np.ndarray:
+    if mask_u8.ndim == 3:
+        mask_u8 = cv2.cvtColor(mask_u8, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(mask_u8, 127, 255, cv2.THRESH_BINARY)
+    if int(np.count_nonzero(bw)) == 0:
+        return bw
+    line_like = _line_like_mask(bw, lengths=line_lengths, thickness=1) > 0
+    dt = cv2.distanceTransform((bw > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dt_dil = cv2.dilate(dt, np.ones((3, 3), np.uint8))
+    ridge = (dt >= 1.0) & (dt >= (dt_dil - 0.01))
+    line_keep = line_like & ridge
+    thick = dt > float(thickness_thr)
+    filtered = bw.copy()
+    filtered[thick] = 0
+    if int(density_win) >= 3:
+        win = int(density_win)
+        if win % 2 == 0:
+            win += 1
+        kernel = (win, win)
+        bw_f = (bw > 0).astype(np.float32)
+        line_f = line_like.astype(np.float32)
+        density = cv2.blur(bw_f, kernel)
+        line_density = cv2.blur(line_f, kernel)
+        dense_non_line = (density > float(dense_soft)) & (line_density < float(line_density_max))
+        dense_block = density > float(dense_hard)
+        filtered[dense_non_line] = 0
+        line_keep = line_keep & (~dense_block)
+    # Restore only thin line-like structure (skeleton), not full blobs.
+    filtered = cv2.bitwise_or(filtered, line_keep.astype(np.uint8) * 255)
+    filtered = _remove_small_speckles(
+        filtered,
+        min_area=speckle_area,
+        min_aspect=min_aspect,
+        min_long=min_long,
+    )
+    filtered = cv2.bitwise_or(filtered, line_keep.astype(np.uint8) * 255)
+    return filtered
+
+
+def _bridge_edges_across_hole(
+    edges_u8: np.ndarray,
+    hole_u8: np.ndarray,
+    angles_deg: list[float],
+    length: int = 41,
+    thickness: int = 3,
+) -> np.ndarray:
+    edges = edges_u8.copy()
+    edges = cv2.bitwise_and(edges, cv2.bitwise_not(hole_u8))
+    for ang in angles_deg:
+        k = _line_kernel(int(length), int(thickness), float(ang))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k)
+        newpix = cv2.subtract(closed, edges)
+        newpix = cv2.bitwise_and(newpix, hole_u8)
+        edges = cv2.bitwise_or(edges, newpix)
+    return edges
+
+
+def _dominant_angles_from_segments(
+    segments: list[Tuple[float, float, float, float]],
+) -> Optional[Tuple[float, float]]:
+    if len(segments) < 2:
+        return None
+    angles = []
+    lengths = []
+    for x1, y1, x2, y2 in segments:
+        ang = math.atan2(y2 - y1, x2 - x1)
+        ang = float(np.mod(ang, math.pi))
+        angles.append(ang)
+        lengths.append(float(math.hypot(x2 - x1, y2 - y1)))
+    angles_arr = np.array(angles, dtype=np.float32)
+    weights = np.array(lengths, dtype=np.float32)
+    feats = np.stack([np.cos(2.0 * angles_arr), np.sin(2.0 * angles_arr)], axis=1)
+    idx0 = int(np.argmax(weights))
+    c1 = feats[idx0]
+    dists = np.sum((feats - c1) ** 2, axis=1)
+    idx1 = int(np.argmax(dists))
+    c2 = feats[idx1]
+    for _ in range(10):
+        d1 = np.sum((feats - c1) ** 2, axis=1)
+        d2 = np.sum((feats - c2) ** 2, axis=1)
+        assign_a = d1 <= d2
+        if not np.any(assign_a) or np.all(assign_a):
+            break
+        w_a = weights[assign_a][:, None]
+        w_b = weights[~assign_a][:, None]
+        c1 = np.sum(feats[assign_a] * w_a, axis=0) / max(np.sum(w_a), 1e-6)
+        c2 = np.sum(feats[~assign_a] * w_b, axis=0) / max(np.sum(w_b), 1e-6)
+
+    assign_a = np.sum((feats - c1) ** 2, axis=1) <= np.sum((feats - c2) ** 2, axis=1)
+    if not np.any(assign_a) or np.all(assign_a):
+        return None
+    ang_a = angles_arr[assign_a]
+    ang_b = angles_arr[~assign_a]
+    w_a = weights[assign_a]
+    w_b = weights[~assign_a]
+    sa = float(np.sum(w_a * np.sin(2.0 * ang_a)))
+    ca = float(np.sum(w_a * np.cos(2.0 * ang_a)))
+    sb = float(np.sum(w_b * np.sin(2.0 * ang_b)))
+    cb = float(np.sum(w_b * np.cos(2.0 * ang_b)))
+    if abs(sa) < 1e-6 and abs(ca) < 1e-6:
+        return None
+    if abs(sb) < 1e-6 and abs(cb) < 1e-6:
+        return None
+    a1 = 0.5 * math.atan2(sa, ca)
+    a2 = 0.5 * math.atan2(sb, cb)
+    if a1 < 0:
+        a1 += math.pi
+    if a2 < 0:
+        a2 += math.pi
+    return float(a1), float(a2)
+
+
+def _mean_angle_segments(
+    segments: list[Tuple[float, float, float, float]],
+) -> Optional[float]:
+    if not segments:
+        return None
+    angles = []
+    weights = []
+    for x1, y1, x2, y2 in segments:
+        ang = float(np.mod(math.atan2(y2 - y1, x2 - x1), math.pi))
+        angles.append(ang)
+        weights.append(float(math.hypot(x2 - x1, y2 - y1)))
+    ang_arr = np.array(angles, dtype=np.float32)
+    w_arr = np.array(weights, dtype=np.float32)
+    sa = float(np.sum(w_arr * np.sin(2.0 * ang_arr)))
+    ca = float(np.sum(w_arr * np.cos(2.0 * ang_arr)))
+    if abs(sa) < 1e-6 and abs(ca) < 1e-6:
+        return None
+    ang = 0.5 * math.atan2(sa, ca)
+    if ang < 0:
+        ang += math.pi
+    return float(ang)
 def _line_from_rho_theta(rho: float, theta: float) -> Tuple[float, float, float]:
     a = float(np.cos(theta))
     b = float(np.sin(theta))
@@ -135,25 +2529,195 @@ def _intersect_lines(l1: Tuple[float, float, float], l2: Tuple[float, float, flo
         return None
     x = (b1 * c2 - b2 * c1) / d
     y = (c1 * a2 - c2 * a1) / d
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    if abs(x) > 1e6 or abs(y) > 1e6:
+        return None
     return np.array([x, y], dtype=np.float32)
 
 
-def _split_lines_by_angle(
-    lines: np.ndarray,
-    angle_thresh_deg: float = 20.0,
-) -> Tuple[list[Tuple[float, float, float]], list[Tuple[float, float, float]]]:
-    horiz: list[Tuple[float, float, float]] = []
-    vert: list[Tuple[float, float, float]] = []
-    if lines is None:
-        return horiz, vert
-    thresh = np.deg2rad(float(angle_thresh_deg))
-    for rho_theta in lines:
-        rho, theta = float(rho_theta[0][0]), float(rho_theta[0][1])
-        if abs(theta - np.pi / 2.0) <= thresh:
-            horiz.append(_line_from_rho_theta(rho, theta))
-        elif abs(theta) <= thresh or abs(theta - np.pi) <= thresh:
-            vert.append(_line_from_rho_theta(rho, theta))
-    return horiz, vert
+def _pick_rep_line(
+    segments: list[Tuple[float, float, float, float]],
+    *,
+    y_ref: float,
+    x_ref: float,
+    pick: str,
+    angle_ref: Optional[float],
+    max_angle_deg: float = 15.0,
+    min_len: float = 0.0,
+    line_mask: Optional[np.ndarray] = None,
+    top_k: int = 8,
+    line_ids: Optional[Sequence[Optional[int]]] = None,
+) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any]]:
+    best_line = None
+    best_val: Optional[float] = None
+    best_meta: Dict[str, Any] = {}
+    max_angle = math.radians(float(max_angle_deg))
+    candidates = []
+    for idx, (x1, y1, x2, y2) in enumerate(segments):
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        length = float(math.hypot(dx, dy))
+        if length < float(min_len):
+            continue
+        angle = float(np.mod(math.atan2(dy, dx), math.pi))
+        if angle_ref is not None and _angle_distance(angle, float(angle_ref)) > max_angle:
+            continue
+        line = _line_from_points((x1, y1), (x2, y2))
+        support = None
+        if line_mask is not None:
+            support = _line_support((x1, y1, x2, y2), line_mask)
+        score = float(length * (0.5 + 0.5 * (support if support is not None else 0.0)))
+        lid = None
+        if line_ids is not None and idx < len(line_ids):
+            lid = line_ids[idx]
+        candidates.append((score, line, angle, length, support, lid))
+    if not candidates:
+        return None, {}
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    top = candidates[: max(1, int(top_k))]
+    for score, line, angle, length, support, lid in top:
+        if pick in ("min_x", "max_x"):
+            x_at = _x_at_y(line, y_ref)
+            if x_at is None:
+                continue
+            val = float(x_at)
+            if best_val is None or (pick == "min_x" and val < best_val) or (
+                pick == "max_x" and val > best_val
+            ):
+                best_val = val
+                best_line = line
+                best_meta = {
+                    "theta_deg": float(math.degrees(angle)),
+                    "length": float(length),
+                    "support": float(support) if support is not None else None,
+                    "line_id": lid,
+                    "score": float(score),
+                }
+        elif pick in ("min_y", "max_y"):
+            y_at = _y_at_x(line, x_ref)
+            if y_at is None:
+                continue
+            val = float(y_at)
+            if best_val is None or (pick == "min_y" and val < best_val) or (
+                pick == "max_y" and val > best_val
+            ):
+                best_val = val
+                best_line = line
+                best_meta = {
+                    "theta_deg": float(math.degrees(angle)),
+                    "length": float(length),
+                    "support": float(support) if support is not None else None,
+                    "line_id": lid,
+                    "score": float(score),
+                }
+    return best_line, best_meta
+
+
+def _complete_corners_from_lines(
+    ordered_lb_rb_rt_lt: np.ndarray,
+    lines_left: list[Tuple[float, float, float, float]],
+    lines_bottom: list[Tuple[float, float, float, float]],
+    floor_bbox: Tuple[int, int, int, int],
+    img_w: int,
+    img_h: int,
+    line_mask: Optional[np.ndarray] = None,
+    line_ids_left: Optional[Sequence[Optional[int]]] = None,
+    line_ids_bottom: Optional[Sequence[Optional[int]]] = None,
+    component_id: Optional[int] = None,
+) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+    ordered = np.asarray(ordered_lb_rb_rt_lt, dtype=np.float32).reshape(4, 2)
+    x0, y0, x1, y1 = [float(v) for v in floor_bbox]
+    y_ref = float(y1 - 1.0)
+    x_ref = float(0.5 * (x0 + x1))
+    sideline_angle = _mean_angle_segments(lines_left)
+    baseline_angle = _mean_angle_segments(lines_bottom)
+    min_len = 0.06 * float(min(img_w, img_h))
+    left_line, left_meta = _pick_rep_line(
+        lines_left,
+        y_ref=y_ref,
+        x_ref=x_ref,
+        pick="min_x",
+        angle_ref=sideline_angle,
+        max_angle_deg=15.0,
+        min_len=min_len,
+        line_mask=line_mask,
+        line_ids=line_ids_left,
+    )
+    right_line, right_meta = _pick_rep_line(
+        lines_left,
+        y_ref=y_ref,
+        x_ref=x_ref,
+        pick="max_x",
+        angle_ref=sideline_angle,
+        max_angle_deg=15.0,
+        min_len=min_len,
+        line_mask=line_mask,
+        line_ids=line_ids_left,
+    )
+    bottom_line, bottom_meta = _pick_rep_line(
+        lines_bottom,
+        y_ref=y_ref,
+        x_ref=x_ref,
+        pick="max_y",
+        angle_ref=baseline_angle,
+        max_angle_deg=15.0,
+        min_len=min_len,
+        line_mask=line_mask,
+        line_ids=line_ids_bottom,
+    )
+    top_line, top_meta = _pick_rep_line(
+        lines_bottom,
+        y_ref=y_ref,
+        x_ref=x_ref,
+        pick="min_y",
+        angle_ref=baseline_angle,
+        max_angle_deg=15.0,
+        min_len=min_len,
+        line_mask=line_mask,
+        line_ids=line_ids_bottom,
+    )
+    meta: Dict[str, Any] = {
+        "baseline_line": bottom_line,
+        "left_sideline": left_line,
+        "right_sideline": right_line,
+        "top_line": top_line,
+        "baseline_meta": bottom_meta,
+        "left_sideline_meta": left_meta,
+        "right_sideline_meta": right_meta,
+        "top_line_meta": top_meta,
+    }
+    if component_id is not None:
+        meta["component_id"] = int(component_id)
+    if left_line is None or right_line is None or bottom_line is None:
+        return ordered, False, meta
+    lb = _intersect_lines(left_line, bottom_line)
+    rb = _intersect_lines(right_line, bottom_line)
+    if lb is None or rb is None:
+        return ordered, False, meta
+    if float(lb[0]) > float(rb[0]):
+        lb, rb = rb, lb
+    completed = ordered.copy()
+    completed[0] = lb
+    completed[1] = rb
+    if top_line is not None:
+        top_ok = True
+        if top_meta:
+            if top_meta.get("length") is not None and float(top_meta["length"]) < min_len:
+                top_ok = False
+            if top_meta.get("support") is not None and float(top_meta["support"]) < 0.2:
+                top_ok = False
+        if not top_ok:
+            return completed, True, meta
+        lt = _intersect_lines(left_line, top_line)
+        rt = _intersect_lines(right_line, top_line)
+        if lt is not None and rt is not None:
+            if float(lt[0]) > float(rt[0]):
+                lt, rt = rt, lt
+            completed[2] = rt
+            completed[3] = lt
+            meta["completed_top"] = True
+    return completed, True, meta
 
 
 def _estimate_vanishing_point(
@@ -212,8 +2776,8 @@ def _dist_points_to_segments(points: np.ndarray, segs: np.ndarray) -> np.ndarray
 def _area_ratio_and_penalty(
     corners_uv: np.ndarray,
     floor_bbox: Tuple[int, int, int, int],
-    min_ratio: float = 0.15,
-    max_ratio: float = 0.90,
+    min_ratio: float = 0.08,
+    max_ratio: float = 0.65,
 ) -> Tuple[float, float]:
     x1, y1, x2, y2 = floor_bbox
     area_floor = float(max(1, (x2 - x1) * (y2 - y1)))
@@ -269,6 +2833,8 @@ def _residual_vector(
     cover_weight: float = 0.7,
     reg_weight: float = 0.2,
     oob_penalty: float = 6.0,
+    dt_oob: float = 255.0,
+    clamp_max: float = 15.0,
 ) -> np.ndarray:
     H = _p_to_H(p)
     uv = project_points(H, Xw)
@@ -295,9 +2861,10 @@ def _residual_vector(
     u = np.rint(uv[:, 0]).astype(np.int32)
     v = np.rint(uv[:, 1]).astype(np.int32)
     valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    r = np.full((uv.shape[0],), float(oob_penalty), dtype=np.float64)
+    r = np.full((uv.shape[0],), float(dt_oob), dtype=np.float64)
     if np.any(valid):
         r[valid] = dt[v[valid], u[valid]].astype(np.float64)
+    r = np.clip(r, 0.0, float(clamp_max))
     residuals = [np.sqrt(float(dist_weight)) * np.sqrt(weights.astype(np.float64)) * r]
 
     if cover_points is not None and cover_points.size > 0:
@@ -310,6 +2877,8 @@ def _residual_vector(
         area_ratio, penalty_area = _area_ratio_and_penalty(corners_uv, floor_bbox)
         diag = float(np.hypot(w, h))
         penalty_inside = _outside_bbox_penalty(corners_uv, floor_bbox) / float(max(diag, 1.0))
+        penalty_area *= 20.0
+        penalty_inside *= 5.0
         residuals.append(
             np.sqrt(float(reg_weight)) * np.array([penalty_area, penalty_inside], dtype=np.float64)
         )
@@ -336,6 +2905,798 @@ def _huber(residuals: np.ndarray, delta: float) -> np.ndarray:
     out[quad] = 0.5 * (residuals[quad] ** 2)
     out[~quad] = delta * (abs_r[~quad] - 0.5 * delta)
     return out
+
+
+def hough_lines_from_edges(
+    edges: np.ndarray,
+    floor_mask: np.ndarray,
+    min_length_ratio: float = 0.08,
+    threshold: int = 80,
+    max_gap_ratio: float = 0.02,
+) -> list[Tuple[float, float, float, float]]:
+    h, w = edges.shape[:2]
+    min_len = int(max(20, round(float(min(h, w)) * float(min_length_ratio))))
+    max_gap = int(max(5, round(float(min(h, w)) * float(max_gap_ratio))))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold, minLineLength=min_len, maxLineGap=max_gap)
+    if lines is None:
+        return []
+    out = []
+    y_excl = None
+    if floor_mask is not None:
+        ys = np.where(floor_mask > 0)[0]
+        if ys.size > 0:
+            y_top = int(ys.min())
+            y_bot = int(ys.max())
+            y_excl = int(y_top + 0.10 * max(1, (y_bot - y_top)))
+    for x1, y1, x2, y2 in lines[:, 0]:
+        mx = int(round((int(x1) + int(x2)) * 0.5))
+        my = int(round((int(y1) + int(y2)) * 0.5))
+        if mx < 0 or mx >= w or my < 0 or my >= h:
+            continue
+        if floor_mask[my, mx] == 0:
+            continue
+        if y_excl is not None:
+            y_mid = 0.5 * (float(y1) + float(y2))
+            if y_mid < float(y_excl):
+                continue
+        out.append((float(x1), float(y1), float(x2), float(y2)))
+    return out
+
+
+def _order_corners_tl_tr_br_bl(pts_xy: np.ndarray) -> np.ndarray:
+    pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
+    sums = pts[:, 0] + pts[:, 1]
+    diffs = pts[:, 0] - pts[:, 1]
+    tl = pts[np.argmin(sums)]
+    br = pts[np.argmax(sums)]
+    tr = pts[np.argmin(diffs)]
+    bl = pts[np.argmax(diffs)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+def _draw_model_lines(image: np.ndarray, H: np.ndarray, color: Tuple[int, int, int]) -> np.ndarray:
+    out = image.copy()
+    for ln in get_bwf_lines():
+        pts = np.array([ln.p1, ln.p2], dtype=np.float32)
+        uv = project_points(H, pts)
+        if not np.all(np.isfinite(uv)):
+            continue
+        p1 = (int(round(float(uv[0, 0]))), int(round(float(uv[0, 1]))))
+        p2 = (int(round(float(uv[1, 0]))), int(round(float(uv[1, 1]))))
+        cv2.line(out, p1, p2, color, 2)
+    return out
+
+
+def _merge_lines_by_rho(
+    segments: list[Tuple[float, float, float, float]],
+    support_mask: np.ndarray,
+    rho_bin: float = 20.0,
+    top_n: int = 10,
+) -> list[Tuple[Tuple[float, float, float], float]]:
+    if not segments:
+        return []
+    bins: Dict[int, Dict[str, float]] = {}
+    for seg in segments:
+        x1, y1, x2, y2 = seg
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        if length <= 1e-3:
+            continue
+        support = _line_support(seg, support_mask)
+        weight = float(length * (0.5 + 0.5 * support))
+        line = _line_from_points((x1, y1), (x2, y2))
+        rho = float(line[2])
+        key = int(round(rho / float(rho_bin)))
+        item = bins.get(key)
+        if item is None:
+            bins[key] = {
+                "w": weight,
+                "a": weight * line[0],
+                "b": weight * line[1],
+                "c": weight * line[2],
+            }
+        else:
+            item["w"] += weight
+            item["a"] += weight * line[0]
+            item["b"] += weight * line[1]
+            item["c"] += weight * line[2]
+    merged: list[Tuple[Tuple[float, float, float], float]] = []
+    for item in bins.values():
+        wsum = float(item["w"])
+        if wsum <= 1e-6:
+            continue
+        a = float(item["a"]) / wsum
+        b = float(item["b"]) / wsum
+        c = float(item["c"]) / wsum
+        norm = math.hypot(a, b)
+        if norm <= 1e-6:
+            continue
+        a /= norm
+        b /= norm
+        c /= norm
+        merged.append(((a, b, c), wsum))
+    merged.sort(key=lambda item: item[1], reverse=True)
+    return merged[: max(2, int(top_n))]
+
+
+def _fit_court_homography_from_raw_floor_debug(
+    white_mask_raw_floor: np.ndarray,
+    frame_shape: Tuple[int, int, int] | Tuple[int, int],
+    floor_roi_mask: Optional[np.ndarray] = None,
+    white_mask_raw_floor_noblob: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any], Dict[str, Optional[np.ndarray]]]:
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    rng = np.random.default_rng(0)
+
+    # ---- raw_floor Hough tuning (env-configurable) ----
+    raw_hough_threshold = _RAW_HOUGH_THRESHOLD
+    raw_hough_minlen_ratio = _RAW_HOUGH_MINLEN_RT
+    raw_seg_minlen_px = _RAW_SEG_MINLEN_PX
+    raw_seg_max_keep = _RAW_SEG_MAX_KEEP
+
+    def _run_hough_and_filter(edge_map_: np.ndarray, floor_roi_mask_: np.ndarray):
+        # Tighten ROI for raw-floor Hough to avoid wall/ceiling/border edges dominating.
+        hough_roi_mask = floor_roi_mask_.copy()
+        top_cut = int(h * float(os.getenv("BADC_RAW_FLOOR_HOUGH_TOP_CUT", "0.18")))
+        border = int(w * float(os.getenv("BADC_RAW_FLOOR_HOUGH_BORDER", "0.03")))
+        if top_cut > 0:
+            hough_roi_mask[:top_cut, :] = 0
+        if border > 0:
+            hough_roi_mask[:, :border] = 0
+            hough_roi_mask[:, (w - border):] = 0
+        erode_k = int(os.getenv("BADC_RAW_FLOOR_HOUGH_ERODE", "5"))
+        if erode_k > 0:
+            k = np.ones((erode_k, erode_k), np.uint8)
+            hough_roi_mask = cv2.erode(hough_roi_mask, k, iterations=1)
+
+        segs = hough_lines_from_edges(
+            edge_map_,
+            hough_roi_mask,
+            min_length_ratio=raw_hough_minlen_ratio,
+            threshold=raw_hough_threshold,
+        )
+        before = len(segs)
+        segs = _filter_segments_minlen(segs, raw_seg_minlen_px, max_keep=raw_seg_max_keep)
+        after = len(segs)
+        return segs, before, after
+    # -----------------------------------------------
+
+    if floor_roi_mask is None:
+        floor_roi_mask = np.ones((h, w), dtype=np.uint8) * 255
+    mask_input = white_mask_raw_floor
+    mask_thin, edge_map, band, blob_mask = preprocess_raw_floor(mask_input, floor_roi_mask)
+    obs = (mask_thin > 0).astype(np.uint8)
+    dt = cv2.distanceTransform(1 - obs, cv2.DIST_L2, 3)
+    dt_vis = cv2.normalize(dt, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    dt_p90 = float(np.percentile(dt, 90)) if dt.size > 0 else 0.0
+    dt_oob = float(max(dt_p90, 15.0))
+
+    segments, seg_before0, seg_after0 = _run_hough_and_filter(edge_map, floor_roi_mask)
+    _, _, floor_bbox = _white_mask_stats(floor_roi_mask)
+    floor_y_cut = int(floor_bbox[1])
+    if floor_y_cut is not None:
+        y0 = max(int(floor_y_cut) - 2, 0)
+        y1 = min(int(floor_y_cut) + 18, edge_map.shape[0])
+        edge_map[y0:y1, :] = 0
+        segments, seg_before1, seg_after1 = _run_hough_and_filter(edge_map, floor_roi_mask)
+    angles_pair = _dominant_angles_from_segments(segments)
+    if blob_mask is not None and angles_pair is not None:
+        ang_a, ang_b = angles_pair
+        edge_map = _bridge_edges_across_hole(
+            edge_map,
+            blob_mask,
+            [math.degrees(ang_a), math.degrees(ang_b)],
+            length=41,
+            thickness=3,
+        )
+        segments, seg_before2, seg_after2 = _run_hough_and_filter(edge_map, floor_roi_mask)
+    angles = []
+    lengths = []
+    centers_y = []
+    segments_filtered = []
+    for x1, y1, x2, y2 in segments:
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        segments_filtered.append((x1, y1, x2, y2))
+        ang = math.atan2(y2 - y1, x2 - x1)
+        ang = float(np.mod(ang, math.pi))
+        angles.append(ang)
+        lengths.append(length)
+        centers_y.append(0.5 * (float(y1) + float(y2)))
+    segments = segments_filtered
+    metrics: Dict[str, Any] = {
+        "raw_floor_num_segments": int(len(segments)),
+        "raw_floor_hough_threshold": int(raw_hough_threshold),
+        "raw_floor_hough_minlen_ratio": float(raw_hough_minlen_ratio),
+        "raw_floor_seg_minlen_px": float(raw_seg_minlen_px),
+        "raw_floor_seg_max_keep": int(raw_seg_max_keep),
+        "raw_floor_num_segments_before_minlen_0": int(locals().get("seg_before0", -1)),
+        "raw_floor_num_segments_after_minlen_0": int(locals().get("seg_after0", -1)),
+        "raw_floor_num_segments_before_minlen_1": int(locals().get("seg_before1", -1)),
+        "raw_floor_num_segments_after_minlen_1": int(locals().get("seg_after1", -1)),
+        "raw_floor_num_segments_before_minlen_2": int(locals().get("seg_before2", -1)),
+        "raw_floor_num_segments_after_minlen_2": int(locals().get("seg_after2", -1)),
+        "raw_floor_bright_band_removed": 1 if band is not None else 0,
+        "raw_floor_bright_band_y1": int(band[0]) if band is not None else None,
+        "raw_floor_bright_band_y2": int(band[1]) if band is not None else None,
+        "raw_floor_bridge_used": 1 if blob_mask is not None and angles_pair is not None else 0,
+    }
+    if not angles:
+        return (
+            None,
+            metrics,
+            {
+                "dt": dt_vis,
+                "hough_lines_a": None,
+                "hough_lines_b": None,
+                "overlay_raw": None,
+                "overlay_top5": None,
+                "preprocessed": mask_thin,
+                "edges": edge_map,
+            },
+        )
+    angles_arr = np.array(angles, dtype=np.float32)
+    weights = np.array(lengths, dtype=np.float32)
+    feats = np.stack([np.cos(2.0 * angles_arr), np.sin(2.0 * angles_arr)], axis=1)
+    idx0 = int(np.argmax(weights))
+    c1 = feats[idx0]
+    dists = np.sum((feats - c1) ** 2, axis=1)
+    idx1 = int(np.argmax(dists))
+    c2 = feats[idx1]
+    for _ in range(10):
+        d1 = np.sum((feats - c1) ** 2, axis=1)
+        d2 = np.sum((feats - c2) ** 2, axis=1)
+        assign_a = d1 <= d2
+        if not np.any(assign_a) or np.all(assign_a):
+            break
+        w_a = weights[assign_a][:, None]
+        w_b = weights[~assign_a][:, None]
+        c1 = np.sum(feats[assign_a] * w_a, axis=0) / max(np.sum(w_a), 1e-6)
+        c2 = np.sum(feats[~assign_a] * w_b, axis=0) / max(np.sum(w_b), 1e-6)
+
+    # --- PATCH START: stabilize A/B split + FIX top_k truncation bug ---
+    top_k = 40
+
+    def _take_topk(segs_in, scores_in, k):
+        """Take top-k segments but keep geometric coverage.
+
+        A pure top-k by score tends to keep multiple very similar segments on the same sideline
+        and can drop the weaker-but-critical opposite sideline / baseline, which collapses the fit.
+        This version ensures we keep both x-extremes and a few per x-bin before filling by score.
+        """
+        if len(segs_in) == 0:
+            return []
+        kk = min(int(k), int(len(segs_in)))
+        scores = np.asarray(scores_in, dtype=np.float32)
+        xs = np.asarray([(float(s[0]) + float(s[2])) * 0.5 for s in segs_in], dtype=np.float32)
+
+        order = np.argsort(scores)[::-1]
+        picked = []
+        picked_set: set[int] = set()
+
+        def _add(i: int) -> None:
+            if i not in picked_set:
+                picked.append(i)
+                picked_set.add(i)
+
+        _add(int(order[0]))
+        _add(int(order[int(np.argmin(xs[order]))]))
+        _add(int(order[int(np.argmax(xs[order]))]))
+
+        xmin, xmax = float(xs.min()), float(xs.max())
+        if xmax - xmin > 1e-3:
+            nb = 4
+            per_bin = max(1, kk // (nb * 2))
+            for b in range(nb):
+                lo = xmin + (xmax - xmin) * (b / nb)
+                hi = xmin + (xmax - xmin) * ((b + 1) / nb)
+                cand = [int(i) for i in order if xs[int(i)] >= lo and xs[int(i)] < hi]
+                for i in cand[:per_bin]:
+                    _add(i)
+
+        for i in order:
+            _add(int(i))
+            if len(picked) >= kk:
+                break
+
+        return [segs_in[i] for i in picked[:kk]]
+
+    # Prefer dominant-angle split when angles are well separated
+    use_dom_split = False
+    if angles_pair is not None:
+        ang0, ang1 = float(angles_pair[0]), float(angles_pair[1])
+        if _angle_distance(ang0, ang1) > math.radians(35.0):
+            use_dom_split = True
+
+    if not use_dom_split:
+        assign_a = np.sum((feats - c1) ** 2, axis=1) <= np.sum((feats - c2) ** 2, axis=1)
+    else:
+        ang0, ang1 = float(angles_pair[0]), float(angles_pair[1])
+        d0 = np.array([_angle_distance(float(a), ang0) for a in angles], dtype=np.float32)
+        d1 = np.array([_angle_distance(float(a), ang1) for a in angles], dtype=np.float32)
+        assign_a = d0 <= d1
+
+    segs_arr = np.array(segments, dtype=np.float32)
+    assign_a = np.array(assign_a, dtype=bool)
+    lengths_arr = np.array(lengths, dtype=np.float32)
+    centers_y_arr = np.array(centers_y, dtype=np.float32)
+    floor_y0 = int(floor_bbox[1])
+    pos_weight = np.array([_segment_y_weight(cy, floor_y0, h, gamma=2.5) for cy in centers_y_arr], dtype=np.float32)
+    score_all = lengths_arr * (0.7 + 0.3 * pos_weight)
+
+    seg_a = segs_arr[assign_a].tolist()
+    seg_b = segs_arr[~assign_a].tolist()
+    score_a = score_all[assign_a]
+    score_b = score_all[~assign_a]
+
+    seg_a = _take_topk(seg_a, score_a, top_k)
+    seg_b = _take_topk(seg_b, score_b, top_k)
+    metrics["raw_floor_num_segments_a"] = int(len(seg_a))
+    metrics["raw_floor_num_segments_b"] = int(len(seg_b))
+    # --- PATCH END ---
+
+    hough_base = cv2.cvtColor(white_mask_raw_floor, cv2.COLOR_GRAY2BGR)
+    hough_a = hough_base.copy()
+    hough_b = hough_base.copy()
+    hough_lines = hough_base.copy()
+    for x1, y1, x2, y2 in seg_a:
+        cv2.line(hough_a, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+        cv2.line(hough_lines, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+    for x1, y1, x2, y2 in seg_b:
+        cv2.line(hough_b, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+        cv2.line(hough_lines, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+
+    lines_a = _merge_lines_by_rho(seg_a, white_mask_raw_floor, rho_bin=20.0, top_n=12)
+    lines_b = _merge_lines_by_rho(seg_b, white_mask_raw_floor, rho_bin=20.0, top_n=12)
+    metrics["raw_floor_num_lines_a"] = int(len(lines_a))
+    metrics["raw_floor_num_lines_b"] = int(len(lines_b))
+    if len(lines_a) < 2 or len(lines_b) < 2:
+        return (
+            None,
+            metrics,
+            {
+                "dt": dt_vis,
+                "hough_lines": hough_lines,
+                "hough_lines_a": hough_a,
+                "hough_lines_b": hough_b,
+                "overlay_raw": None,
+                "overlay_top5": None,
+                "preprocessed": mask_thin,
+                "edges": edge_map,
+            },
+        )
+
+    model_cfgs = [
+        ("outer", np.array([[0.0, 13.40], [6.10, 13.40], [6.10, 0.0], [0.0, 0.0]], dtype=np.float32)),
+        ("singles", np.array([[0.46, 13.40], [5.64, 13.40], [5.64, 0.0], [0.46, 0.0]], dtype=np.float32)),
+        ("service_near", np.array([[0.0, 4.72], [6.10, 4.72], [6.10, 0.76], [0.0, 0.76]], dtype=np.float32)),
+    ]
+
+    Xw_full, w_full, _ = sample_model_points(points_per_meter=25.0, min_weight=0.3)
+    best_H = None
+    best_score = float("-inf")
+    best_cfg = None
+    best_oob = 0
+    best_mixer_parts: Optional[Dict[str, float]] = None
+    best_area_ratio_img: Optional[float] = None
+    best_ymax_ratio: Optional[float] = None
+    best_bottom_support: Optional[float] = None
+    num_quads = 0
+    num_scored = 0
+    rejects = {
+        "parallel": 0,
+        "area": 0,
+        "convex": 0,
+        "inside": 0,
+        "height": 0,
+        "bottom": 0,
+        "roi_bottom": 0,
+        "thin_penalty": 0,
+        "area_too_small": 0,
+        "bbox_w_too_small": 0,
+        "bbox_h_too_small": 0,
+        "min_edge_too_small": 0,
+        "bottom_y_too_high": 0,
+        "bottom_endpoints_outside_floor": 0,
+        "bottom_endpoints_too_high": 0,
+        "top_endpoints_too_low": 0,
+        "area_ratio_low": 0,
+        "ymax_ratio_low": 0,
+        "degenerate_bbox": 0,
+        "degenerate_min_edge": 0,
+        "raw_floor_reject_small_bbox": 0,
+        "raw_floor_reject_vp_close": 0,
+        "corners_in_image_low": 0,
+        "bottom_corners_oob": 0,
+        "bottom_corners_outside_floor_bbox": 0,
+        "inlier_ratio_low": 0,
+        "cover_ratio_low": 0,
+        "oob_frac_high": 0,
+    }
+    img_area = float(h * w)
+    roi_area = float(np.count_nonzero(floor_roi_mask)) or img_area
+    min_thin_ratio = 0.0
+    top5: list[Tuple[float, np.ndarray, str]] = []
+    top3_main: list[Tuple[float, float, float, float]] = []
+    relaxed_pass = 0
+    vp_a = _estimate_vanishing_point([ln[0] for ln in lines_a], rng) if lines_a else None
+    vp_b = _estimate_vanishing_point([ln[0] for ln in lines_b], rng) if lines_b else None
+    # --- Hard constraints (configurable) ---
+    min_area_ratio_hard = float(os.getenv("BADC_FIT_MIN_AREA_RATIO", "0.05"))
+    min_ymax_ratio_hard = float(os.getenv("BADC_FIT_MIN_YMAX_RATIO", "0.70"))
+    min_quad_w_hard = float(os.getenv("BADC_FIT_MIN_QUAD_W", "220"))
+    min_quad_h_hard = float(os.getenv("BADC_FIT_MIN_QUAD_H", "160"))
+    min_corners_in_image_hard = int(os.getenv("BADC_FIT_MIN_CORNERS_IN_IMAGE", "3"))
+    min_bottom_corners_in_image = int(os.getenv("BADC_FIT_MIN_BOTTOM_CORNERS_IN_IMAGE", "2"))
+    require_bottom_in_floor = int(os.getenv("BADC_FIT_REQUIRE_BOTTOM_IN_FLOOR", "1")) == 1
+    bottom_in_floor_margin = int(os.getenv("BADC_FIT_BOTTOM_IN_FLOOR_MARGIN", "8"))
+    min_inlier_ratio_hard = float(os.getenv("BADC_FIT_MIN_INLIER_RATIO", "0.25"))
+    min_cover_ratio_hard = float(os.getenv("BADC_FIT_MIN_COVER_RATIO", "0.22"))
+    max_oob_frac_hard = float(os.getenv("BADC_FIT_MAX_OOB_FRAC", "0.70"))
+    allow_small_quads = int(os.getenv("BADC_FIT_ALLOW_SMALL_QUADS", "0")) == 1
+    vp_min_dist = float(os.getenv("BADC_FIT_MIN_VP_DIST", "0.0"))  # 0 disables
+
+    def _vp_dist_ok(vp_xy: Optional[np.ndarray], w_: int, h_: int) -> bool:
+        if vp_xy is None:
+            return True
+        if not np.isfinite(vp_xy).all():
+            return False
+        cx, cy = 0.5 * float(w_), 0.5 * float(h_)
+        d = float(math.hypot(float(vp_xy[0]) - cx, float(vp_xy[1]) - cy))
+        return d >= vp_min_dist * float(max(w_, h_))
+    for relax_scale in (1.0, 0.7):
+        if relax_scale < 1.0:
+            relaxed_pass = 1
+        best_H = None
+        best_score = float("-inf")
+        best_cfg = None
+        best_oob = 0
+        best_mixer_parts = None
+        best_area_ratio_img = None
+        best_ymax_ratio = None
+        best_bottom_support = None
+        num_scored = 0
+        top5 = []
+        top3_main = []
+        deg_bbox_w = 0.08 * float(w) * float(relax_scale)
+        deg_bbox_h = 0.06 * float(h) * float(relax_scale)
+        deg_edge = 0.05 * float(min(h, w)) * float(relax_scale)
+        for i in range(len(lines_a)):
+            for j in range(i + 1, len(lines_a)):
+                la1 = lines_a[i][0]
+                la2 = lines_a[j][0]
+                for m in range(len(lines_b)):
+                    for n in range(m + 1, len(lines_b)):
+                        lb1 = lines_b[m][0]
+                        lb2 = lines_b[n][0]
+                        num_quads += 1
+                        quad = _intersections_from_pairs((la1, la2), (lb1, lb2))
+                        if quad is None:
+                            rejects["parallel"] += 1
+                            continue
+                        img_pts = _order_corners_tl_tr_br_bl(quad)
+                        if not _is_convex_quad(img_pts):
+                            rejects["convex"] += 1
+                            continue
+                        if _quad_area(img_pts) < 1.0:
+                            rejects["area"] += 1
+                            continue
+                        ordered = _order_corners_lb_rb_rt_lt(img_pts)
+                        # --- Visibility gates (apply to both strict and relaxed) ---
+                        corners_in_img = int(
+                            np.sum(
+                                (ordered[:, 0] >= 0.0)
+                                & (ordered[:, 0] <= float(w - 1))
+                                & (ordered[:, 1] >= 0.0)
+                                & (ordered[:, 1] <= float(h - 1))
+                            )
+                        )
+                        if corners_in_img < min_corners_in_image_hard:
+                            rejects["corners_in_image_low"] += 1
+                            continue
+                        bottom = ordered[:2, :]
+                        bottom_in_img = int(
+                            np.sum(
+                                (bottom[:, 0] >= 0.0)
+                                & (bottom[:, 0] <= float(w - 1))
+                                & (bottom[:, 1] >= 0.0)
+                                & (bottom[:, 1] <= float(h - 1))
+                            )
+                        )
+                        if bottom_in_img < min_bottom_corners_in_image:
+                            rejects["bottom_corners_oob"] += 1
+                            continue
+                        if require_bottom_in_floor:
+                            fx1, fy1, fx2, fy2 = floor_bbox
+                            mrg = float(bottom_in_floor_margin)
+                            in_floor = (
+                                (bottom[:, 0] >= float(fx1) - mrg)
+                                & (bottom[:, 0] <= float(fx2) + mrg)
+                                & (bottom[:, 1] >= float(fy1) - mrg)
+                                & (bottom[:, 1] <= float(fy2) + mrg)
+                            )
+                            if int(np.sum(in_floor)) < 2:
+                                rejects["bottom_corners_outside_floor_bbox"] += 1
+                                continue
+                        ok, why_gate, _gate_metrics = _passes_geom_gates(ordered, floor_bbox)
+                        if not ok:
+                            rejects[why_gate] = rejects.get(why_gate, 0) + 1
+                            continue
+                        # Optional VP sanity (soft unless explicitly hardened)
+                        if (not _vp_dist_ok(vp_a, w, h)) or (not _vp_dist_ok(vp_b, w, h)):
+                            rejects["raw_floor_reject_vp_close"] += 1
+                            if relax_scale >= 1.0 and (not allow_small_quads) and vp_min_dist > 0.0:
+                                continue
+                        bbox_w = float(np.max(ordered[:, 0]) - np.min(ordered[:, 0]))
+                        bbox_h = float(np.max(ordered[:, 1]) - np.min(ordered[:, 1]))
+                        min_edge = float(np.min(_quad_edges(ordered)))
+                        if bbox_w < deg_bbox_w or bbox_h < deg_bbox_h:
+                            rejects["degenerate_bbox"] += 1
+                            continue
+                        if min_edge < deg_edge:
+                            rejects["degenerate_min_edge"] += 1
+                            continue
+                        quad_clip = ordered.copy()
+                        quad_clip[:, 0] = np.clip(quad_clip[:, 0], 0.0, float(w - 1))
+                        quad_clip[:, 1] = np.clip(quad_clip[:, 1], 0.0, float(h - 1))
+                        quad_area = float(_quad_area(quad_clip))
+                        area_ratio_img = quad_area / float(max(img_area, 1.0))
+                        y_vals = ordered[:, 1]
+                        ymax_ratio = max(0.0, min(1.0, float(np.max(y_vals)) / float(max(h - 1, 1))))
+                        ymean_ratio = max(0.0, min(1.0, float(np.mean(y_vals)) / float(max(h - 1, 1))))
+                        quad_w = float(np.max(ordered[:, 0]) - np.min(ordered[:, 0]))
+                        quad_h = float(np.max(ordered[:, 1]) - np.min(ordered[:, 1]))
+
+                        # --- HARD REJECT in strict pass ---
+                        if relax_scale >= 1.0 and (not allow_small_quads):
+                            if area_ratio_img < min_area_ratio_hard:
+                                rejects["area_ratio_low"] += 1
+                                continue
+                            if ymax_ratio < min_ymax_ratio_hard:
+                                rejects["ymax_ratio_low"] += 1
+                                continue
+                            if quad_w < min_quad_w_hard or quad_h < min_quad_h_hard:
+                                rejects["raw_floor_reject_small_bbox"] += 1
+                                continue
+                        else:
+                            # relaxed pass: keep soft counters for area/ymax,
+                            # BUT still hard-reject tiny quads unless explicitly allowed
+                            if area_ratio_img < min_area_ratio_hard:
+                                rejects["area_ratio_low"] += 1
+                            if ymax_ratio < min_ymax_ratio_hard:
+                                rejects["ymax_ratio_low"] += 1
+                            if quad_w < min_quad_w_hard or quad_h < min_quad_h_hard:
+                                rejects["raw_floor_reject_small_bbox"] += 1
+                                if not allow_small_quads:
+                                    continue
+                        thin_penalty = 0.0
+                        penalty = 0.0
+                        for cfg_name, model_pts in model_cfgs:
+                            H = cv2.getPerspectiveTransform(model_pts, img_pts.astype(np.float32))
+                            if not np.all(np.isfinite(H)):
+                                rejects["parallel"] += 1
+                                continue
+                            loss_info = _compute_loss_terms(
+                                H,
+                                dt=dt,
+                                Xw=Xw_full,
+                                weights=w_full,
+                                cover_points=None,
+                                floor_bbox=floor_bbox,
+                                tau_px=5.0,
+                                dt_oob=dt_oob,
+                            )
+                            # Fit-quality gates (strict pass only; relaxed relies on score penalties)
+                            if relax_scale >= 1.0 and (not allow_small_quads):
+                                inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
+                                cover_ratio = float(loss_info.get("cover_ratio", 0.0))
+                                dt_oob = int(loss_info.get("dt_oob_count", 0))
+                                nsamp = int(loss_info.get("num_samples", 0))
+                                oob_frac = float(dt_oob) / float(max(nsamp, 1))
+                                if inlier_ratio < min_inlier_ratio_hard:
+                                    rejects["inlier_ratio_low"] += 1
+                                    continue
+                                if cover_ratio < min_cover_ratio_hard:
+                                    rejects["cover_ratio_low"] += 1
+                                    continue
+                                if oob_frac > max_oob_frac_hard:
+                                    rejects["oob_frac_high"] += 1
+                                    continue
+                            # Fit-quality gates (strict pass only; relaxed relies on score penalties)
+                            if relax_scale >= 1.0 and (not allow_small_quads):
+                                inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
+                                cover_ratio = float(loss_info.get("cover_ratio", 0.0))
+                                dt_oob = int(loss_info.get("dt_oob_count", 0))
+                                nsamp = int(loss_info.get("num_samples", 0))
+                                oob_frac = float(dt_oob) / float(max(nsamp, 1))
+                                if inlier_ratio < min_inlier_ratio_hard:
+                                    rejects["inlier_ratio_low"] += 1
+                                    continue
+                                if cover_ratio < min_cover_ratio_hard:
+                                    rejects["cover_ratio_low"] += 1
+                                    continue
+                                if oob_frac > max_oob_frac_hard:
+                                    rejects["oob_frac_high"] += 1
+                                    continue
+                            score_val, mixer_parts = _mixer_score_candidate(
+                                ordered,
+                                loss_info,
+                                floor_bbox,
+                                vp_long=vp_a,
+                                vp_short=vp_b,
+                            )
+                            score_val = float(score_val + penalty + thin_penalty)
+                            bottom_support = _bottom_support_from_loss(loss_info, ymax_ratio, h, tau_px=5.0)
+                            score_final = float(
+                                score_val
+                                + 6.0 * math.log(max(area_ratio_img, 1e-6))
+                                + 3.0 * ymean_ratio
+                                + 2.0 * ymax_ratio
+                                + 4.0 * bottom_support
+                            )
+                            num_scored += 1
+                            if score_final > best_score:
+                                best_score = score_final
+                                best_H = H
+                                best_cfg = cfg_name
+                                best_oob = int(loss_info.get("dt_oob_count", 0))
+                                best_mixer_parts = mixer_parts
+                                best_area_ratio_img = float(area_ratio_img)
+                                best_ymax_ratio = float(ymax_ratio)
+                                best_bottom_support = float(bottom_support)
+                            top5.append((score_final, img_pts.copy(), cfg_name))
+                            top3_main.append((score_final, area_ratio_img, ymax_ratio, bottom_support))
+        if best_H is not None:
+            break
+    top5.sort(key=lambda item: item[0], reverse=True)
+    top5 = top5[:5]
+    top3_main.sort(key=lambda item: item[0], reverse=True)
+    top3_main = top3_main[:3]
+
+    metrics.update(
+        {
+            "raw_floor_num_quads_generated": int(num_quads),
+            "raw_floor_num_quads_scored": int(num_scored),
+            "raw_floor_reject_parallel": int(rejects["parallel"]),
+            "raw_floor_reject_area": int(rejects["area"]),
+            "raw_floor_reject_convex": int(rejects["convex"]),
+            "raw_floor_reject_inside": int(rejects["inside"]),
+            "raw_floor_reject_height": int(rejects["height"]),
+            "raw_floor_reject_bottom": int(rejects["bottom"]),
+            "raw_floor_reject_bottom_corners": int(rejects["roi_bottom"]),
+            "raw_floor_thin_penalty_count": int(rejects["thin_penalty"]),
+            "raw_floor_reject_thin": int(rejects["thin_penalty"]),
+            "raw_floor_reject_area_too_small": int(rejects.get("area_too_small", 0)),
+            "raw_floor_reject_bbox_w_too_small": int(rejects.get("bbox_w_too_small", 0)),
+            "raw_floor_reject_bbox_h_too_small": int(rejects.get("bbox_h_too_small", 0)),
+            "raw_floor_reject_min_edge_too_small": int(rejects.get("min_edge_too_small", 0)),
+            "raw_floor_reject_bottom_y_too_high": int(rejects.get("bottom_y_too_high", 0)),
+            "raw_floor_reject_bottom_endpoints_outside_floor": int(rejects.get("bottom_endpoints_outside_floor", 0)),
+            "raw_floor_reject_bottom_endpoints_too_high": int(rejects.get("bottom_endpoints_too_high", 0)),
+            "raw_floor_reject_top_endpoints_too_low": int(rejects.get("top_endpoints_too_low", 0)),
+            "raw_floor_reject_area_ratio_low": int(rejects.get("area_ratio_low", 0)),
+            "raw_floor_reject_ymax_ratio_low": int(rejects.get("ymax_ratio_low", 0)),
+            "raw_floor_reject_degenerate_bbox": int(rejects.get("degenerate_bbox", 0)),
+            "raw_floor_reject_degenerate_min_edge": int(rejects.get("degenerate_min_edge", 0)),
+            "raw_floor_reject_corners_in_image_low": int(rejects.get("corners_in_image_low", 0)),
+            "raw_floor_reject_bottom_corners_oob": int(rejects.get("bottom_corners_oob", 0)),
+            "raw_floor_reject_bottom_corners_outside_floor_bbox": int(
+                rejects.get("bottom_corners_outside_floor_bbox", 0)
+            ),
+            "raw_floor_reject_inlier_ratio_low": int(rejects.get("inlier_ratio_low", 0)),
+            "raw_floor_reject_cover_ratio_low": int(rejects.get("cover_ratio_low", 0)),
+            "raw_floor_reject_oob_frac_high": int(rejects.get("oob_frac_high", 0)),
+            "raw_floor_relaxed_pass": int(relaxed_pass),
+            "raw_floor_gate_min_corners_in_image": int(min_corners_in_image_hard),
+            "raw_floor_gate_min_bottom_corners_in_image": int(min_bottom_corners_in_image),
+            "raw_floor_gate_require_bottom_in_floor": bool(require_bottom_in_floor),
+            "raw_floor_gate_bottom_in_floor_margin": int(bottom_in_floor_margin),
+            "raw_floor_gate_min_inlier_ratio": float(min_inlier_ratio_hard),
+            "raw_floor_gate_min_cover_ratio": float(min_cover_ratio_hard),
+            "raw_floor_gate_max_oob_frac": float(max_oob_frac_hard),
+            "raw_floor_best_score": float(best_score) if np.isfinite(best_score) else None,
+            "raw_floor_best_model_config": best_cfg,
+            "raw_floor_oob_points": int(best_oob),
+            "raw_floor_best_mixer": best_mixer_parts if isinstance(best_mixer_parts, dict) else None,
+            "raw_floor_selected_area_ratio": float(best_area_ratio_img)
+            if best_area_ratio_img is not None
+            else None,
+            "raw_floor_selected_ymax_ratio": float(best_ymax_ratio)
+            if best_ymax_ratio is not None
+            else None,
+            "raw_floor_selected_bottom_support": float(best_bottom_support)
+            if best_bottom_support is not None
+            else None,
+            "raw_floor_top5": [
+                {"score": float(score), "model_config": cfg} for score, _, cfg in top5
+            ],
+            "raw_floor_top3_mainfield": [
+                {
+                    "score_final": float(s),
+                    "area_ratio": float(a),
+                    "ymax_ratio": float(y),
+                    "bottom_support": float(b),
+                }
+                for s, a, y, b in top3_main
+            ],
+        }
+    )
+    if best_H is None:
+        return (
+            None,
+            metrics,
+            {
+                "dt": dt_vis,
+                "hough_lines": hough_lines,
+                "hough_lines_a": hough_a,
+                "hough_lines_b": hough_b,
+                "overlay_raw": None,
+                "overlay_top5": None,
+                "preprocessed": mask_thin,
+                "edges": edge_map,
+            },
+        )
+
+    overlay_raw = _draw_model_lines(cv2.cvtColor(white_mask_raw_floor, cv2.COLOR_GRAY2BGR), best_H, (0, 255, 0))
+    overlay_top5 = cv2.cvtColor(white_mask_raw_floor, cv2.COLOR_GRAY2BGR)
+    colors = [(0, 255, 0), (0, 200, 255), (255, 200, 0), (255, 0, 255), (0, 255, 255)]
+    for idx, (score_val, quad_pts, cfg) in enumerate(top5):
+        color = colors[idx % len(colors)]
+        pts = quad_pts.reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(overlay_top5, [pts], True, color, 2)
+        label = f"{idx+1}:{score_val:.2f}"
+        cv2.putText(overlay_top5, label, (int(pts[0][0][0]), int(pts[0][0][1])), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return (
+        best_H,
+        metrics,
+        {
+            "dt": dt_vis,
+            "hough_lines": hough_lines,
+            "hough_lines_a": hough_a,
+            "hough_lines_b": hough_b,
+            "overlay_raw": overlay_raw,
+            "overlay_top5": overlay_top5,
+            "preprocessed": mask_thin,
+            "edges": edge_map,
+        },
+    )
+
+
+def fit_court_homography_from_raw_floor(
+    white_mask_raw_floor: np.ndarray,
+    frame_shape: Tuple[int, int, int] | Tuple[int, int],
+    debug_dir: Optional[str] = None,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    H, metrics, _ = _fit_court_homography_from_raw_floor_debug(white_mask_raw_floor, frame_shape)
+    return H, metrics
+
+
+def _confidence_terms(
+    inlier_ratio: float,
+    cover_ratio: float,
+    p90_dist_px: float,
+    area_ratio: float,
+    a: float = 12.0,
+    b: float = 10.0,
+    c: float = 0.35,
+    d: float = 12.0,
+) -> Dict[str, float]:
+    def _sigmoid(x: float) -> float:
+        return 1.0 / (1.0 + math.exp(-float(x)))
+
+    s_inlier = _sigmoid(float(a) * (float(inlier_ratio) - 0.55))
+    s_cover = _sigmoid(float(b) * (float(cover_ratio) - 0.50))
+    s_p90 = _sigmoid(float(c) * (12.0 - float(p90_dist_px)))
+    s_area = _sigmoid(float(d) * (float(area_ratio) - 0.10)) * _sigmoid(
+        float(d) * (0.95 - float(area_ratio))
+    )
+    conf = float(np.clip(s_inlier * s_cover * s_p90 * s_area, 0.0, 1.0))
+    return {
+        "confidence": conf,
+        "s_inlier": float(s_inlier),
+        "s_cover": float(s_cover),
+        "s_p90": float(s_p90),
+        "s_area": float(s_area),
+    }
 
 
 def compute_fit_metrics(
@@ -396,23 +3757,32 @@ def _compute_loss_terms(
     w_dist: float = 1.0,
     w_cover: float = 0.7,
     w_reg: float = 0.2,
+    dt_oob: float = 255.0,
+    clamp_max: float = 15.0,
 ) -> Dict[str, Any]:
     uv = project_points(H, Xw)
     h, w = dt.shape[:2]
     u = np.rint(uv[:, 0]).astype(np.int32)
     v = np.rint(uv[:, 1]).astype(np.int32)
     valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    r = np.full((uv.shape[0],), 6.0, dtype=np.float32)
+    r = np.zeros((uv.shape[0],), dtype=np.float32)
     if np.any(valid):
         r[valid] = dt[v[valid], u[valid]].astype(np.float32)
-    w_valid = weights.astype(np.float32)
-    huber_vals = _huber(r, float(huber_delta))
-    l_dist = float(np.average(huber_vals, weights=w_valid))
-
+    r_raw = r.copy()
+    r = np.clip(r, 0.0, float(clamp_max))
     num_valid = int(np.count_nonzero(valid))
+    num_oob = int(uv.shape[0] - num_valid)
+    if num_valid > 0:
+        w_valid = weights[valid].astype(np.float32)
+        huber_vals = _huber(r[valid], float(huber_delta))
+        l_dist = float(np.average(huber_vals, weights=w_valid))
+    else:
+        l_dist = float(clamp_max)
+
     inlier_mask = (r < float(tau_px)) & valid
     num_inliers = int(np.count_nonzero(inlier_mask))
     inlier_ratio = float(num_inliers) / float(max(num_valid, 1))
+    cover_ratio = float(inlier_ratio)
     inlier_dists = r[inlier_mask]
     inlier_dist_p90 = float(np.percentile(inlier_dists, 90)) if inlier_dists.size > 0 else None
 
@@ -420,42 +3790,171 @@ def _compute_loss_terms(
     sample_dist_p50 = float(np.percentile(r[valid], 50)) if np.any(valid) else None
     sample_dist_p90 = float(np.percentile(r[valid], 90)) if np.any(valid) else None
     sample_dist_max = float(np.max(r[valid])) if np.any(valid) else None
+    sample_dist_p90_raw = float(np.percentile(r_raw[valid], 90)) if np.any(valid) else None
 
     l_cover = 0.0
     if cover_points is not None and cover_points.size > 0:
         segs = _project_line_segments(H)
         cover_dist = _dist_points_to_segments(cover_points, segs)
+        cover_dist = np.clip(cover_dist, 0.0, float(clamp_max))
         l_cover = float(np.mean(_huber(cover_dist, float(huber_delta))))
 
     corners_uv = project_points(H, get_bwf_corners())
     area_ratio, penalty_area = _area_ratio_and_penalty(corners_uv, floor_bbox)
     diag = float(np.hypot(w, h))
     penalty_inside = _outside_bbox_penalty(corners_uv, floor_bbox) / float(max(diag, 1.0))
+    penalty_area *= 20.0
+    penalty_inside *= 5.0
     l_reg = float(penalty_area + penalty_inside)
+    cover_target = 0.55
+    cover_penalty = max(0.0, float(cover_target) - cover_ratio)
+    cover_penalty_weight = 50.0
 
-    total_loss = float(w_dist * l_dist + w_cover * l_cover + w_reg * l_reg)
+    valid_ratio = float(num_valid) / float(max(uv.shape[0], 1))
+    valid_ratio_penalty = float(1.0 - valid_ratio)
+    valid_ratio_weight = 2.0
+    total_loss = float(
+        w_dist * l_dist
+        + w_cover * l_cover
+        + w_reg * l_reg
+        + cover_penalty_weight * cover_penalty
+        + valid_ratio_weight * valid_ratio_penalty
+    )
     return {
         "loss": total_loss,
         "l_dist": float(l_dist),
         "l_cover": float(l_cover),
         "l_reg": float(l_reg),
+        "valid_ratio": float(valid_ratio),
+        "valid_ratio_penalty": float(valid_ratio_penalty),
         "area_ratio": float(area_ratio),
+        "cover_ratio": float(cover_ratio),
+        "cover_penalty": float(cover_penalty),
         "inlier_ratio": float(inlier_ratio),
         "inlier_dist_p90": inlier_dist_p90,
         "num_inliers": num_inliers,
         "num_valid_samples": num_valid,
+        "dt_oob_count": num_oob,
         "num_samples": int(uv.shape[0]),
         "sample_dist_mean": sample_dist_mean,
         "sample_dist_p50": sample_dist_p50,
         "sample_dist_p90": sample_dist_p90,
         "sample_dist_max": sample_dist_max,
+        "sample_dist_p90_raw": sample_dist_p90_raw,
         "sample_dists": r,
         "sample_uv": uv,
     }
 
 
+def _init_from_line_clusters(
+    horiz_lines: list[LineSeg],
+    vert_lines: list[LineSeg],
+    dt: np.ndarray,
+    Xw: np.ndarray,
+    weights: np.ndarray,
+    cover_points: np.ndarray,
+    floor_bbox: Tuple[int, int, int, int],
+    world_corners: np.ndarray,
+    ratio_ref: float = 13.40 / 6.10,
+    ratio_tol: float = 0.40,
+    top_k: int = 3,
+    min_area_ratio: float = 0.01,
+    dt_oob: float = 255.0,
+    vp_long: Optional[np.ndarray] = None,
+    vp_short: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Optional[Dict[str, Any]]]:
+    if len(horiz_lines) < 2 or len(vert_lines) < 2:
+        return None, None
+    h, w = dt.shape[:2]
+    center = (float(w) * 0.5, float(h) * 0.5)
+    min_sep = 0.05 * float(min(h, w))
+
+    def _select_outer(lines: list[LineSeg]) -> Tuple[list[LineSeg], list[LineSeg]]:
+        scored = [(ln, _line_signed_distance(ln.line, center)) for ln in lines]
+        scored.sort(key=lambda item: item[1])
+        span = max(2, int(top_k) * 2)
+        low_candidates = [ln for ln, _ in scored[:span]]
+        high_candidates = [ln for ln, _ in scored[-span:]]
+        low_candidates.sort(key=lambda ln: float(ln.weight), reverse=True)
+        high_candidates.sort(key=lambda ln: float(ln.weight), reverse=True)
+        low = low_candidates[: max(1, int(top_k))]
+        high = high_candidates[: max(1, int(top_k))]
+        return low, high
+
+    h_low, h_high = _select_outer(horiz_lines)
+    v_low, v_high = _select_outer(vert_lines)
+    if not h_low or not h_high or not v_low or not v_high:
+        return None, None
+
+    min_area = 1.0
+    best_H = None
+    best_info: Optional[Dict[str, Any]] = None
+    best_score = float("inf")
+
+    for h1 in h_low:
+        for h2 in h_high:
+            if h1 is h2:
+                continue
+            d_h1 = _line_signed_distance(h1.line, center)
+            d_h2 = _line_signed_distance(h2.line, center)
+            if abs(d_h1 - d_h2) < min_sep:
+                continue
+            for v1 in v_low:
+                for v2 in v_high:
+                    if v1 is v2:
+                        continue
+                    d_v1 = _line_signed_distance(v1.line, center)
+                    d_v2 = _line_signed_distance(v2.line, center)
+                    if abs(d_v1 - d_v2) < min_sep:
+                        continue
+                    p1 = _intersect_lines(h1.line, v1.line)
+                    p2 = _intersect_lines(h1.line, v2.line)
+                    p3 = _intersect_lines(h2.line, v2.line)
+                    p4 = _intersect_lines(h2.line, v1.line)
+                    if p1 is None or p2 is None or p3 is None or p4 is None:
+                        continue
+                    quad = np.stack([p1, p2, p3, p4], axis=0)
+                    if not np.all(np.isfinite(quad)):
+                        continue
+                    if not _is_convex_quad(quad):
+                        continue
+                    area = _quad_area(quad)
+                    if area < min_area:
+                        continue
+                    ordered = _order_corners_lb_rb_rt_lt(quad)
+                    ok, _gate_reason, gate_metrics = _passes_geom_gates(ordered, floor_bbox)
+                    if not ok:
+                        continue
+                    H = cv2.getPerspectiveTransform(world_corners.astype(np.float32), ordered.astype(np.float32))
+                    if not np.all(np.isfinite(H)):
+                        continue
+                    info = _compute_loss_terms(
+                        H,
+                        dt=dt,
+                        Xw=Xw,
+                        weights=weights,
+                        cover_points=cover_points,
+                        floor_bbox=floor_bbox,
+                        dt_oob=dt_oob,
+                    )
+                    score, mixer_parts = _mixer_score_candidate(
+                        ordered,
+                        info,
+                        floor_bbox,
+                        vp_long=vp_long,
+                        vp_short=vp_short,
+                    )
+                    if score < best_score:
+                        best_score = float(score)
+                        best_H = H
+                        best_info = info
+                        best_info.update(gate_metrics)
+                        best_info.update(mixer_parts)
+    return best_H, best_info
+
 def ransac_init_homography(
     white_mask: np.ndarray,
+    white_mask_raw: np.ndarray,
     dt: np.ndarray,
     world_corners: np.ndarray,
     Xw: np.ndarray,
@@ -465,6 +3964,7 @@ def ransac_init_homography(
     iters: int = 2000,
     tau_px: float = 3.0,
     min_area_ratio: float = 0.01,
+    dt_oob: float = 255.0,
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[Dict[str, Any]]]:
     ys, xs = np.where(white_mask > 0)
@@ -473,35 +3973,76 @@ def ransac_init_homography(
     coords = np.stack([xs, ys], axis=1).astype(np.float32)
     rng = rng or np.random.default_rng()
     h, w = white_mask.shape[:2]
-    min_area = float(h * w) * float(min_area_ratio)
-    best_H = None
+    min_area = 1.0
+    best_H: Optional[np.ndarray] = None
     best_info: Optional[Dict[str, Any]] = None
-    best_score = float("inf")
+    best_score: float = float("inf")
     world = world_corners.astype(np.float32)
 
-    edges = cv2.Canny(white_mask, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180.0, 120)
-    horiz, vert = _split_lines_by_angle(lines)
-    vp_h = _estimate_vanishing_point(horiz, rng)
-    vp_v = _estimate_vanishing_point(vert, rng)
+    x1, y1, x2, y2 = floor_bbox
+    support_mask = np.zeros_like(white_mask_raw)
+    support_mask[y1 : y2 + 1, x1 : x2 + 1] = white_mask_raw[y1 : y2 + 1, x1 : x2 + 1]
+    lsd_lines, num_lsd_raw = _detect_lsd_lines(
+        white_mask,
+        support_mask,
+        floor_bbox,
+        min_length=20.0,
+    )
+    cluster_a, cluster_b, cluster_info = _cluster_lines_by_angle(lsd_lines)
+    if cluster_info.get("cluster_ratio", 0.0) < 0.25:
+        sum_a = float(cluster_info.get("sum_len_a", 0.0))
+        sum_b = float(cluster_info.get("sum_len_b", 0.0))
+        main = cluster_a if sum_a >= sum_b else cluster_b
+        missing_is_a = sum_a < sum_b
+        vp_main = _estimate_vanishing_point([ln.line for ln in main], rng)
+        if isinstance(vp_main, np.ndarray):
+            center = (float(w) * 0.5, float(h) * 0.5)
+            base_angle = math.atan2(center[1] - float(vp_main[1]), center[0] - float(vp_main[0]))
+            base_angle = float(base_angle % math.pi)
+            perp = float((base_angle + math.pi * 0.5) % math.pi)
+            alt = [ln for ln in lsd_lines if _angle_distance(ln.theta, perp) < math.radians(15.0)]
+            if alt:
+                if missing_is_a:
+                    cluster_a = alt
+                else:
+                    cluster_b = alt
+                sum_a = float(np.sum([ln.weight for ln in cluster_a])) if cluster_a else 0.0
+                sum_b = float(np.sum([ln.weight for ln in cluster_b])) if cluster_b else 0.0
+                denom = max(sum_a, sum_b, 1e-6)
+                cluster_info = {
+                    "mean_angle_a": _mean_angle(cluster_a),
+                    "mean_angle_b": _mean_angle(cluster_b),
+                    "sum_len_a": sum_a,
+                    "sum_len_b": sum_b,
+                    "cluster_ratio": float(min(sum_a, sum_b) / denom),
+                }
+    horiz, vert, role_info = _assign_cluster_roles(cluster_a, cluster_b)
 
-    def _sample_from_lines() -> Optional[np.ndarray]:
-        if len(horiz) < 2 or len(vert) < 2:
-            return None
-        h_idx = rng.choice(len(horiz), size=2, replace=False)
-        v_idx = rng.choice(len(vert), size=2, replace=False)
-        h1 = horiz[int(h_idx[0])]
-        h2 = horiz[int(h_idx[1])]
-        v1 = vert[int(v_idx[0])]
-        v2 = vert[int(v_idx[1])]
-        p1 = _intersect_lines(h1, v1)
-        p2 = _intersect_lines(h1, v2)
-        p3 = _intersect_lines(h2, v2)
-        p4 = _intersect_lines(h2, v1)
-        if p1 is None or p2 is None or p3 is None or p4 is None:
-            return None
-        pts = np.stack([p1, p2, p3, p4], axis=0)
-        return pts
+    vp_a = _estimate_vanishing_point([ln.line for ln in cluster_a], rng)
+    vp_b = _estimate_vanishing_point([ln.line for ln in cluster_b], rng)
+    horiz_is_a = horiz is cluster_a
+    vp_short = vp_a if horiz_is_a else vp_b
+    vp_long = vp_b if horiz_is_a else vp_a
+
+    if horiz is not None and vert is not None:
+        H_line, info_line = _init_from_line_clusters(
+            horiz,
+            vert,
+            dt=dt,
+            Xw=Xw,
+            weights=weights,
+            cover_points=cover_points,
+            floor_bbox=floor_bbox,
+            world_corners=world,
+            ratio_ref=13.40 / 6.10,
+            dt_oob=dt_oob,
+            vp_long=vp_long,
+            vp_short=vp_short,
+        )
+        if H_line is not None and info_line is not None:
+            best_H = H_line
+            best_info = info_line
+            best_score = float(info_line.get("mixer_score", info_line.get("loss", float("inf"))))
 
     def _sample_from_quadrants() -> Optional[np.ndarray]:
         h_mid = float(h) * 0.5
@@ -517,43 +4058,67 @@ def ransac_init_homography(
         pts = np.stack([b[rng.integers(0, b.shape[0])] for b in bins], axis=0)
         return pts
 
-    for _ in range(int(iters)):
-        pts = _sample_from_lines()
-        if pts is None:
+    if best_H is None:
+        for _ in range(int(iters)):
             pts = _sample_from_quadrants()
-        if pts is None:
-            idx = rng.choice(coords.shape[0], size=4, replace=False)
-            pts = coords[idx]
-        ordered = _order_corners_lb_rb_rt_lt(pts)
-        if not _is_convex_quad(ordered):
-            continue
-        area = _quad_area(ordered)
-        if area < min_area:
-            continue
-        H = cv2.getPerspectiveTransform(world, ordered.astype(np.float32))
-        if not np.all(np.isfinite(H)):
-            continue
-        info = _compute_loss_terms(
-            H,
-            dt=dt,
-            Xw=Xw,
-            weights=weights,
-            cover_points=cover_points,
-            floor_bbox=floor_bbox,
-            tau_px=tau_px,
-        )
-        score = float(info.get("loss", float("inf")))
-        if score < best_score:
-            best_score = score
-            best_H = H
-            best_info = info
+            if pts is None:
+                idx = rng.choice(coords.shape[0], size=4, replace=False)
+                pts = coords[idx]
+            ordered = _order_corners_lb_rb_rt_lt(pts)
+            if not _is_convex_quad(ordered):
+                continue
+            ok, _gate_reason, gate_metrics = _passes_geom_gates(ordered, floor_bbox)
+            if not ok:
+                continue
+            H = cv2.getPerspectiveTransform(world, ordered.astype(np.float32))
+            if not np.all(np.isfinite(H)):
+                continue
+            info = _compute_loss_terms(
+                H,
+                dt=dt,
+                Xw=Xw,
+                weights=weights,
+                cover_points=cover_points,
+                floor_bbox=floor_bbox,
+                tau_px=tau_px,
+                dt_oob=dt_oob,
+            )
+            score, mixer_parts = _mixer_score_candidate(
+                ordered,
+                info,
+                floor_bbox,
+                vp_long=vp_long,
+                vp_short=vp_short,
+            )
+            if score < best_score:
+                best_score = float(score)
+                best_H = H
+                best_info = info
+                best_info.update(gate_metrics)
+                best_info.update(mixer_parts)
 
+    line_info = {
+        "vp_long": vp_long.tolist() if isinstance(vp_long, np.ndarray) else None,
+        "vp_short": vp_short.tolist() if isinstance(vp_short, np.ndarray) else None,
+        "num_lsd_raw": int(num_lsd_raw),
+        "num_lsd_kept": int(len(lsd_lines)),
+        "dirA_count": int(len(cluster_a)),
+        "dirB_count": int(len(cluster_b)),
+        "sum_len_a": float(cluster_info.get("sum_len_a", 0.0)),
+        "sum_len_b": float(cluster_info.get("sum_len_b", 0.0)),
+        "cluster_ratio": float(cluster_info.get("cluster_ratio", 0.0)),
+        "mean_angle_a": role_info.get("mean_angle_a"),
+        "mean_angle_b": role_info.get("mean_angle_b"),
+        "lsd_lines_a": [
+            [float(ln.p1[0]), float(ln.p1[1]), float(ln.p2[0]), float(ln.p2[1])] for ln in cluster_a
+        ],
+        "lsd_lines_b": [
+            [float(ln.p1[0]), float(ln.p1[1]), float(ln.p2[0]), float(ln.p2[1])] for ln in cluster_b
+        ],
+    }
     if best_info is None:
-        return None, None
-    best_info["vp_h"] = vp_h.tolist() if isinstance(vp_h, np.ndarray) else None
-    best_info["vp_v"] = vp_v.tolist() if isinstance(vp_v, np.ndarray) else None
-    best_info["num_hough_lines_h"] = int(len(horiz))
-    best_info["num_hough_lines_v"] = int(len(vert))
+        return None, line_info
+    best_info.update(line_info)
     return best_H, best_info
 
 
@@ -567,16 +4132,17 @@ def _lm_numeric(
     max_iter: int = 30,
     lam: float = 1e-3,
     eps: float = 1e-4,
+    dt_oob: float = 255.0,
 ) -> Tuple[np.ndarray, float]:
     p = p0.astype(np.float64).copy()
     for _ in range(int(max_iter)):
-        r = _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox)
+        r = _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox, dt_oob=dt_oob)
         cost = 0.5 * float(np.dot(r, r))
         J = np.zeros((r.shape[0], 8), dtype=np.float64)
         for i in range(8):
             p_eps = p.copy()
             p_eps[i] += float(eps)
-            r_eps = _residual_vector(p_eps, dt, Xw, weights, cover_points, floor_bbox)
+            r_eps = _residual_vector(p_eps, dt, Xw, weights, cover_points, floor_bbox, dt_oob=dt_oob)
             J[:, i] = (r_eps - r) / float(eps)
         A = J.T @ J + float(lam) * np.eye(8, dtype=np.float64)
         g = J.T @ r
@@ -585,14 +4151,14 @@ def _lm_numeric(
         except np.linalg.LinAlgError:
             break
         p_new = p + delta
-        r_new = _residual_vector(p_new, dt, Xw, weights, cover_points, floor_bbox)
+        r_new = _residual_vector(p_new, dt, Xw, weights, cover_points, floor_bbox, dt_oob=dt_oob)
         new_cost = 0.5 * float(np.dot(r_new, r_new))
         if new_cost < cost:
             p = p_new
             lam *= 0.7
         else:
             lam *= 2.0
-    final_r = _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox)
+    final_r = _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox, dt_oob=dt_oob)
     final_cost = 0.5 * float(np.dot(final_r, final_r))
     return p, final_cost
 
@@ -605,18 +4171,21 @@ def refine_homography_lm(
     cover_points: np.ndarray,
     floor_bbox: Tuple[int, int, int, int],
     max_nfev: int = 50,
+    dt_oob: float = 255.0,
 ) -> Tuple[np.ndarray, float]:
     p0 = _H_to_p(H_init)
     if _HAS_SCIPY and least_squares is not None:
         res = least_squares(
-            lambda p: _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox),
+            lambda p: _residual_vector(p, dt, Xw, weights, cover_points, floor_bbox, dt_oob=dt_oob),
             p0,
             loss="huber",
             f_scale=3.0,
             max_nfev=int(max_nfev),
         )
         return _p_to_H(res.x), float(res.cost)
-    p_ref, cost = _lm_numeric(p0, dt, Xw, weights, cover_points, floor_bbox, max_iter=int(max_nfev))
+    p_ref, cost = _lm_numeric(
+        p0, dt, Xw, weights, cover_points, floor_bbox, max_iter=int(max_nfev), dt_oob=dt_oob
+    )
     return _p_to_H(p_ref), float(cost)
 
 
@@ -625,10 +4194,16 @@ def draw_debug_overlay(
     white_mask: np.ndarray,
     H: np.ndarray,
     conf: float,
+    cost_total: float,
+    s_inlier: float,
+    s_cover: float,
+    s_p90: float,
+    s_area: float,
     inlier_ratio: float,
     mean_dist_px: float,
     p90_dist_px: float,
     white_mask_ratio: float,
+    cover_ratio: float,
     l_dist: float,
     l_cover: float,
     l_reg: float,
@@ -701,15 +4276,24 @@ def draw_debug_overlay(
                 color = (0, g, r)
             cv2.circle(out, (int(round(float(x))), int(round(float(y)))), 2, color, -1)
 
-    title = f"conf={conf:.2f} inlier={inlier_ratio:.2f} mean={mean_dist_px:.2f}px p90={p90_dist_px:.2f}px"
+    title = (
+        f"conf={conf:.2f} cost={cost_total:.2f} inlier={inlier_ratio:.2f} "
+        f"mean={mean_dist_px:.2f}px p90={p90_dist_px:.2f}px"
+    )
     cv2.putText(out, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
     cv2.putText(out, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    row2 = f"mask={white_mask_ratio:.3f} Ld={l_dist:.3f} Lc={l_cover:.3f} Lr={l_reg:.3f} area={area_ratio:.3f}"
+    row2 = f"s_inlier={s_inlier:.2f} s_cover={s_cover:.2f} s_p90={s_p90:.2f} s_area={s_area:.2f}"
     cv2.putText(out, row2, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
     cv2.putText(out, row2, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    row3 = f"dt_min={dt_min:.2f} dt_mean={dt_mean:.2f} dt_p90={dt_p90:.2f}" if dt_min is not None else "dt_min=NA dt_mean=NA dt_p90=NA"
+    row3 = (
+        f"mask={white_mask_ratio:.3f} cover={cover_ratio:.2f} "
+        f"Ld={l_dist:.3f} Lc={l_cover:.3f} Lr={l_reg:.3f} area={area_ratio:.3f}"
+    )
     cv2.putText(out, row3, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
     cv2.putText(out, row3, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    row3 = f"dt_min={dt_min:.2f} dt_mean={dt_mean:.2f} dt_p90={dt_p90:.2f}" if dt_min is not None else "dt_min=NA dt_mean=NA dt_p90=NA"
+    cv2.putText(out, row3, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+    cv2.putText(out, row3, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     if sample_dist_mean is not None:
         row4 = (
             f"samp_mean={sample_dist_mean:.2f} p50={sample_dist_p50:.2f} "
@@ -717,19 +4301,2325 @@ def draw_debug_overlay(
         )
     else:
         row4 = "samp_mean=NA p50=NA p90=NA max=NA"
-    cv2.putText(out, row4, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
-    cv2.putText(out, row4, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(out, row4, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+    cv2.putText(out, row4, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return out
 
 
-def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
+def _remove_big_blobs(
+    mask: np.ndarray,
+    roi_mask: np.ndarray,
+    area_ratio: float = 0.01,
+    extent_thresh: float = 0.25,
+    huge_ratio: float = 0.02,
+    min_aspect: float = 6.0,
+    thin_thresh: float = 6.0,
+    huge_extent_thresh: float = 0.14,
+) -> np.ndarray:
+    h, w = mask.shape[:2]
+    roi_area = int(np.count_nonzero(roi_mask))
+    if roi_area <= 0:
+        return mask.copy()
+    max_area = float(roi_area) * float(area_ratio)
+    huge_area = float(roi_area) * float(huge_ratio)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    keep = np.zeros_like(mask)
+    for idx in range(1, num):
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        if area <= 0.0:
+            continue
+        x, y, bw, bh, _ = stats[idx]
+        bw = max(1, int(bw))
+        bh = max(1, int(bh))
+        aspect = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+        extent = float(area) / float(max(bw * bh, 1))
+        is_line_like = aspect >= float(min_aspect)
+        thickness = float(area) / float(bw + bh + 1.0)
+        is_thin = thickness <= float(thin_thresh)
+        drop_blob = (
+            (area > huge_area and extent > float(huge_extent_thresh))
+            or (area > max_area and extent > float(extent_thresh))
+        )
+        if is_line_like or is_thin or not drop_blob:
+            keep[labels == idx] = 255
+    return keep
+
+
+def _remove_solid_mid_blobs(
+    mask: np.ndarray,
+    roi_mask: Optional[np.ndarray],
+    area_min: int = 120,
+    area_max: int = 2500,
+    extent_min: float = 0.38,
+    aspect_max: float = 3.0,
+) -> np.ndarray:
+    """Remove medium, solid, non-elongated blobs (e.g., shoes) without killing sparse line nets."""
+    if roi_mask is None:
+        roi_mask = np.ones_like(mask)
+    work = cv2.bitwise_and(mask, roi_mask)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    out = mask.copy()
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < int(area_min) or area > int(area_max):
+            continue
+        bw = max(1, int(stats[idx, cv2.CC_STAT_WIDTH]))
+        bh = max(1, int(stats[idx, cv2.CC_STAT_HEIGHT]))
+        extent = float(area) / float(max(bw * bh, 1))
+        aspect = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+        if extent >= float(extent_min) and aspect <= float(aspect_max):
+            out[labels == idx] = 0
+    return out
+
+
+def _remove_thick_solid_components_by_dt(
+    mask: np.ndarray,
+    roi_mask: Optional[np.ndarray],
+    max_r: float = 3.2,
+    extent_min: float = 0.35,
+    aspect_max: float = 4.0,
+    area_min: int = 120,
+) -> np.ndarray:
+    """
+    Remove whole connected components that are thick (DT max > max_r) and solid-ish,
+    avoiding hollow-line artifacts from pixelwise thinning.
+    """
+    if mask.ndim == 3:
+        m = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    else:
+        m = mask.copy()
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    if roi_mask is None:
+        roi_mask = np.ones_like(m)
+    work = cv2.bitwise_and(m, roi_mask)
+    dist = cv2.distanceTransform(work, cv2.DIST_L2, 3)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    out = m.copy()
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < int(area_min):
+            continue
+        bw = max(1, int(stats[idx, cv2.CC_STAT_WIDTH]))
+        bh = max(1, int(stats[idx, cv2.CC_STAT_HEIGHT]))
+        extent = float(area) / float(max(bw * bh, 1))
+        aspect = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+        cc_mask = labels == idx
+        max_dt = float(dist[cc_mask].max()) if np.any(cc_mask) else 0.0
+        if (max_dt > float(max_r)) and (extent >= float(extent_min)) and (aspect <= float(aspect_max)):
+            out[cc_mask] = 0
+    return out
+
+
+def _clamp_by_thickness_dt(mask: np.ndarray, max_r: float = 3.2) -> np.ndarray:
+    """
+    Remove thick white regions while keeping thin line strokes using distance transform.
+    max_r ~ maximum allowed distance-to-background in pixels.
+    """
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    _, m = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    keep = (dist <= float(max_r))
+    out = np.zeros_like(m)
+    out[keep & (m > 0)] = 255
+    return out
+
+
+def _remove_mid_solid_blobs_near_bottom(
+    mask: np.ndarray,
+    roi_mask: np.ndarray,
+    area_min: int = 120,
+    area_max: int = 12000,
+    extent_min: float = 0.35,
+    aspect_max: float = 3.2,
+    y_center_min_ratio: float = 0.62,
+) -> np.ndarray:
+    """
+    Remove mid-size solid-ish blobs near the bottom (e.g., shoes), while keeping lines.
+    """
+    if mask.ndim == 3:
+        m = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    else:
+        m = mask.copy()
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    if roi_mask is None:
+        roi_mask = np.ones_like(m)
+    work = cv2.bitwise_and(m, roi_mask)
+    h, w = work.shape[:2]
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    out = m.copy()
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < int(area_min) or area > int(area_max):
+            continue
+        bw = max(1, int(stats[idx, cv2.CC_STAT_WIDTH]))
+        bh = max(1, int(stats[idx, cv2.CC_STAT_HEIGHT]))
+        aspect = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+        extent = float(area) / float(max(bw * bh, 1))
+        cy = float(stats[idx, cv2.CC_STAT_TOP] + 0.5 * bh)
+        if (cy / float(max(h, 1))) < float(y_center_min_ratio):
+            continue
+        if extent >= float(extent_min) and aspect <= float(aspect_max):
+            out[labels == idx] = 0
+    return out
+
+
+def preprocess_raw_floor(
+    mask: np.ndarray,
+    roi_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[int, int]], Optional[np.ndarray]]:
+    if roi_mask is None:
+        roi_mask = np.ones_like(mask)
+    work = mask.copy()
+    h, w = work.shape[:2]
+    y_min = int(round(0.35 * float(h)))
+    if y_min > 0:
+        work[:y_min, :] = 0
+    if work.ndim == 3:
+        work = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    _, work = cv2.threshold(work, 127, 255, cv2.THRESH_BINARY)
+    work = cv2.bitwise_and(work, roi_mask)
+    blob_mask = _detect_blob_mask(
+        work,
+        roi_mask=roi_mask,
+        dt_thr=5.5,
+        min_core_area=800,
+        dilate_ksize=17,
+    )
+    keep_lines = _keep_thin_structures_in_blob(work, blob_mask)
+    base_no_blob = cv2.bitwise_and(work, cv2.bitwise_not(blob_mask))
+    mask_for_edges = cv2.bitwise_or(base_no_blob, keep_lines)
+    edges = cv2.Canny(mask_for_edges, 30, 110)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    ys, xs = np.where(roi_mask > 0)
+    floor_y0 = int(ys.min()) if xs.size > 0 else 0
+    edges, band = _suppress_bright_band_on_edges(
+        edges,
+        floor_y0=floor_y0,
+        search_height_frac=0.30,
+        row_white_ratio_thr=0.20,
+        min_run=10,
+        pad=8,
+    )
+    return mask_for_edges, edges, band, blob_mask
+
+
+def _fit_court_homography_hough(
+    frame_bgr: np.ndarray,
+    person_boxes: Optional[Sequence[Sequence[float]]] = None,
+    linepix_mask_override: Optional[np.ndarray] = None,
+    skip_component_split: bool = False,
+    component_id: Optional[int] = None,
+    component_bbox: Optional[Tuple[int, int, int, int]] = None,
+    component_area: Optional[int] = None,
+) -> CourtFitResult:
     rng = np.random.default_rng(0)
-    white_mask = build_white_mask(frame_bgr)
-    white_mask_sum, white_mask_ratio, floor_bbox = _white_mask_stats(white_mask)
-    dt = build_distance_transform(white_mask)
+    debug_dir: Optional[str] = None
+    debug_prefix: str = "court_fit"
+    floor_mask, floor_debug = get_floor_roi_mask_debug(frame_bgr)
+    # Keep these defined for early-failure returns / debug.
+    linepix_mask_pre: Optional[np.ndarray] = None
+    floor_gate_mask: Optional[np.ndarray] = None
+    disable_anchor_prior = os.getenv("BADC_DISABLE_ANCHOR_PRIOR", "").strip() == "1"
+    enable_anchor_prior = os.getenv("BADC_ENABLE_ANCHOR_PRIOR", "").strip() == "1" and not disable_anchor_prior
+    manual_path = os.path.join("reports", "demo_friend", "manual_vp_corners.json")
+    manual = _load_manual_vp_corners(manual_path) if enable_anchor_prior else None
+    manual_vp_left = None
+    manual_vp_bottom = None
+    manual_lt = None
+    manual_rt = None
+    manual_rb = None
+    manual_lb = None
+    manual_vis = {}
+    manual_quad = None
+    manual_metrics: Dict[str, Any] = {}
+    if disable_anchor_prior:
+        manual_metrics["manual_present"] = False
+        # Widen ROI if lab-seed mask is too narrow without manual anchors.
+        x0, y0, x1, y1 = _white_mask_stats(floor_mask)[2]
+        h, w = frame_bgr.shape[:2]
+        if (x1 - x0) < int(0.6 * w):
+            floor_mask = floor_mask.copy()
+            floor_mask[y0 : y1 + 1, :] = 255
+            floor_debug["fallback_mode"] = "lab_seed_widen"
+    if isinstance(manual, dict):
+        try:
+            corners = manual.get("court_corners", {})
+            manual_lt = corners.get("LT")
+            manual_rt = corners.get("RT")
+            manual_rb = corners.get("RB")
+            manual_lb = corners.get("LB")
+            manual_vis = {
+                "LT": bool(manual_lt and manual_lt.get("visible", True)),
+                "RT": bool(manual_rt and manual_rt.get("visible", True)),
+                "RB": bool(manual_rb and manual_rb.get("visible", True)),
+            }
+            vps = manual.get("vanishing_points", {})
+            manual_vp_left = vps.get("VP_left")
+            manual_vp_bottom = vps.get("VP_bottom")
+            if manual_lb and manual_rb and manual_rt and manual_lt:
+                manual_quad = np.array(
+                    [
+                        [float(manual_lb.get("x")), float(manual_lb.get("y"))],
+                        [float(manual_rb.get("x")), float(manual_rb.get("y"))],
+                        [float(manual_rt.get("x")), float(manual_rt.get("y"))],
+                        [float(manual_lt.get("x")), float(manual_lt.get("y"))],
+                    ],
+                    dtype=np.float32,
+                )
+            manual_metrics["manual_present"] = True
+        except Exception:
+            manual = None
+            manual_metrics["manual_present"] = False
+    manual_x_range = None
+    if manual_lt and manual_rt and manual_rb:
+        h, w = frame_bgr.shape[:2]
+        x0, y0, x1, y1 = _white_mask_stats(floor_mask)[2]
+        pad = max(24, int(round(0.05 * float(min(h, w)))))
+        xs = [manual_lt["x"], manual_rt["x"], manual_rb["x"]]
+        ys = [manual_lt["y"], manual_rt["y"], manual_rb["y"]]
+        x0 = int(min(x0, min(xs) - pad))
+        x1 = int(max(x1, max(xs) + pad))
+        y0 = int(min(y0, min(ys) - pad))
+        y1 = int(max(y1, max(ys) + pad))
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(w - 1, x1)
+        y1 = min(h - 1, y1)
+        if x1 > x0 and y1 > y0:
+            floor_mask = floor_mask.copy()
+            floor_mask[y0 : y1 + 1, x0 : x1 + 1] = 255
+            floor_debug["manual_floor_bbox"] = [int(x0), int(y0), int(x1), int(y1)]
+            floor_debug["manual_present"] = True
+        manual_x0 = int(max(0, min(xs) - pad))
+        manual_x1 = int(min(w - 1, max(xs) + pad))
+        floor_mask[:, :manual_x0] = 0
+        floor_mask[:, manual_x1 + 1 :] = 0
+        floor_debug["floor_x_tightened"] = True
+        floor_debug["floor_x_range"] = [int(manual_x0), int(manual_x1)]
+        manual_x_range = (manual_x0, manual_x1)
+    floor_roi_mask = floor_mask
+    floor_roi_source = "floor_mask"
+    floor_y_cut = floor_debug.get("floor_y_cut")
+    x0, y0, x1, y1 = _white_mask_stats(floor_mask)[2]
+    bbox_mask = np.zeros_like(floor_mask)
+    if x1 > x0 and y1 > y0:
+        bbox_mask[y0 : y1 + 1, x0 : x1 + 1] = 255
+    if floor_y_cut is not None:
+        bbox_mask[: int(floor_y_cut), :] = 0
+    green_ratio = None
+    green_mask = floor_debug.get("green_mask")
+    if isinstance(green_mask, np.ndarray) and green_mask.size > 0:
+        ys, xs = np.where(bbox_mask > 0)
+        if xs.size > 0:
+            green_ratio = float(np.mean(green_mask[ys, xs] > 0))
+        if green_ratio is None or green_ratio < 0.15 or green_ratio > 0.95:
+            floor_roi_mask = bbox_mask
+            floor_roi_source = "bbox_fallback"
+        else:
+            d = 21
+            k = np.ones((d, d), np.uint8)
+            green_dil = cv2.dilate((green_mask > 0).astype(np.uint8) * 255, k, iterations=1)
+            floor_roi_mask = cv2.bitwise_and(green_dil, bbox_mask)
+            floor_roi_source = "green_dilated"
+    else:
+        floor_roi_mask = bbox_mask
+        floor_roi_source = "bbox_fallback"
+    if floor_y_cut is not None:
+        floor_roi_mask[: int(floor_y_cut), :] = 0
+    floor_mask = floor_roi_mask
+    floor_debug["floor_roi_source"] = floor_roi_source
+    if green_ratio is not None:
+        floor_debug["floor_roi_green_ratio"] = float(green_ratio)
+
+    floor_roi_overlay = frame_bgr.copy()
+    if np.any(floor_mask > 0):
+        mask = floor_mask > 0
+        overlay_color = np.zeros_like(frame_bgr)
+        overlay_color[:, :] = (0, 255, 0)
+        floor_roi_overlay[mask] = (
+            0.7 * floor_roi_overlay[mask].astype(np.float32)
+            + 0.3 * overlay_color[mask].astype(np.float32)
+        ).astype(np.uint8)
+    white_mask_raw_full = build_white_mask_raw(
+        frame_bgr,
+        white_s_max=140,
+        white_v_min=155,
+        l_min=170,
+        chroma_max=55,
+        roi_mask_u8=floor_mask,
+    )
+    h, w = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    k = int(max(21, round(min(h, w) * 0.03)))
+    if k % 2 == 0:
+        k += 1
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))
+    tophat_h = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_h)
+    tophat_v = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel_v)
+    tophat = cv2.max(tophat_h, tophat_v)
+    roi_vals = tophat[floor_mask > 0]
+    thin_line_mask = None
+    if roi_vals.size > 0:
+        thresh = max(float(np.percentile(roi_vals, 75.0)), 10.0)
+        thin_line_mask = (tophat >= thresh).astype(np.uint8) * 255
+        thin_line_mask = cv2.bitwise_and(thin_line_mask, floor_mask)
+    if thin_line_mask is not None:
+        white_mask_raw_floor_preblob = cv2.bitwise_and(white_mask_raw_full, thin_line_mask)
+    else:
+        white_mask_raw_floor_preblob = cv2.bitwise_and(white_mask_raw_full, floor_mask)
+    white_mask_raw_floor_postblob, blob_stats = filter_blobs_keep_lines(
+        white_mask_raw_floor_preblob,
+        close_kernel_lens=(),
+        close_thickness=1,
+        open_kernel_lens=(7, 9, 15, 21, 31),
+        line_kernel_thickness=1,
+        line_thickness_max=4.0,
+        speckle_area=20,
+        min_blob_area_ratio=0.001,
+        max_aspect_for_blob=2.5,
+        min_fill_ratio=0.55,
+        return_stats=True,
+    )
+
+    white_mask_raw_floor_postblob = _filter_postblob_non_line(
+        white_mask_raw_floor_postblob,
+        line_lengths=(15, 21, 31),
+        thickness_thr=999.0,
+        speckle_area=25,
+        min_aspect=4.0,
+        min_long=20,
+        density_win=11,
+        dense_soft=0.25,
+        dense_hard=0.55,
+        line_density_max=0.30,
+    )
+    white_mask_raw_floor = white_mask_raw_floor_preblob
+    white_mask_raw_floor_noblob = _remove_big_blobs(white_mask_raw_floor_postblob, floor_mask)
+    white_mask_raw_floor_noblob = _remove_thick_solid_components_by_dt(
+        white_mask_raw_floor_noblob,
+        floor_mask,
+        max_r=3.2,
+        extent_min=0.35,
+        aspect_max=4.0,
+        area_min=120,
+    )
+    white_mask_raw_floor_noblob = _remove_solid_mid_blobs(
+        white_mask_raw_floor_noblob,
+        floor_mask,
+        area_min=120,
+        area_max=3000,
+        extent_min=0.40,
+        aspect_max=3.0,
+    )
+    white_mask_raw_floor_noblob = _remove_mid_solid_blobs_near_bottom(
+        white_mask_raw_floor_noblob,
+        floor_mask,
+        area_min=120,
+        area_max=12000,
+        extent_min=0.35,
+        aspect_max=3.2,
+        y_center_min_ratio=0.62,
+    )
+
+    if roi_vals.size == 0:
+        mask_floor_lines = white_mask_raw_floor_noblob.copy()
+    else:
+        thresh = max(float(np.percentile(roi_vals, 75.0)), 10.0)
+        mask_floor_lines = (tophat >= thresh).astype(np.uint8) * 255
+        mask_floor_lines = cv2.bitwise_and(mask_floor_lines, floor_mask)
+        mask_floor_lines = cv2.bitwise_and(mask_floor_lines, white_mask_raw_floor_noblob)
+    # Keep the raw line structure; avoid extending/bridging lines.
+    mask_floor_lines = cv2.morphologyEx(mask_floor_lines, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    white_mask_clean = mask_floor_lines
+
+    raw_full_sum, raw_full_ratio, raw_full_bbox = _white_mask_stats(white_mask_raw_full)
+    raw_floor_pre_sum, raw_floor_pre_ratio, _ = _white_mask_stats(white_mask_raw_floor_preblob)
+    raw_floor_post_sum, raw_floor_post_ratio, _ = _white_mask_stats(white_mask_raw_floor_postblob)
+    raw_floor_noblob_sum, raw_floor_noblob_ratio, _ = _white_mask_stats(white_mask_raw_floor_noblob)
+    clean_sum, clean_ratio, _ = _white_mask_stats(white_mask_clean)
+    _, floor_ratio, floor_bbox = _white_mask_stats(floor_mask)
+
+    max_cc_area = 0
+    if clean_sum > 0:
+        num, _, stats, _ = cv2.connectedComponentsWithStats(white_mask_clean, connectivity=8)
+        for idx in range(1, num):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            max_cc_area = max(max_cc_area, area)
+
+    dt_from_label = "white_mask_clean"
+    dt_source = white_mask_raw_floor_postblob if raw_floor_post_sum > 0 else white_mask_clean
+    if raw_floor_post_sum > 0:
+        dt_from_label = "white_mask_raw_floor"
+    dt = build_distance_transform(dt_source)
     dt_min = float(np.min(dt)) if dt.size > 0 else None
     dt_mean = float(np.mean(dt)) if dt.size > 0 else None
     dt_p90 = float(np.percentile(dt, 90)) if dt.size > 0 else None
+    dt_oob = float(max(dt_p90 or 0.0, 15.0))
+    x1, y1, x2, y2 = floor_bbox
+    x1 = int(np.clip(x1, 0, dt.shape[1] - 1))
+    x2 = int(np.clip(x2, x1 + 1, dt.shape[1]))
+    y1 = int(np.clip(y1, 0, dt.shape[0] - 1))
+    y2 = int(np.clip(y2, y1 + 1, dt.shape[0]))
+    roi_h = max(1, y2 - y1)
+    roi_w = max(1, x2 - x1)
+    rand_n = 1000
+    xs = rng.integers(x1, x1 + roi_w, size=rand_n)
+    ys = rng.integers(y1, y1 + roi_h, size=rand_n)
+    dt_rand = dt[ys, xs].astype(np.float32) if dt.size > 0 else np.array([], dtype=np.float32)
+    dt_rand_mean = float(np.mean(dt_rand)) if dt_rand.size > 0 else None
+    dt_rand_p90 = float(np.percentile(dt_rand, 90)) if dt_rand.size > 0 else None
+
+    corners_world = get_bwf_corners()
+    Xw_ransac, _, _ = sample_model_points(points_per_meter=30.0, min_weight=0.6)
+    Xw_full, w_full, _ = sample_model_points(points_per_meter=30.0, min_weight=0.3)
+    foot_points = _foot_points_from_boxes(person_boxes, frame_bgr.shape[0])
+
+    base_metrics = {
+        "model": MODEL_ID,
+        "person_box_count": int(len(foot_points)),
+        "foot_points": [[float(px), float(py)] for px, py in foot_points],
+        "canonical_points_norm": get_canonical_points_norm(),
+        "component_id": int(component_id) if component_id is not None else None,
+        "component_bbox": [int(v) for v in component_bbox] if component_bbox is not None else None,
+        "component_area": int(component_area) if component_area is not None else None,
+        "selected_component_id": int(component_id) if component_id is not None else None,
+        "component_stats_top3": [],
+        "manual_override": False,
+        "manual_present": False,
+        "manual_pairs_added": False,
+        "anchor_prior_enabled": False,
+        "used_anchor_prior": False,
+        "used_manual_anchors": False,
+        "dt_from": dt_from_label,
+        "white_mask_sum": int(clean_sum),
+        "white_mask_ratio": float(clean_ratio),
+        "white_mask_raw_sum": int(raw_full_sum),
+        "white_mask_raw_ratio": float(raw_full_ratio),
+        "white_mask_raw_full_sum": int(raw_full_sum),
+        "white_mask_raw_full_ratio": float(raw_full_ratio),
+        "white_mask_raw_floor_sum": int(raw_floor_pre_sum),
+        "white_mask_raw_floor_ratio": float(raw_floor_pre_ratio),
+        "white_mask_raw_floor_preblob_ratio": float(raw_floor_pre_ratio),
+        "white_mask_raw_floor_postblob_ratio": float(raw_floor_post_ratio),
+        "white_mask_raw_floor_postblob_sum": int(raw_floor_post_sum),
+        "white_mask_raw_floor_noblob_sum": int(raw_floor_noblob_sum),
+        "white_mask_raw_floor_noblob_ratio": float(raw_floor_noblob_ratio),
+        "white_mask_clean_sum": int(clean_sum),
+        "white_mask_clean_ratio": float(clean_ratio),
+        "mask_raw_ratio": float(raw_floor_pre_ratio),
+        "mask_clean_ratio": float(clean_ratio),
+        "max_cc_area": int(max_cc_area),
+        "floor_bbox": [int(v) for v in floor_bbox],
+        "floor_roi_ratio": float(floor_ratio),
+        "floor_roi_source": floor_debug.get("floor_roi_source"),
+        "floor_roi_green_ratio": floor_debug.get("floor_roi_green_ratio"),
+        "white_mask_blob_removed_count": int(blob_stats.get("removed_count", 0))
+        if isinstance(blob_stats, dict)
+        else None,
+        "white_mask_blob_removed_topk": blob_stats.get("removed_topk", [])
+        if isinstance(blob_stats, dict)
+        else [],
+        "white_raw_full_bbox": [int(v) for v in raw_full_bbox],
+        "fallback_floor_roi": bool(floor_debug.get("fallback_floor_roi", False)),
+        "fallback_mode": floor_debug.get("fallback_mode"),
+        "floor_y_cut": floor_debug.get("floor_y_cut"),
+        "floor_x_tightened": floor_debug.get("floor_x_tightened"),
+        "floor_x_range": floor_debug.get("floor_x_range"),
+        "floor_x_support_ratio": floor_debug.get("floor_x_support_ratio"),
+        "floor_x_reject_reason": floor_debug.get("floor_x_reject_reason"),
+        "floor_cc_scores": floor_debug.get("floor_cc_scores"),
+        "floor_strip_thr": floor_debug.get("floor_strip_thr"),
+        "floor_strip_y0": floor_debug.get("floor_strip_y0"),
+        "lab_seed_ok": floor_debug.get("lab_seed_ok"),
+        "lab_seed_bbox": floor_debug.get("lab_seed_bbox"),
+        "lab_seed_y0": floor_debug.get("lab_seed_y0"),
+        "dt_min": dt_min,
+        "dt_mean": dt_mean,
+        "dt_p90": dt_p90,
+        "dt_rand_mean": dt_rand_mean,
+        "dt_rand_p90": dt_rand_p90,
+        "debug_image_path": None,
+        "white_mask_path": None,
+        "white_mask_raw_path": None,
+        "white_mask_clean_path": None,
+        "lsd_dirA_path": None,
+        "lsd_dirB_path": None,
+        "ori_maskA_path": None,
+        "ori_maskB_path": None,
+        "hough_lines_path": None,
+        "debug_init_path": None,
+        "dt_debug_path": None,
+        "linepix_green_only_used": False,
+        "max_inside_count": 0,
+        "selection_reason": "not_selected",
+    }
+    # ===== Farin2005 meters-based matcher hook (after noblob, needs base_metrics) =====
+    matcher = os.environ.get("BADC_COURT_MATCHER", "legacy").strip().lower()
+    if matcher in ("farin2005", "farin2005_m", "farin_m"):
+        try:
+            from src.vision.court_match_farin2005 import fit_model_farin2005_m
+        except Exception:
+            from .court_match_farin2005 import fit_model_farin2005_m  # type: ignore
+
+        res = fit_model_farin2005_m(
+            mask_noblob=white_mask_raw_floor_noblob,
+            img_shape=white_mask_raw_floor_noblob.shape[:2],
+        )
+
+        if res.H is None or res.corners is None:
+            return CourtFitResult(
+                H=None,
+                corners=None,
+                confidence=0.0,
+                metrics={
+                    **base_metrics,
+                    "farin2005_m": res.metrics,
+                    "E": float(res.E),
+                },
+                reason="R_fit_poor",
+                method_used="farin2005_m",
+                white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+                white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+                white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+                floor_roi_mask=floor_mask,
+                floor_roi_overlay=floor_roi_overlay,
+            )
+
+        conf = float(np.exp(-0.02 * float(res.E)))
+
+        return CourtFitResult(
+            H=res.H,
+            corners=res.corners,
+            confidence=conf,
+            metrics={
+                **base_metrics,
+                "farin2005_m": res.metrics,
+                "E": float(res.E),
+            },
+            reason="R_ok",
+            method_used="farin2005_m",
+            white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+            white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+            white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+            floor_roi_mask=floor_mask,
+            floor_roi_overlay=floor_roi_overlay,
+        )
+    # ===== end hook =====
+    if skip_component_split and component_id is not None:
+        base_metrics["selected_component_id"] = int(component_id)
+    base_metrics["score_base"] = None
+    base_metrics["score_total"] = None
+    base_metrics["inside_count"] = int(0)
+    base_metrics["inside_bonus"] = 0.0
+    dt_debug = cv2.normalize(dt, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) if dt.size > 0 else None
+
+    def _annotate_failure(reason: str) -> np.ndarray:
+        img = frame_bgr.copy()
+        label = f"Hough failed: {reason}"
+        cv2.putText(img, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4)
+        cv2.putText(img, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        return img
+
+    def _fail_result(
+        reason: str,
+        *,
+        maskA: Optional[np.ndarray] = None,
+        maskB: Optional[np.ndarray] = None,
+        hough_lines_img: Optional[np.ndarray] = None,
+        linepix_mask: Optional[np.ndarray] = None,
+        linepix_mask_pre: Optional[np.ndarray] = None,
+        floor_gate_mask: Optional[np.ndarray] = None,
+        linepix_overlay: Optional[np.ndarray] = None,
+        ransac_lines_img: Optional[np.ndarray] = None,
+        extra_metrics: Optional[Dict[str, Any]] = None,
+        metrics_override: Optional[Dict[str, Any]] = None,
+    ) -> CourtFitResult:
+        metrics_base = dict(metrics_override) if metrics_override is not None else dict(base_metrics)
+        if maskA is None:
+            maskA = np.zeros_like(white_mask_clean)
+        if maskB is None:
+            maskB = np.zeros_like(white_mask_clean)
+        if hough_lines_img is None:
+            hough_lines_img = _annotate_failure(reason)
+        metrics = {
+            **metrics_base,
+            "H": None,
+            "inlier_ratio": 0.0,
+            "mean_dist_px": None,
+            "p90_dist_px": None,
+            "num_inliers": 0,
+            "num_valid_samples": 0,
+            "num_samples": int(Xw_ransac.shape[0]),
+            "tau_px": 3.0,
+            "lm_cost": None,
+        }
+        if metrics.get("selected_component_id") is None:
+            metrics["selected_component_id"] = int(metrics_base.get("component_id") or 0)
+        if isinstance(extra_metrics, dict):
+            metrics.update(extra_metrics)
+        # Debug-visibility normalization: ensure masks are uint8 {0,255}.
+        def _vis_mask(m: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if not isinstance(m, np.ndarray):
+                return None
+            mm = m
+            if mm.ndim == 3:
+                mm = cv2.cvtColor(mm, cv2.COLOR_BGR2GRAY)
+            if mm.dtype != np.uint8:
+                mm = mm.astype(np.uint8)
+            return ((mm > 0).astype(np.uint8) * 255)
+
+        linepix_mask_vis = _vis_mask(linepix_mask)
+        linepix_mask_pre_vis = _vis_mask(linepix_mask_pre)
+        floor_gate_mask_vis = _vis_mask(floor_gate_mask)
+        debug_fail = _annotate_failure(reason)
+        return CourtFitResult(
+            H=None,
+            corners=None,
+            confidence=0.0,
+            metrics=metrics,
+            reason=reason,
+            debug_image=debug_fail,
+            debug_image_init=debug_fail,
+            white_mask=white_mask_clean,
+            white_mask_raw=white_mask_raw_full,
+            white_mask_clean=white_mask_clean,
+            white_mask_raw_full=white_mask_raw_full,
+            white_mask_raw_floor=white_mask_raw_floor,
+            white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+            white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+            white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+            floor_roi_mask=floor_mask,
+            floor_roi_overlay=floor_roi_overlay,
+            seed_bottom_mask=floor_debug.get("seed_bottom_mask"),
+            green_mask=floor_debug.get("green_mask"),
+            largest_cc_mask=floor_debug.get("largest_cc_mask"),
+            exg_row_plot=floor_debug.get("exg_row_plot"),
+            linepix_mask=linepix_mask_vis,
+            linepix_mask_pre=linepix_mask_pre_vis,
+            floor_gate_mask=floor_gate_mask_vis,
+            linepix_overlay=linepix_overlay,
+            ransac_lines_img=ransac_lines_img,
+            dt_debug=dt_debug,
+            ori_mask_a=maskA,
+            ori_mask_b=maskB,
+            hough_lines_img=hough_lines_img,
+        )
+
+    if clean_ratio < 0.001 or clean_ratio > 0.25:
+        return _fail_result("R_mask_invalid")
+
+    if dt_rand_p90 is not None and dt_rand_mean is not None:
+        if dt_rand_p90 < 0.5 or dt_rand_mean < 0.2:
+            return _fail_result("R_dt_invalid")
+
+    tau_line = 6
+    disable_floor_gate = os.getenv("BADC_DISABLE_FLOOR_GATE", "").strip() == "1"
+    force_postblob = os.getenv("BADC_FORCE_LINEPIX_POSTBLOB", "").strip() == "1"
+    linepix_source = os.getenv("BADC_LINEPIX_SOURCE", "mask").strip().lower()
+    linepix_mask = None
+    if linepix_mask_override is not None:
+        linepix_source = "override"
+        linepix_mask = linepix_mask_override.copy()
+        if linepix_mask.shape[:2] != floor_mask.shape[:2]:
+            linepix_mask = cv2.resize(
+                linepix_mask, (floor_mask.shape[1], floor_mask.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+        if linepix_mask.ndim == 3:
+            linepix_mask = cv2.cvtColor(linepix_mask, cv2.COLOR_BGR2GRAY)
+        linepix_mask = (linepix_mask > 0).astype(np.uint8) * 255
+    else:
+        if force_postblob:
+            linepix_source = "postblob_forced"
+            linepix_mask = white_mask_raw_floor_postblob.copy()
+        elif linepix_source in ("mask", "postblob"):
+            linepix_mask = white_mask_raw_floor_postblob.copy()
+            min_lp = int(0.001 * float(h * w))
+            if linepix_source == "mask" and int(np.count_nonzero(linepix_mask)) < min_lp:
+                linepix_mask = None
+                linepix_source = "canny"
+        elif linepix_source in ("noblob", "raw_noblob"):
+            # Use the raw floor white mask before blob filtering (often best for line geometry).
+            linepix_mask = white_mask_raw_floor_noblob.copy()
+            min_lp = int(0.001 * float(h * w))
+            if int(np.count_nonzero(linepix_mask)) < min_lp:
+                linepix_mask = None
+                linepix_source = "canny"
+        if linepix_mask is None:
+            linepix_source = "canny"
+            if frame_bgr is not None:
+                edges = cv2.Canny(gray, 30, 110)
+                linepix_mask = cv2.bitwise_and(edges, floor_mask)
+            else:
+                linepix_mask = white_mask_clean.copy()
+    # Normalize to binary uint8 {0,255} for downstream ops and debug visibility.
+    if isinstance(linepix_mask, np.ndarray):
+        if linepix_mask.ndim == 3:
+            linepix_mask = cv2.cvtColor(linepix_mask, cv2.COLOR_BGR2GRAY)
+        if linepix_mask.dtype != np.uint8:
+            linepix_mask = linepix_mask.astype(np.uint8)
+        linepix_mask = ((linepix_mask > 0).astype(np.uint8) * 255)
+    num_linepix_points_pre = int(np.count_nonzero(linepix_mask))
+    linepix_mask_pre = linepix_mask.copy()
+    num_linepix_points_post_floor = num_linepix_points_pre
+    floor_gate_keep_ratio = None
+    floor_gate_applied = False
+    floor_gate_mask = floor_mask
+    cc_mask = floor_debug.get("largest_cc_mask")
+    if floor_debug.get("fallback_mode") == "lab_seed" and isinstance(cc_mask, np.ndarray):
+        if int(np.count_nonzero(cc_mask)) > 0:
+            floor_gate_mask = cc_mask
+    if manual_x_range and floor_gate_mask is not None:
+        xg0, xg1 = manual_x_range
+        floor_gate_mask = floor_gate_mask.copy()
+        floor_gate_mask[:, :xg0] = 0
+        floor_gate_mask[:, xg1 + 1 :] = 0
+    if (not disable_floor_gate) and floor_gate_mask is not None and linepix_mask_override is None:
+        d = int(tau_line) + 6
+        k = np.ones((2 * d + 1, 2 * d + 1), np.uint8)
+        floor_gate = cv2.dilate(floor_gate_mask, k, iterations=1)
+        linepix_mask = cv2.bitwise_and(linepix_mask, floor_gate)
+        num_linepix_points_post_floor = int(np.count_nonzero(linepix_mask))
+        floor_gate_keep_ratio = float(num_linepix_points_post_floor) / float(max(num_linepix_points_pre, 1))
+        floor_gate_applied = True
+        if floor_gate_keep_ratio < 0.60:
+            linepix_mask = linepix_mask_pre
+            num_linepix_points_post_floor = num_linepix_points_pre
+            floor_gate_keep_ratio = 1.0
+            floor_gate_applied = False
+    green_mask = floor_debug.get("green_mask")
+    if not isinstance(green_mask, np.ndarray) or green_mask.size == 0:
+        b, g, r = cv2.split(frame_bgr)
+        green_score = g.astype(np.int16) - np.maximum(r, b).astype(np.int16)
+        green_mask = ((green_score > 24) & (g > 90)).astype(np.uint8) * 255
+        if floor_mask is not None:
+            green_mask = cv2.bitwise_and(green_mask, floor_mask)
+    if green_mask.shape[:2] != linepix_mask.shape[:2]:
+        green_mask = cv2.resize(
+            green_mask, (linepix_mask.shape[1], linepix_mask.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+    if green_mask.ndim == 3:
+        green_mask = cv2.cvtColor(green_mask, cv2.COLOR_BGR2GRAY)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    green_dil = cv2.dilate(green_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+    # Green-mask gating with fallback
+    green_only_env = os.environ.get("BADC_LINEPIX_GREEN_ONLY", "1").strip()
+    green_only = green_only_env not in ("0", "false", "False", "no", "NO", "")
+    green_keep_min = float(os.environ.get("BADC_GREEN_KEEP_MIN", "0.60"))
+    green_gate_mode = os.environ.get("BADC_GREEN_GATE_MODE", "erode").strip().lower()
+    erode_k = int(os.environ.get("BADC_GREEN_ERODE_K", "7"))
+    dilate_k = int(os.environ.get("BADC_GREEN_DILATE_K", "13"))
+    erode_k = max(0, erode_k | 1)
+    dilate_k = max(0, dilate_k | 1)
+
+    if green_gate_mode in ("none", "raw", "off"):
+        green_mask_for_gate = green_mask
+    elif green_gate_mode in ("dilate", "dilation"):
+        if dilate_k > 0:
+            green_mask_for_gate = cv2.dilate(
+                green_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k)),
+                iterations=1,
+            )
+        else:
+            green_mask_for_gate = green_mask
+    else:  # default erode
+        if erode_k > 0:
+            green_mask_for_gate = cv2.erode(
+                green_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k)),
+                iterations=1,
+            )
+        else:
+            green_mask_for_gate = green_mask
+
+    green_applied = False
+    _before = int(cv2.countNonZero(linepix_mask))
+    _after = _before
+    _keep = 1.0
+    if green_only:
+        _gated = cv2.bitwise_and(linepix_mask, green_mask_for_gate)
+        _after = int(cv2.countNonZero(_gated))
+        _keep = float(_after) / float(max(1, _before))
+        if _keep >= float(green_keep_min):
+            linepix_mask = _gated
+            green_applied = True
+    base_metrics["linepix_green_only_used"] = bool(green_applied)
+    base_metrics["green_keep_ratio"] = float(_keep)
+    base_metrics["green_linepix_before"] = int(_before)
+    base_metrics["green_linepix_after"] = int(_after)
+    line_like_mask = _line_like_mask(linepix_mask)
+    linepix_mask = _remove_small_speckles(linepix_mask, min_area=8, min_aspect=3.0, min_long=10)
+    num_linepix_points = int(np.count_nonzero(linepix_mask))
+    h_lp, w_lp = linepix_mask.shape[:2]
+    total_lp = max(1, num_linepix_points)
+    left_lp = int(np.count_nonzero(linepix_mask[:, : w_lp // 2]))
+    right_lp = int(np.count_nonzero(linepix_mask[:, w_lp // 2 :]))
+    top_lp = int(np.count_nonzero(linepix_mask[: h_lp // 2, :]))
+    bottom_lp = int(np.count_nonzero(linepix_mask[h_lp // 2 :, :]))
+    if frame_bgr is not None:
+        # Visualization only: optionally draw linepix on top of floor_roi_overlay (raw frame + green ROI overlay).
+        overlay_base = os.getenv("BADC_LINEPIX_OVERLAY_BASE", "raw").strip().lower()
+        floor_overlay = locals().get("floor_roi_overlay", None)
+        if overlay_base in ("floor", "floor_roi", "roi", "floor_roi_overlay") and floor_overlay is not None:
+            linepix_overlay = floor_overlay.copy()
+        else:
+            linepix_overlay = frame_bgr.copy()
+        # Visual-only: choose which mask to draw as red.
+        #   linepix (default): post-gate linepix_mask
+        #   noblob: white_mask_raw_floor_noblob
+        #   pre: linepix_mask_pre if exists (pre floor-gate)
+        overlay_mask_mode = os.getenv("BADC_LINEPIX_OVERLAY_MASK", "linepix").strip().lower()
+        if overlay_mask_mode in ("noblob", "white_noblob"):
+            overlay_mask = white_mask_raw_floor_noblob
+        elif overlay_mask_mode in ("pre", "pre_gate", "pregate"):
+            overlay_mask = locals().get("linepix_mask_pre", linepix_mask)
+        else:
+            overlay_mask = linepix_mask
+        dil = int(os.getenv("BADC_LINEPIX_OVERLAY_DILATE", "0"))
+        if dil > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * dil + 1, 2 * dil + 1))
+            overlay_mask = cv2.dilate(overlay_mask.astype(np.uint8), k, iterations=1)
+        linepix_overlay[overlay_mask > 0] = (0, 0, 255)
+    else:
+        linepix_overlay = cv2.cvtColor(linepix_mask, cv2.COLOR_GRAY2BGR)
+
+    # Debug dump for gate/pre/post masks to visualize line breaks near people/ROI.
+    if debug_dir is not None:
+        def _dump_mask(name: str, m: Optional[np.ndarray]) -> None:
+            if m is None or not isinstance(m, np.ndarray):
+                return
+            mm = m
+            if mm.ndim == 3:
+                mm = cv2.cvtColor(mm, cv2.COLOR_BGR2GRAY)
+            if mm.dtype != np.uint8:
+                mm = mm.astype(np.uint8)
+            mm = ((mm > 0).astype(np.uint8) * 255)
+            cv2.imwrite(os.path.join(debug_dir, f"{debug_prefix}_{name}.jpeg"), mm)
+
+        _dump_mask("floor_gate_mask", floor_gate_mask)
+        _dump_mask("linepix_pre_gate", linepix_mask_pre)
+        _dump_mask("linepix_post_gate", linepix_mask)
+
+    if not skip_component_split:
+        # Bridge fragmented far-court lines into larger components for Hough.
+        cc_kernel = np.ones((7, 7), np.uint8)
+        cc_mask = cv2.dilate(linepix_mask, cc_kernel, iterations=2)
+        num_cc, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(cc_mask, connectivity=8)
+        components: list[Tuple[int, int, Tuple[int, int, int, int]]] = []
+        for idx in range(1, int(num_cc)):
+            area = int(stats_cc[idx, cv2.CC_STAT_AREA])
+            x = int(stats_cc[idx, cv2.CC_STAT_LEFT])
+            y = int(stats_cc[idx, cv2.CC_STAT_TOP])
+            w_cc = int(stats_cc[idx, cv2.CC_STAT_WIDTH])
+            h_cc = int(stats_cc[idx, cv2.CC_STAT_HEIGHT])
+            if area <= 0 or w_cc <= 0 or h_cc <= 0:
+                continue
+            bbox_xyxy = (x, y, x + w_cc - 1, y + h_cc - 1)
+            components.append((idx, area, bbox_xyxy))
+        components.sort(key=lambda item: item[1], reverse=True)
+        top_k = 6
+        component_stats_top3: list[Dict[str, Any]] = []
+        component_results: list[Dict[str, Any]] = []
+        img_area = float(max(1, linepix_mask.shape[0] * linepix_mask.shape[1]))
+        for comp_rank, (idx, area, bbox_xyxy) in enumerate(components[:top_k]):
+            comp_mask_label = np.zeros_like(linepix_mask)
+            comp_mask_label[labels_cc == idx] = 255
+            comp_mask = cv2.bitwise_and(linepix_mask, comp_mask_label)
+            x0, y0, x1, y1 = bbox_xyxy
+            bbox_area = float(max(0, x1 - x0 + 1) * max(0, y1 - y0 + 1))
+            bbox_area_ratio = float(bbox_area / img_area)
+            if bbox_area_ratio < 0.06:
+                continue
+            comp_linepix = int(np.count_nonzero(comp_mask))
+            green_overlap = 0.0
+            if comp_linepix > 0:
+                green_overlap = float(np.count_nonzero(cv2.bitwise_and(comp_mask, green_dil))) / float(
+                    max(comp_linepix, 1)
+                )
+            if green_overlap < 0.18:
+                continue
+            res_comp = _fit_court_homography_hough(
+                frame_bgr,
+                person_boxes=person_boxes,
+                linepix_mask_override=comp_mask,
+                skip_component_split=True,
+                component_id=int(comp_rank),
+                component_bbox=bbox_xyxy,
+                component_area=int(area),
+            )
+            metrics_c = res_comp.metrics if isinstance(res_comp.metrics, dict) else {}
+            score_base_val = metrics_c.get("score_base", metrics_c.get("score_final"))
+            try:
+                score_base = float(score_base_val) if score_base_val is not None else float("-inf")
+            except Exception:
+                score_base = float("-inf")
+            score_total = metrics_c.get("score_total")
+            try:
+                score_total_val = float(score_total)
+            except Exception:
+                score_total_val = float(score_base)
+            if not math.isfinite(score_total_val):
+                continue
+            inside_ct = metrics_c.get("inside_count")
+            num_hough = metrics_c.get("num_hough_lines") or metrics_c.get("num_ransac_lines")
+            selection_score = float(score_total_val) + float(25.0 * bbox_area_ratio)
+            comp_stat = {
+                "component_id": int(comp_rank),
+                "area": int(area),
+                "area_px": int(area),
+                "bbox": [int(v) for v in bbox_xyxy],
+                "num_linepix_points": comp_linepix,
+                "num_hough_lines": int(num_hough) if num_hough is not None else None,
+                "bbox_area_ratio": float(bbox_area_ratio),
+                "base_score": None if not math.isfinite(score_base) else float(score_base),
+                "inside_count": int(inside_ct) if inside_ct is not None else 0,
+                "score_total": float(score_total_val),
+                "score_breakdown": {
+                    "base": None if not math.isfinite(score_base) else float(score_base),
+                    "inside_bonus": float(10.0 * (inside_ct or 0)),
+                    "score_total": float(score_total_val),
+                },
+                "green_overlap": float(green_overlap),
+                "score_total_sel": float(selection_score),
+            }
+            component_stats_top3.append(comp_stat)
+            if res_comp.corners is None:
+                continue
+            component_results.append(
+                {
+                    "score_total": float(selection_score),
+                    "score_total_raw": float(score_total_val),
+                    "inside_count": int(inside_ct) if inside_ct is not None else 0,
+                    "bbox_area_ratio": float(bbox_area_ratio),
+                    "res": res_comp,
+                    "stat": comp_stat,
+                }
+            )
+        if component_results:
+            max_inside_count = max(item["inside_count"] for item in component_results)
+            if max_inside_count > 0:
+                candidates = [item for item in component_results if item["inside_count"] == max_inside_count]
+                selection_reason = "max_inside"
+            else:
+                candidates = component_results
+                selection_reason = "bbox_area_then_score"
+            if max_inside_count <= 0:
+                candidates = sorted(
+                    candidates,
+                    key=lambda item: (item.get("bbox_area_ratio", 0.0), item.get("score_total", -1e9)),
+                    reverse=True,
+                )
+            else:
+                candidates.sort(key=lambda item: item["score_total"], reverse=True)
+            best_item = candidates[0]
+            best_res = best_item["res"]
+            best_stat = best_item["stat"]
+            best_score = best_item["score_total"]
+            best_metrics = best_res.metrics if isinstance(best_res.metrics, dict) else {}
+            if isinstance(best_metrics, dict):
+                best_metrics["selected_component_id"] = int(best_stat.get("component_id"))
+                best_metrics["component_stats_top3"] = component_stats_top3
+                best_metrics.setdefault("score_total", float(best_item.get("score_total_raw", best_score)))
+                best_metrics["score_total_sel"] = float(best_score)
+                best_metrics["max_inside_count"] = int(max_inside_count)
+                best_metrics["selection_reason"] = selection_reason
+            return best_res
+        # Fall back to single-component processing if none found.
+
+    segments, tls_stats = ransac_line_segments_from_mask(
+        linepix_mask,
+        floor_mask,
+        max_lines=30,
+        iters=800,
+        inlier_thr=2.0,
+        min_inliers=250,
+        min_length_ratio=0.08,
+        seed=0,
+    )
+    ransac_lines_img = (
+        frame_bgr.copy() if frame_bgr is not None else cv2.cvtColor(linepix_mask, cv2.COLOR_GRAY2BGR)
+    )
+    rng_lines = np.random.default_rng(0)
+    for seg in segments:
+        color = tuple(int(v) for v in rng_lines.integers(0, 255, size=3))
+        cv2.line(
+            ransac_lines_img,
+            (int(round(seg.x1)), int(round(seg.y1))),
+            (int(round(seg.x2)), int(round(seg.y2))),
+            color,
+            2,
+        )
+    lines_all = [(seg.x1, seg.y1, seg.x2, seg.y2) for seg in segments]
+    line_ids_all = list(range(len(lines_all)))
+    x0, y0, x1, y1 = floor_bbox
+
+    # --- PATCH: do NOT hard-kill lines near the top of floor bbox ---
+    # Old behavior: reject any segment whose midpoint is within top 5% of floor bbox.
+    # That kills many far-court lines => A/B too few.
+    #
+    # New behavior:
+    # - Top-guard ratio is configurable via env var (default 0.0 = disabled)
+    # - Even if within guard band, only reject if the segment is very short (likely noise)
+    top_guard_ratio = float(os.environ.get("BADC_FLOOR_TOP_GUARD_RATIO", "0.0"))
+    y_margin = int(top_guard_ratio * max(1, (y1 - y0)))
+
+    # "short" threshold: reject tiny segments near top, keep long court lines
+    diag = float(math.hypot(float(x1 - x0), float(y1 - y0)))
+    short_len_thr = float(os.environ.get("BADC_FLOOR_TOP_SHORT_THR", "0.06")) * diag
+
+    reject_mid_outside = 0
+    reject_mid_topshort = 0
+    filtered = []
+    filtered_ids: list[int] = []
+
+    for idx, (x1s, y1s, x2s, y2s) in enumerate(lines_all):
+        mx = 0.5 * (float(x1s) + float(x2s))
+        my = 0.5 * (float(y1s) + float(y2s))
+
+        # must be inside floor bbox
+        if mx < float(x0) or mx > float(x1) or my < float(y0) or my > float(y1):
+            reject_mid_outside += 1
+            continue
+
+        # within top guard band: only reject if the segment is very short
+        if y_margin > 0 and my < float(y0 + y_margin):
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            if seg_len < short_len_thr:
+                reject_mid_topshort += 1
+                continue
+
+        filtered.append((x1s, y1s, x2s, y2s))
+        if idx < len(line_ids_all):
+            filtered_ids.append(line_ids_all[idx])
+
+    lines_all = filtered
+    line_ids_all = filtered_ids
+    angles = []
+    weights = []
+    line_ids_angles: list[int] = []
+    lines_all_filtered: list[Tuple[float, float, float, float]] = []
+    line_ids_filtered: list[int] = []
+    for (x1s, y1s, x2s, y2s), lid in zip(lines_all, line_ids_all):
+        dx = float(x2s) - float(x1s)
+        dy = float(y2s) - float(y1s)
+        length = float(math.hypot(dx, dy))
+        if length <= 1e-3:
+            continue
+        ang = math.atan2(dy, dx)
+        ang = float(np.mod(ang, math.pi))
+        angles.append(ang)
+        weights.append(length)
+        line_ids_angles.append(int(lid))
+        lines_all_filtered.append((x1s, y1s, x2s, y2s))
+        line_ids_filtered.append(int(lid))
+    lines_all = lines_all_filtered
+    line_ids_all = line_ids_filtered
+    if not angles:
+        maskA = np.zeros_like(white_mask_clean)
+        maskB = np.zeros_like(white_mask_clean)
+        return _fail_result(
+            "R_hough_lines",
+            maskA=maskA,
+            maskB=maskB,
+            linepix_mask=linepix_mask,
+            linepix_overlay=linepix_overlay,
+            ransac_lines_img=ransac_lines_img,
+            extra_metrics={
+                "num_linepix_points": int(num_linepix_points),
+                "num_ransac_lines": int(len(segments)),
+                "top10_line_lengths": [],
+            },
+        )
+    angles = np.array(angles, dtype=np.float32)
+    weights = np.array(weights, dtype=np.float32)
+    base_metrics.update(
+        {
+            "num_linepix_points": int(num_linepix_points),
+            "num_linepix_points_pre_person": int(num_linepix_points_pre),
+            "num_linepix_points_post_floor": int(num_linepix_points_post_floor),
+            "num_linepix_points_post_person": int(num_linepix_points),
+            "linepix_source": str(linepix_source),
+            "linepix_green_only_used": bool(green_only),
+            "linepix_green_gate_mode": str(green_gate_mode),
+            "linepix_green_keep_min": float(green_keep_min),
+            "linepix_green_erode_k": int(erode_k),
+            "linepix_green_dilate_k": int(dilate_k),
+            "linepix_green_gate_applied": bool(green_applied),
+            "linepix_green_keep_ratio": float(_keep),
+            "linepix_floor_gate_applied": bool(floor_gate_applied),
+            "linepix_floor_gate_disabled": bool(disable_floor_gate),
+            "linepix_floor_gate_keep_ratio": float(floor_gate_keep_ratio)
+            if floor_gate_keep_ratio is not None
+            else None,
+            "linepix_ratio": float(num_linepix_points) / float(h_lp * w_lp),
+            "linepix_left_ratio": float(left_lp) / float(total_lp),
+            "linepix_right_ratio": float(right_lp) / float(total_lp),
+            "linepix_top_ratio": float(top_lp) / float(total_lp),
+            "linepix_bottom_ratio": float(bottom_lp) / float(total_lp),
+            "num_ransac_lines": int(len(segments)),
+            "top10_line_lengths": [
+                float(v)
+                for v in sorted([seg.length for seg in segments], reverse=True)[:10]
+            ],
+            "reject_mid_outside": int(reject_mid_outside),
+            "num_hough_lines": int(len(lines_all)),
+            "tls_num_input_pts": int(tls_stats.get("tls_num_input_pts", 0)),
+            "tls_num_finite_pts": int(tls_stats.get("tls_num_finite_pts", 0)),
+            "tls_skipped_degenerate": int(tls_stats.get("tls_skipped_degenerate", 0)),
+        }
+    )
+    if manual:
+        base_metrics["manual_present"] = True
+    if manual_metrics:
+        base_metrics.update(manual_metrics)
+    if not disable_anchor_prior:
+        base_metrics["used_manual_anchors"] = bool(manual_lt and manual_rt and manual_rb)
+    hist, edges = np.histogram(angles, bins=180, range=(0.0, math.pi), weights=weights)
+    idx1 = int(np.argmax(hist))
+    center1 = float((edges[idx1] + edges[idx1 + 1]) * 0.5)
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    best_center2 = None
+    best_center2_score = -1.0
+    for c, hval in zip(centers, hist):
+        diff = _angle_distance(float(c), center1)
+        if diff < math.radians(20.0):
+            continue
+        ortho_score = max(0.0, 1.0 - abs(diff - (0.5 * math.pi)) / (0.5 * math.pi))
+        score = float(hval) * (0.6 + 0.4 * ortho_score)
+        if score > best_center2_score:
+            best_center2_score = score
+            best_center2 = float(c)
+    if best_center2 is None:
+        best_center2 = float((center1 + math.pi * 0.5) % math.pi)
+    center2 = best_center2
+
+    band = math.radians(25.0)
+    linesA = []
+    linesB = []
+    line_ids_A: list[int] = []
+    line_ids_B: list[int] = []
+    maskA = np.zeros_like(white_mask_clean)
+    maskB = np.zeros_like(white_mask_clean)
+    for (x1, y1, x2, y2), ang, lid in zip(lines_all, angles, line_ids_angles):
+        d1 = _angle_distance(float(ang), center1)
+        d2 = _angle_distance(float(ang), center2)
+        if d1 <= band and d1 <= d2:
+            linesA.append((x1, y1, x2, y2))
+            line_ids_A.append(int(lid))
+            cv2.line(maskA, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+        elif d2 <= band:
+            linesB.append((x1, y1, x2, y2))
+            line_ids_B.append(int(lid))
+            cv2.line(maskB, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+
+    if len(linesA) < 3 or len(linesB) < 3:
+        band = math.radians(30.0)
+        linesA = []
+        linesB = []
+        line_ids_A = []
+        line_ids_B = []
+        maskA = np.zeros_like(white_mask_clean)
+        maskB = np.zeros_like(white_mask_clean)
+        for (x1, y1, x2, y2), ang, lid in zip(lines_all, angles, line_ids_angles):
+            d1 = _angle_distance(float(ang), center1)
+            d2 = _angle_distance(float(ang), center2)
+            if d1 <= band and d1 <= d2:
+                linesA.append((x1, y1, x2, y2))
+                line_ids_A.append(int(lid))
+                cv2.line(maskA, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+            elif d2 <= band:
+                linesB.append((x1, y1, x2, y2))
+                line_ids_B.append(int(lid))
+                cv2.line(maskB, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+        if len(linesA) < 3 or len(linesB) < 3:
+            # Last-resort: avoid kmeans here.
+            # kmeans on (cos2θ,sin2θ) can split a sparse orientation into two non-orthogonal clusters.
+            # Force an orthogonal pair and soft-assign by nearest center.
+            base_metrics["angle_cluster_kmeans_used"] = False
+            center2 = float((center1 + math.pi * 0.5) % math.pi)
+
+            linesA = []
+            linesB = []
+            line_ids_A = []
+            line_ids_B = []
+            maskA = np.zeros_like(white_mask_clean)
+            maskB = np.zeros_like(white_mask_clean)
+
+            for (x1, y1, x2, y2), ang, lid in zip(lines_all, angles, line_ids_angles):
+                d1 = _angle_distance(float(ang), center1)
+                d2 = _angle_distance(float(ang), center2)
+                if d1 <= d2:
+                    linesA.append((x1, y1, x2, y2))
+                    line_ids_A.append(int(lid))
+                    cv2.line(maskA, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+                else:
+                    linesB.append((x1, y1, x2, y2))
+                    line_ids_B.append(int(lid))
+                    cv2.line(maskB, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+    hough_lines_img = frame_bgr.copy()
+    for x1, y1, x2, y2 in linesA:
+        cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+    for x1, y1, x2, y2 in linesB:
+        cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+    base_metrics["num_hough_lines_a"] = int(len(linesA))
+    base_metrics["num_hough_lines_b"] = int(len(linesB))
+    if len(linesA) < 3 or len(linesB) < 3:
+        return _fail_result(
+            "R_hough_lines",
+            maskA=maskA,
+            maskB=maskB,
+            hough_lines_img=hough_lines_img,
+            linepix_mask=linepix_mask,
+            linepix_overlay=linepix_overlay,
+            ransac_lines_img=ransac_lines_img,
+            extra_metrics={
+                "num_hough_lines_a": int(len(linesA)),
+                "num_hough_lines_b": int(len(linesB)),
+            },
+        )
+
+    manual_left_lines = None
+    manual_bottom_lines = None
+    manual_metrics.update(
+        {
+            "num_selected_left": 0,
+            "num_selected_bottom": 0,
+            "vp_left_error": None,
+            "vp_bottom_error": None,
+        }
+    )
+    if manual_vp_left and manual_vp_bottom and manual_lt and manual_rb:
+        vp_left = (float(manual_vp_left.get("x")), float(manual_vp_left.get("y")))
+        vp_bottom = (float(manual_vp_bottom.get("x")), float(manual_vp_bottom.get("y")))
+        anchor_lt = (float(manual_lt.get("x")), float(manual_lt.get("y")))
+        anchor_rt = (float(manual_rt.get("x")), float(manual_rt.get("y"))) if manual_rt else None
+        anchor_rb = (float(manual_rb.get("x")), float(manual_rb.get("y")))
+        vp_thresh = 140.0
+        anchor_thresh = 140.0
+        diag = float(math.hypot(frame_bgr.shape[1], frame_bgr.shape[0]))
+
+        def _score_lines(lines):
+            out = []
+            for seg in lines:
+                x1s, y1s, x2s, y2s = seg
+                line = _line_from_points((x1s, y1s), (x2s, y2s))
+                d_vp_left = _line_point_dist(line, vp_left)
+                d_vp_bottom = _line_point_dist(line, vp_bottom)
+                d_lt = _line_point_dist(line, anchor_lt)
+                d_rt = _line_point_dist(line, anchor_rt) if anchor_rt else float("inf")
+                d_rb = _line_point_dist(line, anchor_rb)
+                out.append((seg, line, d_vp_left, d_vp_bottom, d_lt, d_rt, d_rb))
+            return out
+
+        scoredA = _score_lines(linesA)
+        scoredB = _score_lines(linesB)
+        median_left_A = np.median([v[2] for v in scoredA]) if scoredA else float("inf")
+        median_left_B = np.median([v[2] for v in scoredB]) if scoredB else float("inf")
+        use_A_as_left = median_left_A <= median_left_B
+        left_scored = scoredA if use_A_as_left else scoredB
+        bottom_scored = scoredB if use_A_as_left else scoredA
+        left_lines = [
+            seg
+            for (seg, _, d_vpl, _, dlt, drt, _) in left_scored
+            if d_vpl <= vp_thresh and min(dlt, drt) <= anchor_thresh
+        ]
+        bottom_lines = [
+            seg for (seg, _, _, dvp, *_rest, drb) in bottom_scored if dvp <= vp_thresh and drb <= anchor_thresh
+        ]
+        if not left_lines and left_scored:
+            left_scored_sorted = sorted(left_scored, key=lambda v: float(v[2] + min(v[4], v[5])))
+            left_lines = [seg for (seg, *_rest) in left_scored_sorted[:8]]
+            manual_metrics["reject_reason"] = "R_manual_line_filter_loosen_left"
+        if not bottom_lines and bottom_scored:
+            bottom_scored_sorted = sorted(bottom_scored, key=lambda v: float(v[3] + v[5]))
+            bottom_lines = [seg for (seg, *_rest) in bottom_scored_sorted[:8]]
+            manual_metrics["reject_reason"] = "R_manual_line_filter_loosen_bottom"
+        if left_lines and bottom_lines:
+            manual_left_lines = left_lines
+            manual_bottom_lines = bottom_lines
+            manual_metrics["num_selected_left"] = int(len(left_lines))
+            manual_metrics["num_selected_bottom"] = int(len(bottom_lines))
+            vp_left_raw = float(np.median([v[2] for v in left_scored])) if left_scored else None
+            vp_bottom_raw = float(np.median([v[3] for v in bottom_scored])) if bottom_scored else None
+            manual_metrics["vp_left_error_norm"] = (
+                float(vp_left_raw / diag) if vp_left_raw is not None else None
+            )
+            manual_metrics["vp_bottom_error_norm"] = (
+                float(vp_bottom_raw / diag) if vp_bottom_raw is not None else None
+            )
+            manual_metrics["manual_left_group"] = "A" if use_A_as_left else "B"
+        else:
+            manual_metrics["reject_reason"] = "R_manual_line_filter_empty"
+    if manual_metrics:
+        base_metrics.update(manual_metrics)
+    if len(linesA) > 20:
+        pairedA = list(zip(linesA, line_ids_A))
+        pairedA.sort(key=lambda ln: math.hypot(ln[0][2] - ln[0][0], ln[0][3] - ln[0][1]), reverse=True)
+        pairedA = pairedA[:20]
+        linesA = [p[0] for p in pairedA]
+        line_ids_A = [p[1] for p in pairedA]
+    if len(linesB) > 20:
+        pairedB = list(zip(linesB, line_ids_B))
+        pairedB.sort(key=lambda ln: math.hypot(ln[0][2] - ln[0][0], ln[0][3] - ln[0][1]), reverse=True)
+        pairedB = pairedB[:20]
+        linesB = [p[0] for p in pairedB]
+        line_ids_B = [p[1] for p in pairedB]
+
+    lines_left = manual_left_lines if manual_left_lines else linesA
+    lines_bottom = manual_bottom_lines if manual_bottom_lines else linesB
+    line_ids_left = [None] * len(manual_left_lines) if manual_left_lines else line_ids_A
+    line_ids_bottom = [None] * len(manual_bottom_lines) if manual_bottom_lines else line_ids_B
+
+    def _min_point_line_dist(point_xy: Optional[Tuple[float, float]],
+                             segments: list[Tuple[float, float, float, float]]) -> Optional[float]:
+        if point_xy is None or not segments:
+            return None
+        px, py = float(point_xy[0]), float(point_xy[1])
+        best = None
+        for x1, y1, x2, y2 in segments:
+            line = _line_from_points((x1, y1), (x2, y2))
+            dist = abs(_line_signed_distance(line, (px, py)))
+            if best is None or dist < best:
+                best = dist
+        return float(best) if best is not None else None
+
+    if manual_lt and manual_rt and manual_rb:
+        base_metrics["min_dist_line_to_LT"] = _min_point_line_dist(
+            (manual_lt.get("x"), manual_lt.get("y")), lines_left
+        )
+        base_metrics["min_dist_line_to_RT"] = _min_point_line_dist(
+            (manual_rt.get("x"), manual_rt.get("y")), lines_left
+        )
+        base_metrics["min_dist_line_to_RB_bottom"] = _min_point_line_dist(
+            (manual_rb.get("x"), manual_rb.get("y")), lines_bottom
+        )
+        base_metrics["min_dist_line_to_RB_right"] = _min_point_line_dist(
+            (manual_rb.get("x"), manual_rb.get("y")), lines_left
+        )
+    manual_left_group = manual_metrics.get("manual_left_group")
+    if manual_left_group == "B":
+        mask_left = maskB
+        mask_bottom = maskA
+        center_left = center2
+    else:
+        mask_left = maskA
+        mask_bottom = maskB
+        center_left = center1
+
+    # --- FIX: left/right boundaries are NOT parallel under perspective ---
+    # Prefer VP-based pairing to avoid selecting two nearly-parallel left lines.
+    pairsA = []
+    if not manual_left_lines:
+        pairsA = candidate_outer_pairs_vp(
+            lines_left,
+            mask_left,
+            floor_bbox,
+            (h, w),
+            top_k=16,
+            max_pairs=6,
+        )
+
+    # Fallback to angle-based pairing (kept for safety / manual mode)
+    if not pairsA:
+        pairsA = candidate_outer_pairs(
+            lines_left,
+            mask_left,
+            angle_ref=center_left,
+            top_k=12 if manual_left_lines else 12,
+            max_pairs=6,
+            max_angle_deg=90.0 if manual_left_lines else 25.0,
+        )
+    if manual_bottom_lines:
+        center_bottom = center2 if center_left == center1 else center1
+        pairsB = candidate_outer_pairs(
+            lines_bottom,
+            mask_bottom,
+            angle_ref=center_bottom,
+            top_k=12,
+            max_pairs=6,
+            max_angle_deg=40.0,
+        )
+    else:
+        pairsB = candidate_outer_pairs_vp(lines_bottom, mask_bottom, floor_bbox, (h, w), top_k=16, max_pairs=6)
+    if not pairsB:
+        center_bottom = center2 if center_left == center1 else center1
+        pairsB = candidate_outer_pairs(
+            lines_bottom,
+            mask_bottom,
+            angle_ref=center_bottom,
+            top_k=8 if manual_bottom_lines else 6,
+            max_pairs=3,
+            max_angle_deg=90.0 if manual_bottom_lines else 15.0,
+        )
+    # Force extreme boundary combinations to be considered
+    if len(lines_left) >= 2:
+        lines_left_sorted = sorted(lines_left, key=lambda seg: min(float(seg[0]), float(seg[2])))
+        left_seg, right_seg = lines_left_sorted[0], lines_left_sorted[-1]
+        line_left_ext = _line_from_points((left_seg[0], left_seg[1]), (left_seg[2], left_seg[3]))
+        line_right_ext = _line_from_points((right_seg[0], right_seg[1]), (right_seg[2], right_seg[3]))
+        pairsA.append(((line_left_ext, line_right_ext), 1e6))
+    if len(lines_bottom) >= 2:
+        lines_bottom_sorted = sorted(lines_bottom, key=lambda seg: min(float(seg[1]), float(seg[3])))
+        bottom_seg, top_seg = lines_bottom_sorted[-1], lines_bottom_sorted[0]
+        line_bottom_ext = _line_from_points((bottom_seg[0], bottom_seg[1]), (bottom_seg[2], bottom_seg[3]))
+        line_top_ext = _line_from_points((top_seg[0], top_seg[1]), (top_seg[2], top_seg[3]))
+        pairsB.append(((line_bottom_ext, line_top_ext), 1e6))
+    if manual_lt and manual_rt and manual_rb and manual_left_lines and manual_bottom_lines:
+        def _seg_line_and_dist(segments, pt):
+            px, py = float(pt[0]), float(pt[1])
+            scored = []
+            for x1s, y1s, x2s, y2s in segments:
+                line = _line_from_points((x1s, y1s), (x2s, y2s))
+                dist = abs(_line_signed_distance(line, (px, py)))
+                scored.append((dist, line))
+            return scored
+
+        scored_lt = sorted(_seg_line_and_dist(lines_left, (manual_lt["x"], manual_lt["y"])), key=lambda v: v[0])
+        scored_rt = sorted(_seg_line_and_dist(lines_left, (manual_rt["x"], manual_rt["y"])), key=lambda v: v[0])
+        if scored_lt and scored_rt:
+            line_lt = scored_lt[0][1]
+            line_rt = next((ln for _, ln in scored_rt if ln != line_lt), None)
+            if line_rt is not None:
+                pairsA.append(((line_lt, line_rt), 1e6))
+
+        scored_rb = _seg_line_and_dist(lines_bottom, (manual_rb["x"], manual_rb["y"]))
+        if scored_rb:
+            scored_rb.sort(key=lambda v: v[0])
+            line_rb = scored_rb[0][1]
+            line_far = max(scored_rb, key=lambda v: v[0])[1]
+            if line_far != line_rb:
+                pairsB.append(((line_rb, line_far), 1e6))
+    if manual_lb and manual_rb and manual_rt and manual_lt:
+        left_line = _line_from_points((manual_lt["x"], manual_lt["y"]), (manual_lb["x"], manual_lb["y"]))
+        right_line = _line_from_points((manual_rt["x"], manual_rt["y"]), (manual_rb["x"], manual_rb["y"]))
+        bottom_line = _line_from_points((manual_lb["x"], manual_lb["y"]), (manual_rb["x"], manual_rb["y"]))
+        top_line = _line_from_points((manual_lt["x"], manual_lt["y"]), (manual_rt["x"], manual_rt["y"]))
+        pairsA.append(((left_line, right_line), 1e6))
+        pairsB.append(((bottom_line, top_line), 1e6))
+        base_metrics["manual_pairs_added"] = True
+    base_metrics["num_hough_pairs_a"] = int(len(pairsA))
+    base_metrics["num_hough_pairs_b"] = int(len(pairsB))
+    if not pairsA or not pairsB:
+        hough_lines_img = frame_bgr.copy()
+        for x1, y1, x2, y2 in linesA:
+            cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+        for x1, y1, x2, y2 in linesB:
+            cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+        return _fail_result(
+            "R_hough_pair",
+            maskA=maskA,
+            maskB=maskB,
+            hough_lines_img=hough_lines_img,
+            linepix_mask=linepix_mask,
+            linepix_overlay=linepix_overlay,
+            ransac_lines_img=ransac_lines_img,
+            extra_metrics={
+                "num_hough_lines_a": int(len(linesA)),
+                "num_hough_lines_b": int(len(linesB)),
+                "num_hough_pairs_a": int(len(pairsA)),
+                "num_hough_pairs_b": int(len(pairsB)),
+            },
+        )
+    best_pairA = None
+    best_pairB = None
+    best_ordered = None
+    best_area_ratio = None
+    best_inside_ratio = None
+    best_score = float("-inf")
+    best_score_base = None
+    best_inside_count: Optional[int] = None
+    best_inside_bonus: Optional[float] = None
+    reject_aspect_ratio = 0
+    reject_roi_corner = 0
+    h, w = white_mask_clean.shape[:2]
+    margin = 20
+    img_bbox = (margin, margin, int(w - 1 - margin), int(h - 1 - margin))
+    bbox_w = max(1, int(x1 - x0))
+    bbox_h = max(1, int(y1 - y0))
+    corner_margin_x = max(24, int(round(0.05 * float(bbox_w))))
+    corner_margin_y = max(24, int(round(0.05 * float(bbox_h))))
+    reject_manual_anchor = 0
+    best_anchor_score = None
+    best_mixer_parts: Optional[Dict[str, float]] = None
+    best_area_ratio_img: Optional[float] = None
+    best_ymax_ratio: Optional[float] = None
+    best_bottom_support: Optional[float] = None
+    reject_area_ratio_low = 0
+    reject_ymax_ratio_low = 0
+    reject_degenerate_bbox = 0
+    reject_degenerate_min_edge = 0
+    top3_main: list[Tuple[float, float, float, float]] = []
+    relaxed_pass = 0
+    vp_a = _estimate_vanishing_point(
+        [_line_from_points((x1, y1), (x2, y2)) for x1, y1, x2, y2 in linesA], rng
+    )
+    vp_b = _estimate_vanishing_point(
+        [_line_from_points((x1, y1), (x2, y2)) for x1, y1, x2, y2 in linesB], rng
+    )
+    for relax_scale in (1.0, 0.7):
+        if relax_scale < 1.0:
+            relaxed_pass = 1
+        best_pairA = None
+        best_pairB = None
+        best_ordered = None
+        best_area_ratio = None
+        best_inside_ratio = None
+        best_score = float("-inf")
+        best_mixer_parts = None
+        best_area_ratio_img = None
+        best_ymax_ratio = None
+        best_bottom_support = None
+        top3_main = []
+        deg_bbox_w = 0.08 * float(w) * float(relax_scale)
+        deg_bbox_h = 0.06 * float(h) * float(relax_scale)
+        deg_edge = 0.05 * float(min(h, w)) * float(relax_scale)
+        min_area_ratio_img = float(os.environ.get("BADC_QRT_MIN_AREA_RATIO_IMG", "0.04"))
+        aspect_min = float(os.environ.get("BADC_QRT_ASPECT_MIN", "1.4"))
+        aspect_max = float(os.environ.get("BADC_QRT_ASPECT_MAX", "3.0"))
+        for pairA, _scoreA in pairsA:
+            for pairB, _scoreB in pairsB:
+                quad = _intersections_from_pairs(pairA, pairB)
+                if quad is None:
+                    continue
+                ordered = _order_corners_lb_rb_rt_lt(quad)
+                if not _is_convex_quad(ordered):
+                    continue
+                if _quad_area(ordered) < 1.0:
+                    continue
+                ok, _gate_reason, _gate_metrics = _passes_geom_gates(ordered, floor_bbox)
+                if not ok:
+                    continue
+                bbox_w = float(np.max(ordered[:, 0]) - np.min(ordered[:, 0]))
+                bbox_h = float(np.max(ordered[:, 1]) - np.min(ordered[:, 1]))
+                min_edge = float(np.min(_quad_edges(ordered)))
+                if bbox_w < deg_bbox_w or bbox_h < deg_bbox_h:
+                    reject_degenerate_bbox += 1
+                    continue
+                if min_edge < deg_edge:
+                    reject_degenerate_min_edge += 1
+                    continue
+                quad_clip = ordered.copy()
+                quad_clip[:, 0] = np.clip(quad_clip[:, 0], 0.0, float(w - 1))
+                quad_clip[:, 1] = np.clip(quad_clip[:, 1], 0.0, float(h - 1))
+                quad_area = float(_quad_area(quad_clip))
+                area_ratio_img = quad_area / float(max(h * w, 1.0))
+                if area_ratio_img < float(min_area_ratio_img):
+                    reject_area_ratio_low += 1
+                    continue
+                w1 = float(np.linalg.norm(ordered[1] - ordered[0]))
+                w2 = float(np.linalg.norm(ordered[2] - ordered[3]))
+                h1 = float(np.linalg.norm(ordered[3] - ordered[0]))
+                h2 = float(np.linalg.norm(ordered[2] - ordered[1]))
+                mean_w = 0.5 * (w1 + w2)
+                mean_h = 0.5 * (h1 + h2)
+                aspect_ratio = max(mean_w, mean_h) / max(min(mean_w, mean_h), 1e-6)
+                if aspect_ratio < float(aspect_min) or aspect_ratio > float(aspect_max):
+                    reject_aspect_ratio += 1
+                    continue
+                y_vals = ordered[:, 1]
+                ymax_ratio = max(0.0, min(1.0, float(np.max(y_vals)) / float(max(h - 1, 1))))
+                ymean_ratio = max(0.0, min(1.0, float(np.mean(y_vals)) / float(max(h - 1, 1))))
+                if ymax_ratio < 0.70:
+                    reject_ymax_ratio_low += 1
+                H_cand = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), ordered.astype(np.float32))
+                if not np.all(np.isfinite(H_cand)):
+                    continue
+                loss_info = _compute_loss_terms(
+                    H_cand,
+                    dt=dt,
+                    Xw=Xw_full,
+                    weights=w_full,
+                    cover_points=None,
+                    floor_bbox=floor_bbox,
+                    tau_px=6.0,
+                    dt_oob=dt_oob,
+                )
+                score, mixer_parts = _mixer_score_candidate(
+                    ordered,
+                    loss_info,
+                    floor_bbox,
+                    vp_long=vp_a,
+                    vp_short=vp_b,
+                )
+                bottom_support = _bottom_support_from_loss(loss_info, ymax_ratio, h, tau_px=6.0)
+                score_final = float(
+                    score
+                    + 6.0 * math.log(max(area_ratio_img, 1e-6))
+                    + 3.0 * ymean_ratio
+                    + 2.0 * ymax_ratio
+                    + 4.0 * bottom_support
+                )
+                inside_count_val, _inside_flags = _count_points_inside_quad(ordered, foot_points)
+                inside_bonus = 10.0 * float(inside_count_val)
+                if manual_lt and manual_rt and manual_rb:
+                    err_map = _corner_errors_to_manual(ordered, manual.get("court_corners") if manual else None)
+                    err_lt = err_map.get("err_LT")
+                    err_rt = err_map.get("err_RT")
+                    err_rb = err_map.get("err_RB")
+                    if (err_rt is not None and err_rt > 300.0) or (err_rb is not None and err_rb > 300.0):
+                        reject_manual_anchor += 1
+                        continue
+                    err_vals = [v for v in [err_lt, err_rt, err_rb] if v is not None]
+                    err_mean = float(np.mean(err_vals)) if err_vals else 999.0
+                    anchor_score = float(math.exp(-err_mean / 200.0))
+                    score_final *= (0.8 + 0.2 * anchor_score)
+                    best_anchor_score = anchor_score
+                score_total = float(score_final + inside_bonus)
+                if score_total > best_score:
+                    best_score = score_total
+                    best_score_base = float(score_final)
+                    best_pairA = pairA
+                    best_pairB = pairB
+                    best_ordered = ordered
+                    best_area_ratio = float(loss_info.get("area_ratio", 0.0))
+                    best_inside_ratio = _points_inside_ratio(ordered, img_bbox)
+                    best_mixer_parts = mixer_parts
+                    best_area_ratio_img = float(area_ratio_img)
+                    best_ymax_ratio = float(ymax_ratio)
+                    best_bottom_support = float(bottom_support)
+                    best_inside_count = int(inside_count_val)
+                    best_inside_bonus = float(inside_bonus)
+                top3_main.append((score_total, area_ratio_img, ymax_ratio, bottom_support, inside_count_val))
+        if best_pairA is not None and best_pairB is not None and best_ordered is not None:
+            break
+
+    base_metrics["reject_roi_corner"] = int(reject_roi_corner)
+    base_metrics["reject_manual_anchor"] = int(reject_manual_anchor)
+    base_metrics["reject_area_ratio_low"] = int(reject_area_ratio_low)
+    base_metrics["reject_ymax_ratio_low"] = int(reject_ymax_ratio_low)
+    base_metrics["reject_degenerate_bbox"] = int(reject_degenerate_bbox)
+    base_metrics["reject_degenerate_min_edge"] = int(reject_degenerate_min_edge)
+    base_metrics["reject_aspect_ratio"] = int(reject_aspect_ratio)
+    base_metrics["relaxed_pass"] = int(relaxed_pass)
+    top3_main.sort(key=lambda item: item[0], reverse=True)
+    base_metrics["top3_mainfield"] = [
+        {
+            "score_final": float(s),
+            "score_total": float(s),
+            "area_ratio": float(a),
+            "ymax_ratio": float(y),
+            "bottom_support": float(b),
+            "inside_count": int(ic),
+        }
+        for s, a, y, b, ic in top3_main[:3]
+    ]
+    base_metrics["selected_area_ratio"] = float(best_area_ratio_img) if best_area_ratio_img is not None else None
+    base_metrics["selected_ymax_ratio"] = float(best_ymax_ratio) if best_ymax_ratio is not None else None
+    base_metrics["selected_bottom_support"] = (
+        float(best_bottom_support) if best_bottom_support is not None else None
+    )
+    if best_anchor_score is not None:
+        base_metrics["best_anchor_score"] = float(best_anchor_score)
+    if isinstance(best_mixer_parts, dict):
+        base_metrics.update(best_mixer_parts)
+    base_metrics["score_base"] = float(best_score_base) if best_score_base is not None else None
+    base_metrics["score_total"] = float(best_score) if best_score != float("-inf") else None
+    base_metrics["inside_count"] = int(best_inside_count) if best_inside_count is not None else 0
+    base_metrics["inside_bonus"] = float(best_inside_bonus) if best_inside_bonus is not None else 0.0
+    base_metrics["score_final"] = base_metrics["score_base"]
+    if base_metrics.get("max_inside_count") is None:
+        base_metrics["max_inside_count"] = int(base_metrics["inside_count"])
+    if base_metrics.get("selection_reason") is None:
+        base_metrics["selection_reason"] = "single_component"
+    if best_score_base is not None or best_inside_bonus is not None:
+        base_metrics["score_breakdown"] = {
+            "base": float(best_score_base) if best_score_base is not None else None,
+            "inside_bonus": float(best_inside_bonus) if best_inside_bonus is not None else None,
+            "score_total": float(best_score) if best_score != float("-inf") else None,
+        }
+
+    if best_pairA is None or best_pairB is None or best_ordered is None:
+        H_raw, raw_metrics, raw_debug = _fit_court_homography_from_raw_floor_debug(
+            white_mask_raw_floor_postblob,
+            frame_bgr.shape,
+            floor_roi_mask=floor_mask,
+            white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+        )
+        if H_raw is not None:
+            dt_raw = build_distance_transform(white_mask_raw_floor_postblob)
+            dt_raw_min = float(np.min(dt_raw)) if dt_raw.size > 0 else None
+            dt_raw_mean = float(np.mean(dt_raw)) if dt_raw.size > 0 else None
+            dt_raw_p90 = float(np.percentile(dt_raw, 90)) if dt_raw.size > 0 else None
+            cover_points_raw = _sample_white_points(white_mask_raw_floor_postblob, max_points=1500, rng=rng)
+            loss_info = _compute_loss_terms(
+                H_raw,
+                dt=dt_raw,
+                Xw=Xw_full,
+                weights=w_full,
+                cover_points=cover_points_raw,
+                floor_bbox=floor_bbox,
+                tau_px=3.0,
+                dt_oob=dt_oob,
+            )
+            p90_raw = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 999.0)
+            cover_ratio = float(loss_info.get("cover_ratio", 0.0))
+            inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
+            cost = 0.6 * p90_raw + 0.4 * (1.0 - cover_ratio) * 50.0 + (1.0 - inlier_ratio) * 30.0
+            conf_terms = _confidence_terms(inlier_ratio, cover_ratio, p90_raw, float(loss_info.get("area_ratio", 0.0)))
+            conf = float(conf_terms["confidence"])
+            score1 = raw_metrics.get("raw_floor_best_score")
+            top5 = raw_metrics.get("raw_floor_top5") if isinstance(raw_metrics, dict) else None
+            score2 = None
+            if isinstance(top5, list) and len(top5) > 1:
+                try:
+                    score2 = float(top5[1].get("score"))
+                except Exception:
+                    score2 = None
+            conf_raw = None
+            conf_gap = None
+            conf_gap_input = None
+            if score1 is not None and isinstance(score1, (int, float)):
+                conf_raw = float(math.exp(-float(score1) / 3.0))
+                gap = float(score2 - score1) if score2 is not None else 0.0
+                z = float(gap / 0.5)
+                z = max(-60.0, min(60.0, z))
+                conf_gap_input = float(z)
+                conf_gap = float(1.0 / (1.0 + math.exp(-z)))
+                conf = max(0.0, min(1.0, conf_raw * conf_gap))
+            conf_auto = float(conf)
+            reason = "OK" if conf >= 0.10 else "R_fit_poor"
+            corners_uv = project_points(H_raw, corners_world)
+            ordered_corners = _order_corners_lb_rb_rt_lt(corners_uv)
+            span_ok, span_metrics = _quad_span_ok(ordered_corners, frame_bgr.shape[1], frame_bgr.shape[0])
+            base_metrics.update(span_metrics)
+            corners_out = ordered_corners.astype(np.float32)
+            deg_bbox_w = float(np.max(ordered_corners[:, 0]) - np.min(ordered_corners[:, 0]))
+            deg_bbox_h = float(np.max(ordered_corners[:, 1]) - np.min(ordered_corners[:, 1]))
+            deg_min_edge = float(np.min(_quad_edges(ordered_corners)))
+            base_metrics["degenerate_predicted_corners_bbox"] = [float(deg_bbox_w), float(deg_bbox_h)]
+            base_metrics["degenerate_predicted_corners_min_edge"] = float(deg_min_edge)
+            if deg_bbox_w < 0.08 * float(frame_bgr.shape[1]) or deg_bbox_h < 0.06 * float(frame_bgr.shape[0]) or (
+                deg_min_edge < 0.05 * float(min(frame_bgr.shape[0], frame_bgr.shape[1]))
+            ):
+                reason = "R_degenerate_quad"
+                conf = 0.0
+                conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and not manual:
+                fb_w = max(1, int(floor_bbox[2] - floor_bbox[0]))
+                fb_h = max(1, int(floor_bbox[3] - floor_bbox[1]))
+                mx = max(24, int(round(0.05 * float(fb_w))))
+                my = max(24, int(round(0.05 * float(fb_h))))
+                if not _corners_inside_floor_roi(corners_out, floor_bbox, margin_x=mx, margin_y=my):
+                    base_metrics["corners_outside_floor_roi"] = True
+            pred_corners = _format_predicted_corners(ordered_corners, frame_bgr.shape[1], frame_bgr.shape[0])
+            err_map = _corner_errors_to_manual(ordered_corners, manual.get("court_corners") if manual else None)
+            err_lt = err_map.get("err_LT")
+            err_rt = err_map.get("err_RT")
+            err_rb = err_map.get("err_RB")
+            err_vals = [v for v in [err_lt, err_rt, err_rb] if v is not None]
+            err_mean = float(np.mean(err_vals)) if err_vals else 999.0
+            conf_geom = float(math.exp(-err_mean / 200.0)) if manual_vis else 1.0
+            conf_support = float(min(1.0, max(0.0, 0.5 * (inlier_ratio + cover_ratio))))
+            conf_visible = float(sum(1 for v in pred_corners if v.get("visible")) / 4.0)
+            anchor_tol = 80.0
+            if reason == "OK" and manual_vis:
+                if (manual_vis.get("LT") and err_lt is not None and err_lt > anchor_tol) or (
+                    manual_vis.get("RT") and err_rt is not None and err_rt > anchor_tol
+                ) or (manual_vis.get("RB") and err_rb is not None and err_rb > anchor_tol):
+                    base_metrics["manual_anchor_violation"] = True
+                    conf = float(conf) * 0.7
+            if manual_vis and not base_metrics.get("manual_override", False):
+                if base_metrics.get("manual_anchor_violation") or (
+                    err_rt is not None and err_rt > 120.0
+                ) or (err_rb is not None and err_rb > 150.0):
+                    reason = "R_manual_anchor_violation"
+                    corners_out = None
+                    conf = 0.0
+                    conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+            if reason != "OK" and manual_quad is not None:
+                H_manual = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), manual_quad.astype(np.float32))
+                manual_loss = _compute_loss_terms(
+                    H_manual,
+                    dt=dt_raw,
+                    Xw=Xw_full,
+                    weights=w_full,
+                    cover_points=cover_points_raw,
+                    floor_bbox=floor_bbox,
+                    tau_px=3.0,
+                    dt_oob=dt_oob,
+                )
+                p90_manual = float(manual_loss.get("sample_dist_p90_raw") or manual_loss.get("sample_dist_p90") or 999.0)
+                cover_manual = float(manual_loss.get("cover_ratio", 0.0))
+                inlier_manual = float(manual_loss.get("inlier_ratio", 0.0))
+                conf_manual_terms = _confidence_terms(
+                    inlier_manual, cover_manual, p90_manual, float(manual_loss.get("area_ratio", 0.0))
+                )
+                base_metrics["manual_candidate_confidence"] = float(conf_manual_terms["confidence"])
+                base_metrics["manual_candidate_cost"] = float(
+                    0.6 * p90_manual + 0.4 * (1.0 - cover_manual) * 50.0 + (1.0 - inlier_manual) * 30.0
+                )
+            frame_overlay = _draw_model_lines(frame_bgr, H_raw, (0, 255, 0))
+            raw_overlay = raw_debug.get("overlay_raw")
+            raw_best_mixer = raw_metrics.get("raw_floor_best_mixer") if isinstance(raw_metrics, dict) else None
+            if isinstance(raw_best_mixer, dict):
+                base_metrics.update(raw_best_mixer)
+            metrics = {
+                **base_metrics,
+                **raw_metrics,
+                "raw_floor_fit_used": True,
+                "H": [float(v) for v in H_raw.reshape(-1)],
+                "dt_min": dt_raw_min,
+                "dt_mean": dt_raw_mean,
+                "dt_p90": dt_raw_p90,
+                "cost_total": float(cost),
+                "confidence": float(conf),
+                "s_inlier": float(conf_terms["s_inlier"]),
+                "s_cover": float(conf_terms["s_cover"]),
+                "s_p90": float(conf_terms["s_p90"]),
+                "s_area": float(conf_terms["s_area"]),
+                "inlier_ratio": float(inlier_ratio),
+                "mean_dist_px": float(loss_info.get("sample_dist_mean") or 0.0),
+                "p90_dist_px": float(p90_raw),
+                "num_inliers": int(loss_info.get("num_inliers", 0)),
+                "num_valid_samples": int(loss_info.get("num_valid_samples", 0)),
+                "num_samples": int(loss_info.get("num_samples", Xw_full.shape[0])),
+                "dt_oob_count": int(loss_info.get("dt_oob_count", 0)),
+                "dt_oob_ratio": float(loss_info.get("dt_oob_count", 0)) / float(max(loss_info.get("num_samples", 1), 1)),
+                "tau_px": 3.0,
+                "l_dist": float(loss_info.get("l_dist", 0.0)),
+                "l_cover": float(loss_info.get("l_cover", 0.0)),
+                "l_reg": float(loss_info.get("l_reg", 0.0)),
+                "area_ratio": float(loss_info.get("area_ratio", 0.0)),
+                "cover_ratio": float(cover_ratio),
+                "raw_floor_conf_raw": float(conf_raw) if conf_raw is not None else None,
+                "raw_floor_conf_gap": float(conf_gap) if conf_gap is not None else None,
+                "conf_gap_input": float(conf_gap_input) if conf_gap_input is not None else None,
+                "raw_floor_conf_final": float(conf),
+                "confidence_auto": float(conf_auto),
+                "confidence_final": float(conf),
+                "conf_geom": float(conf_geom),
+                "conf_support": float(conf_support),
+                "conf_visible": float(conf_visible),
+                "predicted_corners": pred_corners,
+                "err_LT": err_lt,
+                "err_RT": err_rt,
+                "err_RB": err_rb,
+            }
+            if metrics.get("selected_component_id") is None:
+                metrics["selected_component_id"] = int(base_metrics.get("component_id") or 0)
+            return CourtFitResult(
+                H=H_raw,
+                corners=corners_out,
+                confidence=conf,
+                metrics=metrics,
+                reason=reason,
+                debug_image=frame_overlay,
+                white_mask=white_mask_clean,
+                debug_image_init=frame_overlay,
+                white_mask_raw=white_mask_raw_full,
+                white_mask_clean=white_mask_clean,
+                white_mask_raw_full=white_mask_raw_full,
+                white_mask_raw_floor=white_mask_raw_floor,
+                white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+                white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+                white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+                floor_roi_mask=floor_mask,
+                floor_roi_overlay=floor_roi_overlay,
+                seed_bottom_mask=floor_debug.get("seed_bottom_mask"),
+                green_mask=floor_debug.get("green_mask"),
+                largest_cc_mask=floor_debug.get("largest_cc_mask"),
+                exg_row_plot=floor_debug.get("exg_row_plot"),
+                linepix_mask=linepix_mask,
+                linepix_overlay=linepix_overlay,
+                ransac_lines_img=ransac_lines_img,
+                raw_floor_hough_lines_img=raw_debug.get("hough_lines"),
+                raw_floor_dt_debug=raw_debug.get("dt"),
+                raw_floor_model_overlay=raw_overlay,
+                raw_floor_top5_overlay=raw_debug.get("overlay_top5"),
+                raw_floor_preprocessed=raw_debug.get("preprocessed"),
+                raw_floor_edges=raw_debug.get("edges"),
+                raw_floor_hough_lines_a=raw_debug.get("hough_lines_a"),
+                raw_floor_hough_lines_b=raw_debug.get("hough_lines_b"),
+                frame_model_overlay=frame_overlay,
+                dt_debug=raw_debug.get("dt"),
+                ori_mask_a=maskA,
+                ori_mask_b=maskB,
+                hough_lines_img=hough_lines_img,
+            )
+        fail = _fail_result(
+            "R_hough_geometry",
+            maskA=maskA,
+            maskB=maskB,
+            linepix_mask=linepix_mask,
+            linepix_overlay=linepix_overlay,
+            ransac_lines_img=ransac_lines_img,
+            extra_metrics={
+                "num_hough_lines_a": int(len(linesA)),
+                "num_hough_lines_b": int(len(linesB)),
+                "num_hough_pairs_a": int(len(pairsA)),
+                "num_hough_pairs_b": int(len(pairsB)),
+                **raw_metrics,
+            },
+        )
+        fail.raw_floor_hough_lines_img = raw_debug.get("hough_lines")
+        fail.raw_floor_dt_debug = raw_debug.get("dt")
+        fail.raw_floor_model_overlay = raw_debug.get("overlay_raw")
+        fail.raw_floor_top5_overlay = raw_debug.get("overlay_top5")
+        fail.raw_floor_preprocessed = raw_debug.get("preprocessed")
+        fail.raw_floor_edges = raw_debug.get("edges")
+        fail.raw_floor_hough_lines_a = raw_debug.get("hough_lines_a")
+        fail.raw_floor_hough_lines_b = raw_debug.get("hough_lines_b")
+        return fail
+
+    pairA = best_pairA
+    pairB = best_pairB
+    ordered = best_ordered
+    area_ratio = float(best_area_ratio) if best_area_ratio is not None else 0.0
+    inside_ratio = float(best_inside_ratio) if best_inside_ratio is not None else 0.0
+
+    completion_used = False
+    completion_meta: Dict[str, Any] = {}
+    completion_reject_reason = None
+    if ordered is not None and lines_left and lines_bottom:
+        lines_left_comp, line_ids_left_comp = _filter_lines_for_completion(lines_left, line_ids_left, ordered)
+        lines_bottom_comp, line_ids_bottom_comp = _filter_lines_for_completion(lines_bottom, line_ids_bottom, ordered)
+        floor_h = float(max(1.0, float(floor_bbox[3] - floor_bbox[1])))
+        y_sorted = np.sort(ordered[:, 1])
+        bottom_min = float(y_sorted[-2]) if y_sorted.size >= 2 else float(np.max(ordered[:, 1]))
+        out_of_frame = np.any(
+            (ordered[:, 0] < -0.05 * w)
+            | (ordered[:, 0] > 1.05 * w)
+            | (ordered[:, 1] < -0.05 * h)
+            | (ordered[:, 1] > 1.05 * h)
+        )
+        if (not lines_left_comp or not lines_bottom_comp) and completion_reject_reason is None:
+            completion_reject_reason = "completion_no_inlier_lines"
+        if (out_of_frame or bottom_min < (float(floor_bbox[1]) + 0.65 * floor_h)) and lines_left_comp and lines_bottom_comp:
+            completed, ok, meta = _complete_corners_from_lines(
+                ordered,
+                lines_left=lines_left_comp,
+                lines_bottom=lines_bottom_comp,
+                floor_bbox=floor_bbox,
+                img_w=w,
+                img_h=h,
+                line_mask=linepix_mask,
+                line_ids_left=line_ids_left_comp,
+                line_ids_bottom=line_ids_bottom_comp,
+                component_id=component_id,
+            )
+            if ok:
+                comp_bbox_w = float(np.max(completed[:, 0]) - np.min(completed[:, 0]))
+                comp_bbox_h = float(np.max(completed[:, 1]) - np.min(completed[:, 1]))
+                comp_min_edge = float(np.min(_quad_edges(completed)))
+                comp_area = float(_quad_area(completed))
+                comp_area_ratio = comp_area / float(max(w * h, 1.0))
+                if comp_min_edge < 0.05 * float(min(w, h)):
+                    completion_reject_reason = "completion_min_edge"
+                elif comp_area_ratio < 0.02:
+                    completion_reject_reason = "completion_area_small"
+                elif comp_bbox_h < 0.06 * float(h):
+                    completion_reject_reason = "completion_bbox_h_small"
+                else:
+                    ordered = completed
+                    completion_used = True
+                    completion_meta = meta
+    base_metrics["corner_completion_used"] = bool(completion_used)
+    if completion_reject_reason:
+        base_metrics["corner_completion_rejected_reason"] = completion_reject_reason
+    if completion_used and isinstance(completion_meta, dict):
+        def _line_to_list(line_val: Optional[Tuple[float, float, float]]) -> Optional[list]:
+            if line_val is None:
+                return None
+            return [float(line_val[0]), float(line_val[1]), float(line_val[2])]
+
+        base_metrics["completed_LB"] = [float(ordered[0, 0]), float(ordered[0, 1])]
+        base_metrics["completed_RB"] = [float(ordered[1, 0]), float(ordered[1, 1])]
+        base_metrics["completed_RT"] = [float(ordered[2, 0]), float(ordered[2, 1])]
+        base_metrics["completed_LT"] = [float(ordered[3, 0]), float(ordered[3, 1])]
+        base_metrics["baseline_line"] = _line_to_list(completion_meta.get("baseline_line"))
+        base_metrics["left_sideline_line"] = _line_to_list(completion_meta.get("left_sideline"))
+        base_metrics["right_sideline_line"] = _line_to_list(completion_meta.get("right_sideline"))
+        base_metrics["top_line"] = _line_to_list(completion_meta.get("top_line"))
+        base_metrics["baseline_line_meta"] = completion_meta.get("baseline_meta")
+        base_metrics["left_sideline_meta"] = completion_meta.get("left_sideline_meta")
+        base_metrics["right_sideline_meta"] = completion_meta.get("right_sideline_meta")
+        base_metrics["top_line_meta"] = completion_meta.get("top_line_meta")
+
+    H_best = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), ordered.astype(np.float32))
+    cover_points = _sample_white_points(white_mask_clean, max_points=1500, rng=rng)
+    tau_px = 6.0
+    loss_info = _compute_loss_terms(
+        H_best,
+        dt=dt,
+        Xw=Xw_full,
+        weights=w_full,
+        cover_points=cover_points,
+        floor_bbox=floor_bbox,
+        tau_px=tau_px,
+        dt_oob=dt_oob,
+    )
+    p90_raw = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 999.0)
+    cover_ratio = float(loss_info.get("cover_ratio", 0.0))
+    inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
+    cost = 0.6 * p90_raw + 0.4 * (1.0 - cover_ratio) * 50.0 + (1.0 - inlier_ratio) * 30.0
+
+    conf_terms = _confidence_terms(inlier_ratio, cover_ratio, p90_raw, float(loss_info.get("area_ratio", 0.0)))
+    conf = float(conf_terms["confidence"])
+    conf_auto = float(conf)
+    reason = "OK" if conf >= 0.35 else "R_fit_poor"
+    dt_oob_count = int(loss_info.get("dt_oob_count", 0))
+    num_samples = int(loss_info.get("num_samples", 0))
+    dt_oob_ratio = float(dt_oob_count) / float(max(num_samples, 1))
+    if dt_oob_ratio > 0.2:
+        reason = "R_dt_oob"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+
+    corners_uv = project_points(H_best, corners_world)
+    ordered_corners = _order_corners_lb_rb_rt_lt(corners_uv)
+    span_ok, span_metrics = _quad_span_ok(ordered_corners, w, h)
+    base_metrics.update(span_metrics)
+    corners_out = ordered_corners.astype(np.float32)
+    deg_bbox_w = float(np.max(ordered_corners[:, 0]) - np.min(ordered_corners[:, 0]))
+    deg_bbox_h = float(np.max(ordered_corners[:, 1]) - np.min(ordered_corners[:, 1]))
+    deg_min_edge = float(np.min(_quad_edges(ordered_corners)))
+    base_metrics["degenerate_predicted_corners_bbox"] = [float(deg_bbox_w), float(deg_bbox_h)]
+    base_metrics["degenerate_predicted_corners_min_edge"] = float(deg_min_edge)
+    if deg_bbox_w < 0.08 * float(w) or deg_bbox_h < 0.06 * float(h) or (
+        deg_min_edge < 0.05 * float(min(h, w))
+    ):
+        reason = "R_degenerate_quad"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+        corners_out = None
+    if corners_out is not None and not manual:
+        fb_w = max(1, int(floor_bbox[2] - floor_bbox[0]))
+        fb_h = max(1, int(floor_bbox[3] - floor_bbox[1]))
+        mx = max(24, int(round(0.05 * float(fb_w))))
+        my = max(24, int(round(0.05 * float(fb_h))))
+        if not _corners_inside_floor_roi(corners_out, floor_bbox, margin_x=mx, margin_y=my):
+            base_metrics["corners_outside_floor_roi"] = True
+    pred_corners = _format_predicted_corners(ordered_corners, frame_bgr.shape[1], frame_bgr.shape[0])
+    err_map = _corner_errors_to_manual(ordered_corners, manual.get("court_corners") if manual else None)
+    err_lt = err_map.get("err_LT")
+    err_rt = err_map.get("err_RT")
+    err_rb = err_map.get("err_RB")
+    err_vals = [v for v in [err_lt, err_rt, err_rb] if v is not None]
+    err_mean = float(np.mean(err_vals)) if err_vals else 999.0
+    conf_geom = float(math.exp(-err_mean / 200.0)) if manual_vis else 1.0
+    if best_anchor_score is not None:
+        conf_geom = max(conf_geom, float(best_anchor_score))
+    conf_support = float(min(1.0, max(0.0, 0.5 * (inlier_ratio + cover_ratio))))
+    conf_visible = float(sum(1 for v in pred_corners if v.get("visible")) / 4.0)
+    anchor_prior = 0.0
+    anchor_prior_enabled = False
+    used_anchor_prior = False
+    if best_anchor_score is not None and inlier_ratio >= 0.20 and p90_raw <= 80.0:
+        anchor_prior = float(0.35 * float(best_anchor_score))
+        anchor_prior_enabled = True
+        used_anchor_prior = True
+    conf_final = max(conf_auto, conf_support * conf_geom * conf_visible, anchor_prior)
+    conf = conf_final
+    reason = "OK" if conf_final >= 0.35 else reason
+    if reason == "OK" and corners_out is None:
+        corners_out = ordered_corners.astype(np.float32)
+    if manual_vis and not base_metrics.get("manual_override", False):
+        if base_metrics.get("manual_anchor_violation") or (
+            err_rt is not None and err_rt > 120.0
+        ) or (err_rb is not None and err_rb > 150.0):
+            reason = "R_manual_anchor_violation"
+            conf = 0.0
+            conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+    if reason == "OK":
+        reject_reason = base_metrics.get("reject_reason")
+        if isinstance(reject_reason, str) and any(tag in reject_reason for tag in ["loosen", "fallback", "override"]):
+            base_metrics["reject_reason"] = None
+    if reason != "OK" and manual_quad is not None:
+        H_manual = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), manual_quad.astype(np.float32))
+        manual_loss = _compute_loss_terms(
+            H_manual,
+            dt=dt,
+            Xw=Xw_full,
+            weights=w_full,
+            cover_points=cover_points,
+            floor_bbox=floor_bbox,
+            tau_px=tau_px,
+            dt_oob=dt_oob,
+        )
+        p90_manual = float(manual_loss.get("sample_dist_p90_raw") or manual_loss.get("sample_dist_p90") or 999.0)
+        cover_manual = float(manual_loss.get("cover_ratio", 0.0))
+        inlier_manual = float(manual_loss.get("inlier_ratio", 0.0))
+        conf_manual_terms = _confidence_terms(
+            inlier_manual, cover_manual, p90_manual, float(manual_loss.get("area_ratio", 0.0))
+        )
+        base_metrics["manual_candidate_confidence"] = float(conf_manual_terms["confidence"])
+        base_metrics["manual_candidate_cost"] = float(
+            0.6 * p90_manual + 0.4 * (1.0 - cover_manual) * 50.0 + (1.0 - inlier_manual) * 30.0
+        )
+
+    debug_image = draw_debug_overlay(
+        frame_bgr,
+        white_mask_clean,
+        H_best,
+        conf=float(conf),
+        cost_total=float(cost),
+        s_inlier=float(conf_terms["s_inlier"]),
+        s_cover=float(conf_terms["s_cover"]),
+        s_p90=float(conf_terms["s_p90"]),
+        s_area=float(conf_terms["s_area"]),
+        inlier_ratio=float(inlier_ratio),
+        mean_dist_px=float(loss_info.get("sample_dist_mean") or 0.0),
+        p90_dist_px=float(p90_raw),
+        white_mask_ratio=float(clean_ratio),
+        cover_ratio=float(cover_ratio),
+        l_dist=float(loss_info.get("l_dist", 0.0)),
+        l_cover=float(loss_info.get("l_cover", 0.0)),
+        l_reg=float(loss_info.get("l_reg", 0.0)),
+        area_ratio=float(loss_info.get("area_ratio", 0.0)),
+        dt_min=dt_min,
+        dt_mean=dt_mean,
+        dt_p90=dt_p90,
+        sample_dist_mean=loss_info.get("sample_dist_mean"),
+        sample_dist_p50=loss_info.get("sample_dist_p50"),
+        sample_dist_p90=loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
+        sample_dist_max=loss_info.get("sample_dist_max"),
+        sample_uv=loss_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
+        sample_dist=loss_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
+        tau_px=3.0,
+    )
+
+    hough_lines_img = frame_bgr.copy()
+    for x1, y1, x2, y2 in linesA:
+        cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+    for x1, y1, x2, y2 in linesB:
+        cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+
+    metrics = {
+        **base_metrics,
+        "H": [float(v) for v in H_best.reshape(-1)],
+        "cost_total": float(cost),
+        "confidence": float(conf),
+        "s_inlier": float(conf_terms["s_inlier"]),
+        "s_cover": float(conf_terms["s_cover"]),
+        "s_p90": float(conf_terms["s_p90"]),
+        "s_area": float(conf_terms["s_area"]),
+        "inlier_ratio": float(inlier_ratio),
+        "mean_dist_px": float(loss_info.get("sample_dist_mean") or 0.0),
+        "p90_dist_px": float(p90_raw),
+        "num_inliers": int(loss_info.get("num_inliers", 0)),
+        "num_valid_samples": int(loss_info.get("num_valid_samples", 0)),
+        "num_samples": int(loss_info.get("num_samples", Xw_full.shape[0])),
+        "dt_oob_count": int(loss_info.get("dt_oob_count", 0)),
+        "dt_oob_ratio": float(dt_oob_ratio),
+        "tau_px": float(tau_px),
+        "l_dist": float(loss_info.get("l_dist", 0.0)),
+        "l_cover": float(loss_info.get("l_cover", 0.0)),
+        "l_reg": float(loss_info.get("l_reg", 0.0)),
+        "area_ratio": float(loss_info.get("area_ratio", 0.0)),
+        "cover_ratio": float(cover_ratio),
+        "sample_dist_p90": float(p90_raw),
+        "num_hough_lines_a": int(len(linesA)),
+        "num_hough_lines_b": int(len(linesB)),
+        "predicted_corners": pred_corners,
+        "err_LT": err_lt,
+        "err_RT": err_rt,
+        "err_RB": err_rb,
+        "confidence_auto": float(conf_auto),
+        "confidence_final": float(conf),
+        "conf_geom": float(conf_geom),
+        "conf_support": float(conf_support),
+        "conf_visible": float(conf_visible),
+        "best_anchor_score": float(best_anchor_score) if best_anchor_score is not None else None,
+        "anchor_prior_enabled": bool(anchor_prior_enabled),
+        "used_anchor_prior": bool(used_anchor_prior),
+    }
+    if metrics.get("selected_component_id") is None:
+        metrics["selected_component_id"] = int(base_metrics.get("component_id") or 0)
+    return CourtFitResult(
+        H=H_best,
+        corners=corners_out,
+        confidence=conf,
+        metrics=metrics,
+        reason=reason,
+        debug_image=debug_image,
+        white_mask=white_mask_clean,
+        debug_image_init=debug_image,
+        white_mask_raw=white_mask_raw_full,
+        white_mask_clean=white_mask_clean,
+        white_mask_raw_full=white_mask_raw_full,
+        white_mask_raw_floor=white_mask_raw_floor,
+        white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+        white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+        white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+        floor_roi_mask=floor_mask,
+        floor_roi_overlay=floor_roi_overlay,
+        seed_bottom_mask=floor_debug.get("seed_bottom_mask"),
+        green_mask=floor_debug.get("green_mask"),
+        largest_cc_mask=floor_debug.get("largest_cc_mask"),
+        exg_row_plot=floor_debug.get("exg_row_plot"),
+        linepix_mask_pre=linepix_mask_pre,
+        floor_gate_mask=floor_gate_mask,
+        linepix_mask=linepix_mask,
+        linepix_overlay=linepix_overlay,
+        ransac_lines_img=ransac_lines_img,
+        dt_debug=dt_debug,
+        ori_mask_a=maskA,
+        ori_mask_b=maskB,
+        hough_lines_img=hough_lines_img,
+    )
+
+
+def fit_court_homography(
+    frame_bgr: np.ndarray,
+    method: str = "lsd",
+    allow_fallback_lsd: bool = True,
+    person_boxes: Optional[Sequence[Sequence[float]]] = None,
+) -> CourtFitResult:
+    method_key = str(method).lower()
+    if method_key in ("hough_orient", "hough"):
+        res = _fit_court_homography_hough(frame_bgr, person_boxes=person_boxes)
+        res.method_used = "hough_orient"
+        if isinstance(res.metrics, dict):
+            res.metrics["method_used"] = "hough_orient"
+        if res.reason == "OK" or not allow_fallback_lsd:
+            return res
+        res2 = _fit_court_homography_lsd(frame_bgr)
+        res2.method_used = "lsd_fallback"
+        if isinstance(res2.metrics, dict):
+            res2.metrics["method_used"] = "lsd_fallback"
+        return res2
+
+    res = _fit_court_homography_lsd(frame_bgr)
+    res.method_used = "lsd"
+    if isinstance(res.metrics, dict):
+        res.metrics["method_used"] = "lsd"
+    return res
+
+
+def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
+    rng = np.random.default_rng(0)
+    (
+        white_mask_raw,
+        white_mask_clean,
+        floor_bbox,
+        max_cc_area_raw,
+        max_cc_area_clean,
+    ) = build_white_mask(frame_bgr)
+    raw_sum, raw_ratio, _ = _white_mask_stats(white_mask_raw)
+    clean_sum, clean_ratio, _ = _white_mask_stats(white_mask_clean)
+    dt = build_distance_transform(white_mask_clean)
+    dt_min = float(np.min(dt)) if dt.size > 0 else None
+    dt_mean = float(np.mean(dt)) if dt.size > 0 else None
+    dt_p90 = float(np.percentile(dt, 90)) if dt.size > 0 else None
+    dt_oob = float(max(dt_p90 or 0.0, 15.0))
+    x1, y1, x2, y2 = floor_bbox
+    x1 = int(np.clip(x1, 0, dt.shape[1] - 1))
+    x2 = int(np.clip(x2, x1 + 1, dt.shape[1]))
+    y1 = int(np.clip(y1, 0, dt.shape[0] - 1))
+    y2 = int(np.clip(y2, y1 + 1, dt.shape[0]))
+    roi_h = max(1, y2 - y1)
+    roi_w = max(1, x2 - x1)
+    rand_n = 1000
+    xs = rng.integers(x1, x1 + roi_w, size=rand_n)
+    ys = rng.integers(y1, y1 + roi_h, size=rand_n)
+    dt_rand = dt[ys, xs].astype(np.float32) if dt.size > 0 else np.array([], dtype=np.float32)
+    dt_rand_mean = float(np.mean(dt_rand)) if dt_rand.size > 0 else None
+    dt_rand_p90 = float(np.percentile(dt_rand, 90)) if dt_rand.size > 0 else None
 
     corners_world = get_bwf_corners()
     Xw_ransac, w_ransac, _ = sample_model_points(points_per_meter=30.0, min_weight=0.6)
@@ -738,16 +6628,34 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
     base_metrics = {
         "model": MODEL_ID,
         "dt_from": "white_mask_frame",
-        "white_mask_sum": int(white_mask_sum),
-        "white_mask_ratio": float(white_mask_ratio),
+        "white_mask_sum": int(clean_sum),
+        "white_mask_ratio": float(clean_ratio),
+        "white_mask_raw_sum": int(raw_sum),
+        "white_mask_raw_ratio": float(raw_ratio),
+        "white_mask_clean_sum": int(clean_sum),
+        "white_mask_clean_ratio": float(clean_ratio),
+        "mask_raw_ratio": float(raw_ratio),
+        "mask_clean_ratio": float(clean_ratio),
+        "max_cc_area_raw": int(max_cc_area_raw),
+        "max_cc_area_clean": int(max_cc_area_clean),
+        "max_cc_area": int(max_cc_area_clean),
+        "floor_bbox": [int(v) for v in floor_bbox],
         "dt_min": dt_min,
         "dt_mean": dt_mean,
         "dt_p90": dt_p90,
+        "dt_rand_mean": dt_rand_mean,
+        "dt_rand_p90": dt_rand_p90,
         "debug_image_path": None,
         "white_mask_path": None,
+        "white_mask_raw_path": None,
+        "white_mask_clean_path": None,
+        "lsd_dirA_path": None,
+        "lsd_dirB_path": None,
+        "debug_init_path": None,
+        "dt_debug_path": None,
     }
 
-    if white_mask_ratio < 0.001 or white_mask_ratio > 0.25:
+    if clean_ratio < 0.001 or clean_ratio > 0.25:
         metrics = {
             **base_metrics,
             "H": None,
@@ -767,14 +6675,49 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
             metrics=metrics,
             reason="R_mask_invalid",
             debug_image=None,
-            white_mask=white_mask,
+            white_mask=white_mask_clean,
+            white_mask_raw=white_mask_raw,
+            white_mask_clean=white_mask_clean,
+            dt_debug=None,
         )
 
-    cover_points_ransac = _sample_white_points(white_mask, max_points=600, rng=rng)
-    cover_points = _sample_white_points(white_mask, max_points=1500, rng=rng)
+    if dt_rand_p90 is not None and dt_rand_mean is not None:
+        if dt_rand_p90 < 0.5 or dt_rand_mean < 0.2:
+            dt_vis = cv2.normalize(dt, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            metrics = {
+                **base_metrics,
+                "H": None,
+                "inlier_ratio": 0.0,
+                "mean_dist_px": None,
+                "p90_dist_px": None,
+                "num_inliers": 0,
+                "num_valid_samples": 0,
+                "num_samples": int(Xw_ransac.shape[0]),
+                "tau_px": 3.0,
+                "lm_cost": None,
+            }
+            return CourtFitResult(
+                H=None,
+                corners=None,
+                confidence=0.0,
+                metrics=metrics,
+                reason="R_dt_invalid",
+                debug_image=None,
+                white_mask=white_mask_clean,
+                white_mask_raw=white_mask_raw,
+                white_mask_clean=white_mask_clean,
+                debug_image_init=None,
+                lsd_lines_a=None,
+                lsd_lines_b=None,
+                dt_debug=dt_vis,
+            )
+
+    cover_points_ransac = _sample_white_points(white_mask_clean, max_points=600, rng=rng)
+    cover_points = _sample_white_points(white_mask_clean, max_points=1500, rng=rng)
 
     H_init, init_info = ransac_init_homography(
-        white_mask=white_mask,
+        white_mask=white_mask_clean,
+        white_mask_raw=white_mask_raw,
         dt=dt,
         world_corners=corners_world,
         Xw=Xw_ransac,
@@ -784,7 +6727,13 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
         iters=2000,
         tau_px=3.0,
         min_area_ratio=0.01,
+        dt_oob=dt_oob,
     )
+    lsd_img_a, lsd_img_b = None, None
+    if isinstance(init_info, dict):
+        lsd_img_a, lsd_img_b = _draw_lsd_segment_lists(
+            frame_bgr, init_info.get("lsd_lines_a"), init_info.get("lsd_lines_b")
+        )
     if H_init is None or init_info is None:
         metrics = {
             **base_metrics,
@@ -798,6 +6747,22 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
             "tau_px": 3.0,
             "lm_cost": None,
         }
+        if isinstance(init_info, dict):
+            metrics.update(
+                {
+                    "vp_long": init_info.get("vp_long"),
+                    "vp_short": init_info.get("vp_short"),
+                    "num_lsd_raw": init_info.get("num_lsd_raw"),
+                    "num_lsd_kept": init_info.get("num_lsd_kept"),
+                    "dirA_count": init_info.get("dirA_count"),
+                    "dirB_count": init_info.get("dirB_count"),
+                    "sum_len_a": init_info.get("sum_len_a"),
+                    "sum_len_b": init_info.get("sum_len_b"),
+                    "cluster_ratio": init_info.get("cluster_ratio"),
+                    "mean_angle_a": init_info.get("mean_angle_a"),
+                    "mean_angle_b": init_info.get("mean_angle_b"),
+                }
+            )
         return CourtFitResult(
             H=None,
             corners=None,
@@ -805,8 +6770,51 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
             metrics=metrics,
             reason="R_fit_poor",
             debug_image=None,
-            white_mask=white_mask,
+            white_mask=white_mask_clean,
+            white_mask_raw=white_mask_raw,
+            white_mask_clean=white_mask_clean,
+            lsd_lines_a=lsd_img_a,
+            lsd_lines_b=lsd_img_b,
+            dt_debug=None,
         )
+
+    init_p90 = float(init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90") or 999.0)
+    init_conf_terms = _confidence_terms(
+        float(init_info.get("inlier_ratio", 0.0)),
+        float(init_info.get("cover_ratio", 0.0)),
+        init_p90,
+        float(init_info.get("area_ratio", 0.0)),
+    )
+    debug_image_init = draw_debug_overlay(
+        frame_bgr,
+        white_mask_clean,
+        H_init,
+        conf=float(init_conf_terms["confidence"]),
+        cost_total=float(init_info.get("loss", 0.0)),
+        s_inlier=float(init_conf_terms["s_inlier"]),
+        s_cover=float(init_conf_terms["s_cover"]),
+        s_p90=float(init_conf_terms["s_p90"]),
+        s_area=float(init_conf_terms["s_area"]),
+        inlier_ratio=float(init_info.get("inlier_ratio", 0.0)),
+        mean_dist_px=float(init_info.get("sample_dist_mean") or 0.0),
+        p90_dist_px=float(init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90") or 0.0),
+        white_mask_ratio=float(clean_ratio),
+        cover_ratio=float(init_info.get("cover_ratio", 0.0)),
+        l_dist=float(init_info.get("l_dist", 0.0)),
+        l_cover=float(init_info.get("l_cover", 0.0)),
+        l_reg=float(init_info.get("l_reg", 0.0)),
+        area_ratio=float(init_info.get("area_ratio", 0.0)),
+        dt_min=dt_min,
+        dt_mean=dt_mean,
+        dt_p90=dt_p90,
+        sample_dist_mean=init_info.get("sample_dist_mean"),
+        sample_dist_p50=init_info.get("sample_dist_p50"),
+        sample_dist_p90=init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90"),
+        sample_dist_max=init_info.get("sample_dist_max"),
+        sample_uv=init_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
+        sample_dist=init_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
+        tau_px=3.0,
+    )
 
     H_ref, lm_cost = refine_homography_lm(
         H_init,
@@ -816,6 +6824,7 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
         cover_points=cover_points,
         floor_bbox=floor_bbox,
         max_nfev=50,
+        dt_oob=dt_oob,
     )
     loss_info = _compute_loss_terms(
         H_ref,
@@ -825,25 +6834,49 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
         cover_points=cover_points,
         floor_bbox=floor_bbox,
         tau_px=3.0,
+        dt_oob=dt_oob,
     )
     mean_dist = loss_info.get("sample_dist_mean")
-    p90_dist = loss_info.get("sample_dist_p90")
+    p90_clamped = loss_info.get("sample_dist_p90")
+    p90_dist = loss_info.get("sample_dist_p90_raw") or p90_clamped
     inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
-    conf = float(np.clip(inlier_ratio * np.exp(-float(mean_dist or 0.0) / 6.0), 0.0, 1.0))
-    reason = "OK" if (inlier_ratio > 0.25 and mean_dist is not None and mean_dist < 5.0) else "R_fit_poor"
+    cover_ratio = float(loss_info.get("cover_ratio", 0.0))
+    area_ratio = float(loss_info.get("area_ratio", 0.0))
+    p90_val = float(p90_dist) if p90_dist is not None else 999.0
+    conf_terms = _confidence_terms(inlier_ratio, cover_ratio, p90_val, area_ratio)
+    conf = float(conf_terms["confidence"])
+    reason = "OK" if conf >= 0.35 else "R_fit_poor"
+    dt_oob_count = int(loss_info.get("dt_oob_count", 0))
+    num_samples = int(loss_info.get("num_samples", 0))
+    dt_oob_ratio = float(dt_oob_count) / float(max(num_samples, 1))
+    dt_debug = None
+    if dt_oob_ratio > 0.2:
+        reason = "R_dt_oob"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+        dt_debug = cv2.normalize(dt, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     corners_uv = project_points(H_ref, corners_world)
-    corners_out = corners_uv.astype(np.float32) if reason == "OK" else None
+    ordered_corners = _order_corners_lb_rb_rt_lt(corners_uv)
+    span_ok, span_metrics = _quad_span_ok(ordered_corners, frame_bgr.shape[1], frame_bgr.shape[0])
+    base_metrics.update(span_metrics)
+    corners_out = ordered_corners.astype(np.float32)
 
     debug_image = draw_debug_overlay(
         frame_bgr,
-        white_mask,
+        white_mask_clean,
         H_ref,
         conf=float(conf),
+        cost_total=float(loss_info.get("loss", 0.0)),
+        s_inlier=float(conf_terms["s_inlier"]),
+        s_cover=float(conf_terms["s_cover"]),
+        s_p90=float(conf_terms["s_p90"]),
+        s_area=float(conf_terms["s_area"]),
         inlier_ratio=float(inlier_ratio),
         mean_dist_px=float(mean_dist) if mean_dist is not None else 0.0,
         p90_dist_px=float(p90_dist) if p90_dist is not None else 0.0,
-        white_mask_ratio=float(white_mask_ratio),
+        white_mask_ratio=float(clean_ratio),
+        cover_ratio=float(loss_info.get("cover_ratio", 0.0)),
         l_dist=float(loss_info.get("l_dist", 0.0)),
         l_cover=float(loss_info.get("l_cover", 0.0)),
         l_reg=float(loss_info.get("l_reg", 0.0)),
@@ -853,7 +6886,7 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
         dt_p90=dt_p90,
         sample_dist_mean=loss_info.get("sample_dist_mean"),
         sample_dist_p50=loss_info.get("sample_dist_p50"),
-        sample_dist_p90=loss_info.get("sample_dist_p90"),
+        sample_dist_p90=loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
         sample_dist_max=loss_info.get("sample_dist_max"),
         sample_uv=loss_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
         sample_dist=loss_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
@@ -863,27 +6896,50 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
     metrics = {
         **base_metrics,
         "H": [float(v) for v in H_ref.reshape(-1)],
+        "cost_total": float(loss_info.get("loss", 0.0)),
+        "confidence": float(conf),
+        "s_inlier": float(conf_terms["s_inlier"]),
+        "s_cover": float(conf_terms["s_cover"]),
+        "s_p90": float(conf_terms["s_p90"]),
+        "s_area": float(conf_terms["s_area"]),
         "inlier_ratio": float(inlier_ratio),
         "mean_dist_px": float(mean_dist) if mean_dist is not None else None,
         "p90_dist_px": float(p90_dist) if p90_dist is not None else None,
+        "p90_dist_px_clamped": float(p90_clamped) if p90_clamped is not None else None,
         "num_inliers": int(loss_info.get("num_inliers", 0)),
         "num_valid_samples": int(loss_info.get("num_valid_samples", 0)),
         "num_samples": int(loss_info.get("num_samples", Xw_full.shape[0])),
+        "dt_oob_count": int(loss_info.get("dt_oob_count", 0)),
+        "dt_oob_ratio": float(dt_oob_ratio),
         "tau_px": 3.0,
         "lm_cost": float(lm_cost),
         "l_dist": float(loss_info.get("l_dist", 0.0)),
         "l_cover": float(loss_info.get("l_cover", 0.0)),
         "l_reg": float(loss_info.get("l_reg", 0.0)),
         "area_ratio": float(loss_info.get("area_ratio", 0.0)),
+        "cover_ratio": float(loss_info.get("cover_ratio", 0.0)),
+        "cover_penalty": float(loss_info.get("cover_penalty", 0.0)),
         "inlier_dist_p90": loss_info.get("inlier_dist_p90"),
         "sample_dist_mean": loss_info.get("sample_dist_mean"),
         "sample_dist_p50": loss_info.get("sample_dist_p50"),
-        "sample_dist_p90": loss_info.get("sample_dist_p90"),
+        "sample_dist_p90": loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
         "sample_dist_max": loss_info.get("sample_dist_max"),
-        "vp_h": init_info.get("vp_h") if isinstance(init_info, dict) else None,
-        "vp_v": init_info.get("vp_v") if isinstance(init_info, dict) else None,
-        "num_hough_lines_h": init_info.get("num_hough_lines_h") if isinstance(init_info, dict) else None,
-        "num_hough_lines_v": init_info.get("num_hough_lines_v") if isinstance(init_info, dict) else None,
+        "vp_long": init_info.get("vp_long") if isinstance(init_info, dict) else None,
+        "vp_short": init_info.get("vp_short") if isinstance(init_info, dict) else None,
+        "num_lsd_raw": init_info.get("num_lsd_raw") if isinstance(init_info, dict) else None,
+        "num_lsd_kept": init_info.get("num_lsd_kept") if isinstance(init_info, dict) else None,
+        "dirA_count": init_info.get("dirA_count") if isinstance(init_info, dict) else None,
+        "dirB_count": init_info.get("dirB_count") if isinstance(init_info, dict) else None,
+        "sum_len_a": init_info.get("sum_len_a") if isinstance(init_info, dict) else None,
+        "sum_len_b": init_info.get("sum_len_b") if isinstance(init_info, dict) else None,
+        "cluster_ratio": init_info.get("cluster_ratio") if isinstance(init_info, dict) else None,
+        "mean_angle_a": init_info.get("mean_angle_a") if isinstance(init_info, dict) else None,
+        "mean_angle_b": init_info.get("mean_angle_b") if isinstance(init_info, dict) else None,
+        "init_ratio": init_info.get("init_ratio") if isinstance(init_info, dict) else None,
+        "init_inside_ratio": init_info.get("init_inside_ratio") if isinstance(init_info, dict) else None,
+        "init_cover": init_info.get("cover_ratio") if isinstance(init_info, dict) else None,
+        "init_p90": init_info.get("sample_dist_p90_raw") if isinstance(init_info, dict) else None,
+        "init_area_ratio": init_info.get("area_ratio") if isinstance(init_info, dict) else None,
     }
     return CourtFitResult(
         H=H_ref,
@@ -892,5 +6948,11 @@ def fit_court_homography(frame_bgr: np.ndarray) -> CourtFitResult:
         metrics=metrics,
         reason=reason,
         debug_image=debug_image,
-        white_mask=white_mask,
+        white_mask=white_mask_clean,
+        debug_image_init=debug_image_init,
+        white_mask_raw=white_mask_raw,
+        white_mask_clean=white_mask_clean,
+        lsd_lines_a=lsd_img_a,
+        lsd_lines_b=lsd_img_b,
+        dt_debug=dt_debug,
     )
