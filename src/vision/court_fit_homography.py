@@ -95,6 +95,75 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_str(name: str, default: str = "") -> str:
+    v = os.environ.get(name, None)
+    if v is None:
+        return str(default)
+    return str(v)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """
+    Accepts common boolean strings: 1/0, true/false, yes/no, on/off (case-insensitive).
+    """
+    v = os.environ.get(name, None)
+    if v is None:
+        return bool(default)
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+
+def _model_role_weight_params() -> Dict[str, float]:
+    return {
+        "baseline": float(_env_float("BADC_MODEL_W_BASELINE", 1.0)),
+        "sideline_d": float(_env_float("BADC_MODEL_W_SIDELINE_D", 1.0)),
+        "service_short": float(_env_float("BADC_MODEL_W_SERVICE_SHORT", 1.0)),
+        "service_long": float(_env_float("BADC_MODEL_W_SERVICE_LONG", 1.0)),
+        "sideline_s": float(_env_float("BADC_MODEL_W_SIDELINE_S", 1.0)),
+        "center": float(_env_float("BADC_MODEL_W_CENTER", 1.0)),
+    }
+
+
+def _apply_model_role_weights(
+    names: Sequence[str],
+    weights: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Apply optional role-aware line weights (baseline / service / sideline / center).
+    Defaults keep behavior unchanged (all multipliers = 1.0).
+    """
+    w = np.asarray(weights, dtype=np.float32).copy()
+    if w.size == 0 or not names or len(names) != int(w.size):
+        return w, _model_role_weight_params()
+    cfg = _model_role_weight_params()
+
+    def _mul_for_name(name: str) -> float:
+        n = str(name)
+        if n.startswith("baseline_"):
+            return float(cfg["baseline"])
+        if n in ("sideline_left_d", "sideline_right_d"):
+            return float(cfg["sideline_d"])
+        if n in ("short_near", "short_far"):
+            return float(cfg["service_short"])
+        if n in ("long_near_d", "long_far_d"):
+            return float(cfg["service_long"])
+        if n in ("sideline_left_s", "sideline_right_s"):
+            return float(cfg["sideline_s"])
+        if n.startswith("center_"):
+            return float(cfg["center"])
+        return 1.0
+
+    mul = np.array([_mul_for_name(nm) for nm in names], dtype=np.float32)
+    # Keep positive numeric weights.
+    mul = np.clip(mul, 0.0, 10.0)
+    w = w * mul
+    return w, cfg
+
+
 def _seg_len_px(seg) -> float:
     x1, y1, x2, y2 = seg
     return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
@@ -109,6 +178,65 @@ def _filter_segments_minlen(segments, min_len_px: float, max_keep: int = 0):
         segs.sort(key=_seg_len_px, reverse=True)
         segs = segs[:max_keep]
     return segs
+
+
+def _filter_segments_minlen_with_boundary_rescue(
+    segments,
+    min_len_px: float,
+    floor_bbox_xyxy: Optional[Tuple[int, int, int, int]] = None,
+    max_keep: int = 0,
+    resq_enable: bool = True,
+    resq_margin_frac: float = 0.08,
+    resq_minlen_ratio: float = 0.35,
+    resq_vert_cos_max: float = 0.35,
+):
+    """
+    Keep long segments by min length and optionally rescue shorter near-vertical
+    segments near left/right floor boundaries.
+    """
+    if segments is None:
+        return []
+
+    min_len = float(max(1.0, min_len_px))
+    rescued_min = float(max(1.0, resq_minlen_ratio * min_len))
+    out = []
+
+    x0 = y0 = x1 = y1 = None
+    margin = 0.0
+    if floor_bbox_xyxy is not None:
+        try:
+            x0, y0, x1, y1 = [float(v) for v in floor_bbox_xyxy]
+            bw = max(1.0, x1 - x0)
+            margin = float(max(4.0, resq_margin_frac * bw))
+        except Exception:
+            x0 = y0 = x1 = y1 = None
+            margin = 0.0
+
+    for seg in segments:
+        x1s, y1s, x2s, y2s = seg
+        dx = float(x2s - x1s)
+        dy = float(y2s - y1s)
+        ll = float(math.hypot(dx, dy))
+        if ll >= min_len:
+            out.append(seg)
+            continue
+        if not resq_enable or ll < rescued_min or x0 is None or x1 is None:
+            continue
+
+        # Near-vertical segments: |dx| / len should be small.
+        cos_abs = abs(dx) / max(ll, 1e-6)
+        if cos_abs > float(max(0.0, resq_vert_cos_max)):
+            continue
+
+        near_left = (min(float(x1s), float(x2s)) <= float(x0) + margin)
+        near_right = (max(float(x1s), float(x2s)) >= float(x1) - margin)
+        if near_left or near_right:
+            out.append(seg)
+
+    if max_keep and max_keep > 0 and len(out) > max_keep:
+        out.sort(key=_seg_len_px, reverse=True)
+        out = out[:max_keep]
+    return out
 
 
 _RAW_HOUGH_THRESHOLD = _env_int("BADC_RAW_HOUGH_THRESHOLD", 45)
@@ -761,16 +889,22 @@ def _filter_lines_for_completion(
     quad_xy: np.ndarray,
     *,
     margin_px: float = 8.0,
+    margin_x_px: Optional[float] = None,
+    margin_top_px: Optional[float] = None,
+    margin_bottom_px: Optional[float] = None,
 ) -> Tuple[list[Tuple[float, float, float, float]], list[Optional[int]]]:
     if quad_xy is None or quad_xy.size == 0 or not lines:
         return lines, line_ids
     quad = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
     xs = quad[:, 0]
     ys = quad[:, 1]
-    x0 = float(np.min(xs)) - float(margin_px)
-    x1 = float(np.max(xs)) + float(margin_px)
-    y0 = float(np.min(ys)) - float(margin_px)
-    y1 = float(np.max(ys)) + float(margin_px)
+    mx = float(margin_x_px) if margin_x_px is not None else float(margin_px)
+    my_top = float(margin_top_px) if margin_top_px is not None else float(margin_px)
+    my_bottom = float(margin_bottom_px) if margin_bottom_px is not None else float(margin_px)
+    x0 = float(np.min(xs)) - mx
+    x1 = float(np.max(xs)) + mx
+    y0 = float(np.min(ys)) - my_top
+    y1 = float(np.max(ys)) + my_bottom
     bbox = (x0, y0, x1, y1)
     filtered_lines: list[Tuple[float, float, float, float]] = []
     filtered_ids: list[Optional[int]] = []
@@ -842,6 +976,12 @@ def ransac_line_segments_from_mask(
     min_len = float(min(h, w)) * float(min_length_ratio)
     active = np.ones((pts.shape[0],), dtype=bool)
     segments: list[RansacLineSeg] = []
+    # --- NEW: dedup similar lines so max_lines isn't consumed by the same boundary ---
+    dedup_enable = os.getenv("BADC_RANSAC_DEDUP", "1").strip() != "0"
+    dedup_rho = float(os.getenv("BADC_RANSAC_DEDUP_RHO", "4.0"))
+    dedup_theta_deg = float(os.getenv("BADC_RANSAC_DEDUP_THETA_DEG", "1.5"))
+    dedup_theta = math.radians(dedup_theta_deg)
+    accepted_normals: list[Tuple[float, float]] = []  # (theta, rho)
     tls_num_input_pts = 0
     tls_num_finite_pts = 0
     tls_skipped_degenerate = 0
@@ -911,6 +1051,24 @@ def ransac_line_segments_from_mask(
         active[active_idx[best_inliers]] = False
         if length < float(min_len):
             continue
+
+        # --- NEW: canonicalize (theta,rho) and dedup ---
+        # line: a*x + b*y + c = 0 with (a,b) normalized.
+        # rho = -c, theta = atan2(b,a) in [0,pi)
+        if dedup_enable:
+            theta = float(np.mod(math.atan2(b, a), math.pi))
+            rho = float(-c)
+            dup = False
+            for (t0, r0) in accepted_normals:
+                dt = abs(theta - t0)
+                dt = min(dt, math.pi - dt)
+                if dt <= dedup_theta and abs(rho - r0) <= dedup_rho:
+                    dup = True
+                    break
+            if dup:
+                # We still removed inliers from active, so next iterations explore new lines
+                continue
+            accepted_normals.append((theta, rho))
         segments.append(
             RansacLineSeg(
                 x1=x1,
@@ -929,6 +1087,62 @@ def ransac_line_segments_from_mask(
         "tls_num_finite_pts": int(tls_num_finite_pts),
         "tls_skipped_degenerate": int(tls_skipped_degenerate),
     }
+
+
+def _merge_ransac_with_raw_floor_segs(
+    ransac_segs: list[RansacLineSeg],
+    raw_floor_segs: list[Tuple[float, float, float, float]],
+    *,
+    rho_tol: float = 4.0,
+    theta_tol_deg: float = 2.0,
+) -> list[RansacLineSeg]:
+    """Merge raw_floor hough segs into ransac segs (as pseudo segments), with dedup."""
+    if not raw_floor_segs:
+        return ransac_segs
+    theta_tol = math.radians(theta_tol_deg)
+    out = list(ransac_segs)
+
+    def _seg_to_theta_rho(x1, y1, x2, y2):
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return None
+        ang = float(np.mod(math.atan2(dy, dx), math.pi))
+        # normal angle = ang + pi/2
+        theta = float(np.mod(ang + math.pi / 2.0, math.pi))
+        # rho = x*cos(theta) + y*sin(theta)
+        rho = float(x1 * math.cos(theta) + y1 * math.sin(theta))
+        return theta, rho
+
+    existing = []
+    for s in out:
+        tr = _seg_to_theta_rho(s.x1, s.y1, s.x2, s.y2)
+        if tr:
+            existing.append(tr)
+
+    for (x1, y1, x2, y2) in raw_floor_segs:
+        tr = _seg_to_theta_rho(x1, y1, x2, y2)
+        if not tr:
+            continue
+        theta, rho = tr
+        dup = False
+        for (t0, r0) in existing:
+            dt = abs(theta - t0)
+            dt = min(dt, math.pi - dt)
+            if dt <= theta_tol and abs(rho - r0) <= rho_tol:
+                dup = True
+                break
+        if dup:
+            continue
+        existing.append((theta, rho))
+        length = float(math.hypot(x2 - x1, y2 - y1))
+        out.append(
+            RansacLineSeg(
+                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+                a=0.0, b=0.0, c=0.0, support=0, length=length
+            )
+        )
+    return out
 
 
 def build_white_mask(
@@ -1366,6 +1580,8 @@ def get_floor_roi_mask_debug(
     prepass_gate_passed = False
     prepass_line = white_support.copy()
     try:
+        if not _env_flag("BADC_FLOOR_PREPASS_ENABLE", False):
+            raise RuntimeError("floor prepass disabled")
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         k = int(max(21, round(min(h, w) * 0.03)))
         if k % 2 == 0:
@@ -1878,9 +2094,316 @@ def _line_from_points(p1: Tuple[float, float], p2: Tuple[float, float]) -> Tuple
     return a, b, c
 
 
+def _canonicalize_line_abc(a: float, b: float, c: float) -> Tuple[float, float, float]:
+    """
+    Canonicalize ax+by+c=0 (with sqrt(a^2+b^2)=1) so that the normal (a,b) has a consistent sign.
+    This avoids averaging (a,b,c) with (-a,-b,-c) which would cancel out and drift.
+    Rule: force (a>0) or (a==0 and b>0).
+    """
+    if a < 0.0 or (abs(a) < 1e-12 and b < 0.0):
+        return -a, -b, -c
+    return a, b, c
+
+
 def _angle_distance(a: float, b: float) -> float:
-    d = abs(float(a) - float(b))
+    """Angular distance on [0, pi)."""
+    d = abs(float(a) - float(b)) % math.pi
     return float(min(d, math.pi - d))
+
+
+def _seg_theta_undirected(x1: float, y1: float, x2: float, y2: float) -> float:
+    theta = float(math.atan2(y2 - y1, x2 - x1)) % math.pi
+    return theta
+
+
+def _median_angle_segments(
+    segments: list[Tuple[float, float, float, float]],
+) -> Optional[float]:
+    """Robust orientation estimate (weighted median) in radians, modulo pi."""
+    if not segments:
+        return None
+    angles = []
+    weights = []
+    for x1, y1, x2, y2 in segments:
+        ang = float(np.mod(math.atan2(y2 - y1, x2 - x1), math.pi))
+        w = float(math.hypot(x2 - x1, y2 - y1))
+        angles.append(ang)
+        weights.append(max(1e-6, w))
+    order = np.argsort(angles)
+    ang_sorted = np.array([angles[i] for i in order], dtype=np.float32)
+    w_sorted = np.array([weights[i] for i in order], dtype=np.float32)
+    cdf = np.cumsum(w_sorted)
+    cutoff = 0.5 * float(cdf[-1])
+    j = int(np.searchsorted(cdf, cutoff))
+    j = max(0, min(j, len(ang_sorted) - 1))
+    return float(ang_sorted[j])
+
+
+def _two_angle_peaks(
+    thetas: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    bins: int = 90,
+    min_sep_deg: float = 55.0,
+) -> Optional[Tuple[float, float]]:
+    """Find two dominant undirected angle peaks on [0, pi).
+
+    Returns (t0, t1) in radians, or None if a stable pair can't be found.
+    """
+    if thetas is None or len(thetas) < 8:
+        return None
+    thetas = np.asarray(thetas, dtype=np.float64) % math.pi
+    if weights is None:
+        weights = np.ones_like(thetas, dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != thetas.shape:
+            weights = np.ones_like(thetas, dtype=np.float64)
+
+    bins = int(max(18, bins))
+    # Histogram on [0, pi)
+    hist, edges = np.histogram(thetas, bins=bins, range=(0.0, math.pi), weights=weights)
+    if hist.max() <= 0:
+        return None
+    i0 = int(np.argmax(hist))
+    # Peak center
+    t0 = float(0.5 * (edges[i0] + edges[i0 + 1]))
+
+    # Second peak: best weighted count sufficiently far from t0
+    min_sep = float(min_sep_deg) * math.pi / 180.0
+    best_i1 = None
+    best_v1 = -1.0
+    for i in range(len(hist)):
+        t = float(0.5 * (edges[i] + edges[i + 1]))
+        if _angle_distance(t, t0) < min_sep:
+            continue
+        v = float(hist[i])
+        if v > best_v1:
+            best_v1 = v
+            best_i1 = i
+    if best_i1 is None or best_v1 <= 0:
+        return None
+    t1 = float(0.5 * (edges[best_i1] + edges[best_i1 + 1]))
+
+    # Prefer near-orthogonal pairs if possible: adjust by scanning around t1
+    # (helps when there are multiple close secondary peaks).
+    target = (t0 + 0.5 * math.pi) % math.pi
+    best_i1b = best_i1
+    best_cost = 1e9
+    for i in range(len(hist)):
+        if hist[i] <= 0:
+            continue
+        t = float(0.5 * (edges[i] + edges[i + 1]))
+        if _angle_distance(t, t0) < min_sep:
+            continue
+        # cost = distance to orthogonal target minus small reward for count
+        cost = float(_angle_distance(t, target)) - 0.002 * float(hist[i])
+        if cost < best_cost:
+            best_cost = cost
+            best_i1b = i
+    t1 = float(0.5 * (edges[best_i1b] + edges[best_i1b + 1]))
+    return (t0, t1)
+
+
+def _resplit_segments_by_angle_peaks(
+    seg_a: list[Tuple[float, float, float, float]],
+    score_a: np.ndarray,
+    seg_b: list[Tuple[float, float, float, float]],
+    score_b: np.ndarray,
+    min_keep_each: int = 8,
+    min_sep_deg: float = 55.0,
+) -> Tuple[list[Tuple[float, float, float, float]], np.ndarray, list[Tuple[float, float, float, float]], np.ndarray, Dict[str, Any]]:
+    """Fix A/B bucket role mix-ups by re-clustering segments using 2 dominant angle peaks."""
+    meta: Dict[str, Any] = {"used": False}
+    seg_all = list(seg_a) + list(seg_b)
+    if not seg_all:
+        return seg_a, score_a, seg_b, score_b, meta
+    scores_all = np.concatenate([np.asarray(score_a, dtype=np.float32), np.asarray(score_b, dtype=np.float32)], axis=0)
+    thetas = []
+    for (x1, y1, x2, y2) in seg_all:
+        thetas.append(_seg_theta_undirected(float(x1), float(y1), float(x2), float(y2)))
+    thetas = np.asarray(thetas, dtype=np.float64)
+    peaks = _two_angle_peaks(thetas, weights=scores_all.astype(np.float64), bins=90, min_sep_deg=min_sep_deg)
+    if peaks is None:
+        return seg_a, score_a, seg_b, score_b, meta
+    t0, t1 = peaks
+    d0 = np.array([_angle_distance(float(t), float(t0)) for t in thetas], dtype=np.float32)
+    d1 = np.array([_angle_distance(float(t), float(t1)) for t in thetas], dtype=np.float32)
+    assign0 = d0 <= d1
+    seg0 = [seg_all[i] for i in range(len(seg_all)) if assign0[i]]
+    seg1 = [seg_all[i] for i in range(len(seg_all)) if not assign0[i]]
+    sc0 = scores_all[assign0]
+    sc1 = scores_all[~assign0]
+    if len(seg0) < int(min_keep_each) or len(seg1) < int(min_keep_each):
+        return seg_a, score_a, seg_b, score_b, meta
+
+    # Decide which becomes A vs B: keep closer to original means to reduce jitter.
+    # Compute mean theta for original A and original B.
+    def _mean_theta(segs: list[Tuple[float, float, float, float]]) -> float:
+        if not segs:
+            return 0.0
+        th = np.array([_seg_theta_undirected(float(x1), float(y1), float(x2), float(y2)) for (x1, y1, x2, y2) in segs], dtype=np.float64)
+        # circular mean on [0, pi)
+        return float(math.atan2(np.mean(np.sin(2.0 * th)), np.mean(np.cos(2.0 * th))) / 2.0) % math.pi
+
+    mean_a = _mean_theta(seg_a)
+    mean_b = _mean_theta(seg_b)
+    mean0 = _mean_theta(seg0)
+    mean1 = _mean_theta(seg1)
+
+    # Two possible mappings: (0->A,1->B) vs swapped
+    cost_keep = _angle_distance(mean0, mean_a) + _angle_distance(mean1, mean_b)
+    cost_swap = _angle_distance(mean0, mean_b) + _angle_distance(mean1, mean_a)
+    if cost_swap < cost_keep:
+        seg_a2, score_a2 = seg1, sc1
+        seg_b2, score_b2 = seg0, sc0
+        meta["swapped"] = True
+    else:
+        seg_a2, score_a2 = seg0, sc0
+        seg_b2, score_b2 = seg1, sc1
+        meta["swapped"] = False
+
+    meta.update(
+        {
+            "used": True,
+            "peaks_deg": [float(t0 * 180.0 / math.pi), float(t1 * 180.0 / math.pi)],
+            "mean_before_deg": [float(mean_a * 180.0 / math.pi), float(mean_b * 180.0 / math.pi)],
+            "mean_after_deg": [float(_mean_theta(seg_a2) * 180.0 / math.pi), float(_mean_theta(seg_b2) * 180.0 / math.pi)],
+            "n_before": [int(len(seg_a)), int(len(seg_b))],
+            "n_after": [int(len(seg_a2)), int(len(seg_b2))],
+        }
+    )
+    return seg_a2, score_a2, seg_b2, score_b2, meta
+
+
+def _mean_theta_segments(segs: list[tuple[int, int, int, int]]) -> Optional[float]:
+    if not segs:
+        return None
+    angles = np.array([_seg_theta_undirected(x1, y1, x2, y2) for (x1, y1, x2, y2) in segs], dtype=np.float32)
+    weights = np.array([math.hypot(x2 - x1, y2 - y1) for (x1, y1, x2, y2) in segs], dtype=np.float32)
+    s = float(np.sum(weights * np.sin(2.0 * angles)))
+    c = float(np.sum(weights * np.cos(2.0 * angles)))
+    if abs(s) < 1e-6 and abs(c) < 1e-6:
+        return None
+    ang = 0.5 * math.atan2(s, c)
+    if ang < 0:
+        ang += math.pi
+    return float(ang)
+
+
+def _filter_segments_by_angle_keep_min(
+    segs: list[tuple[int, int, int, int]],
+    ang_tol_deg: float,
+    min_keep: int,
+) -> tuple[list[tuple[int, int, int, int]], Dict[str, Any]]:
+    """Filter segments by closeness to the mean undirected angle.
+
+    Keeps at least `min_keep` by selecting the closest ones if the strict filter would drop too much.
+    """
+    if not segs:
+        return [], {"mean_theta": None, "kept": 0, "dropped": 0, "forced_keep": 0}
+    mean_theta = _mean_theta_segments(segs)
+    if mean_theta is None:
+        return segs, {"mean_theta": None, "kept": len(segs), "dropped": 0, "forced_keep": 0}
+
+    tol = math.radians(float(ang_tol_deg))
+    scored = []
+    for s in segs:
+        x1, y1, x2, y2 = s
+        th = _seg_theta_undirected(x1, y1, x2, y2)
+        d = _angle_distance(th, float(mean_theta))
+        scored.append((d, s))
+    scored.sort(key=lambda t: t[0])
+
+    strict = [s for (d, s) in scored if d <= tol]
+    forced_keep = 0
+    if len(strict) < int(min_keep):
+        forced_keep = int(min_keep) - len(strict)
+        strict = [s for (_, s) in scored[: int(min_keep)]]
+    kept = len(strict)
+    dropped = max(0, len(segs) - kept)
+    return strict, {
+        "mean_theta": float(mean_theta),
+        "kept": int(kept),
+        "dropped": int(dropped),
+        "forced_keep": int(forced_keep),
+        "ang_tol_deg": float(ang_tol_deg),
+        "min_keep": int(min_keep),
+    }
+
+
+def _merge_collinear_segments_by_rho(
+    segs: list[tuple[int, int, int, int]],
+    rho_bin_px: float,
+    gap_px: float,
+    min_len_px: float,
+) -> tuple[list[tuple[int, int, int, int]], Dict[str, Any]]:
+    """Merge collinear (nearly parallel) segments into longer segments, per-rho bin.
+
+    Strategy inspired by common lane/court line post-processing:
+    1) Estimate dominant direction (mean undirected theta)
+    2) Compute each segment's signed distance (rho) to that direction's normal
+    3) Bin by rho (so different court markings don't merge)
+    4) Within each bin, project endpoints onto the direction axis and merge 1D intervals with small gaps
+    """
+    if not segs:
+        return [], {"bins": 0, "in": 0, "out": 0}
+    mean_theta = _mean_theta_segments(segs)
+    if mean_theta is None:
+        return segs, {"bins": 0, "in": len(segs), "out": len(segs), "mean_theta": None}
+
+    u = np.array([math.cos(mean_theta), math.sin(mean_theta)], dtype=np.float32)  # direction
+    n = np.array([-u[1], u[0]], dtype=np.float32)  # normal
+
+    # bin by rho
+    bins: Dict[int, list[tuple[float, float]]] = {}
+    for (x1, y1, x2, y2) in segs:
+        p1 = np.array([float(x1), float(y1)], dtype=np.float32)
+        p2 = np.array([float(x2), float(y2)], dtype=np.float32)
+        mid = 0.5 * (p1 + p2)
+        rho = float(np.dot(n, mid))
+        b = int(round(rho / float(rho_bin_px)))
+        t1 = float(np.dot(u, p1))
+        t2 = float(np.dot(u, p2))
+        tmin, tmax = (t1, t2) if t1 <= t2 else (t2, t1)
+        bins.setdefault(b, []).append((tmin, tmax))
+
+    merged: list[tuple[int, int, int, int]] = []
+    out_bins = 0
+    total_intervals = 0
+    for b, intervals in bins.items():
+        if not intervals:
+            continue
+        out_bins += 1
+        total_intervals += len(intervals)
+        intervals.sort(key=lambda t: t[0])
+        cur0, cur1 = intervals[0]
+        for t0, t1 in intervals[1:]:
+            if t0 <= cur1 + float(gap_px):
+                cur1 = max(cur1, t1)
+            else:
+                if (cur1 - cur0) >= float(min_len_px):
+                    rho = float(b) * float(rho_bin_px)
+                    pA = u * cur0 + n * rho
+                    pB = u * cur1 + n * rho
+                    merged.append((int(round(pA[0])), int(round(pA[1])), int(round(pB[0])), int(round(pB[1]))))
+                cur0, cur1 = t0, t1
+        if (cur1 - cur0) >= float(min_len_px):
+            rho = float(b) * float(rho_bin_px)
+            pA = u * cur0 + n * rho
+            pB = u * cur1 + n * rho
+            merged.append((int(round(pA[0])), int(round(pA[1])), int(round(pB[0])), int(round(pB[1]))))
+
+    return merged, {
+        "mean_theta": float(mean_theta),
+        "bins": int(len(bins)),
+        "nonempty_bins": int(out_bins),
+        "intervals_in": int(total_intervals),
+        "segs_in": int(len(segs)),
+        "segs_out": int(len(merged)),
+        "rho_bin_px": float(rho_bin_px),
+        "gap_px": float(gap_px),
+        "min_len_px": float(min_len_px),
+    }
 
 
 def _mean_angle(lines: list[LineSeg]) -> Optional[float]:
@@ -2630,38 +3153,192 @@ def _complete_corners_from_lines(
     x0, y0, x1, y1 = [float(v) for v in floor_bbox]
     y_ref = float(y1 - 1.0)
     x_ref = float(0.5 * (x0 + x1))
-    sideline_angle = _mean_angle_segments(lines_left)
-    baseline_angle = _mean_angle_segments(lines_bottom)
+    sideline_angle_raw = _median_angle_segments(lines_left) or _mean_angle_segments(lines_left)
+    sideline_angle = sideline_angle_raw
+    baseline_angle = _median_angle_segments(lines_bottom) or _mean_angle_segments(lines_bottom)
+    sideline_perp_tol_deg = _env_float("BADC_COMPLETION_SIDELINE_PERP_TOL_DEG", 30.0)
+    sideline_perp_filter = _env_flag("BADC_COMPLETION_SIDELINE_PERP_FILTER", False)
+    sideline_perp_repick = _env_flag("BADC_COMPLETION_SIDELINE_PERP_REPICK", False)
+    lines_left_use = list(lines_left)
+    line_ids_left_use = list(line_ids_left) if line_ids_left is not None else [None] * len(lines_left_use)
+    if sideline_perp_filter and baseline_angle is not None and lines_left_use:
+        tol = math.radians(float(max(5.0, sideline_perp_tol_deg)))
+        scored_idx: list[Tuple[float, int]] = []
+        keep_idx: list[int] = []
+        for i, (x1s, y1s, x2s, y2s) in enumerate(lines_left_use):
+            ang = float(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))
+            d_perp = abs(_angle_distance(ang, float(baseline_angle)) - 0.5 * math.pi)
+            scored_idx.append((float(d_perp), int(i)))
+            if d_perp <= tol:
+                keep_idx.append(int(i))
+        if len(keep_idx) >= 2:
+            lines_left_use = [lines_left_use[i] for i in keep_idx]
+            line_ids_left_use = [line_ids_left_use[i] for i in keep_idx]
+        elif len(scored_idx) >= 2:
+            scored_idx.sort(key=lambda t: t[0])
+            pick = [scored_idx[0][1], scored_idx[1][1]]
+            lines_left_use = [lines_left_use[i] for i in pick]
+            line_ids_left_use = [line_ids_left_use[i] for i in pick]
+    sideline_angle = _median_angle_segments(lines_left_use) or _mean_angle_segments(lines_left_use) or sideline_angle
+    sideline_max_angle_deg = _env_float("BADC_REP_MAX_ANGLE_SIDELINE_DEG", 30.0)
+    baseline_max_angle_deg = _env_float("BADC_REP_MAX_ANGLE_BASELINE_DEG", 20.0)
     min_len = 0.06 * float(min(img_w, img_h))
     left_line, left_meta = _pick_rep_line(
-        lines_left,
+        lines_left_use,
         y_ref=y_ref,
         x_ref=x_ref,
         pick="min_x",
         angle_ref=sideline_angle,
-        max_angle_deg=15.0,
+        max_angle_deg=sideline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
-        line_ids=line_ids_left,
+        line_ids=line_ids_left_use,
     )
     right_line, right_meta = _pick_rep_line(
-        lines_left,
+        lines_left_use,
         y_ref=y_ref,
         x_ref=x_ref,
         pick="max_x",
         angle_ref=sideline_angle,
-        max_angle_deg=15.0,
+        max_angle_deg=sideline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
-        line_ids=line_ids_left,
+        line_ids=line_ids_left_use,
     )
+
+    def _line_angle_from_abc(line_abc: Optional[Tuple[float, float, float]]) -> Optional[float]:
+        if line_abc is None:
+            return None
+        a, b, _ = line_abc
+        ang = float(np.mod(math.atan2(-float(a), float(b)), math.pi))
+        if not math.isfinite(ang):
+            return None
+        return ang
+
+    def _perp_error_to_baseline(line_abc: Optional[Tuple[float, float, float]]) -> Optional[float]:
+        if line_abc is None or baseline_angle is None:
+            return None
+        ang = _line_angle_from_abc(line_abc)
+        if ang is None:
+            return None
+        return float(abs(_angle_distance(ang, float(baseline_angle)) - 0.5 * math.pi))
+
+    def _repick_sideline_if_needed(
+        current_line: Optional[Tuple[float, float, float]],
+        current_meta: Dict[str, Any],
+        pick_mode: str,
+    ) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any]]:
+        meta = dict(current_meta or {})
+        if not sideline_perp_repick:
+            err = _perp_error_to_baseline(current_line)
+            if err is not None:
+                meta["perp_err_deg"] = float(math.degrees(err))
+            return current_line, meta
+        if baseline_angle is None or not lines_left_use:
+            err = _perp_error_to_baseline(current_line)
+            if err is not None:
+                meta["perp_err_deg"] = float(math.degrees(err))
+            return current_line, meta
+        tol = math.radians(float(max(5.0, sideline_perp_tol_deg)))
+        err = _perp_error_to_baseline(current_line)
+        if err is not None:
+            meta["perp_err_deg"] = float(math.degrees(err))
+        if err is None or err <= tol:
+            return current_line, meta
+
+        keep_idx: list[int] = []
+        for i, seg in enumerate(lines_left_use):
+            x1s, y1s, x2s, y2s = seg
+            seg_ang = float(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))
+            d_perp = abs(_angle_distance(seg_ang, float(baseline_angle)) - 0.5 * math.pi)
+            if d_perp <= tol:
+                keep_idx.append(int(i))
+        meta["perp_repick_candidates"] = int(len(keep_idx))
+        if len(keep_idx) < 1:
+            return current_line, meta
+
+        segs = [lines_left_use[i] for i in keep_idx]
+        ids = [line_ids_left_use[i] for i in keep_idx]
+        alt_line, alt_meta = _pick_rep_line(
+            segs,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick=pick_mode,
+            angle_ref=sideline_angle,
+            max_angle_deg=sideline_max_angle_deg,
+            min_len=min_len,
+            line_mask=line_mask,
+            line_ids=ids,
+        )
+        if alt_line is None:
+            return current_line, meta
+        out_meta = dict(alt_meta or {})
+        out_meta["perp_repicked"] = True
+        out_err = _perp_error_to_baseline(alt_line)
+        if out_err is not None:
+            out_meta["perp_err_deg"] = float(math.degrees(out_err))
+        return alt_line, out_meta
+
+    left_line, left_meta = _repick_sideline_if_needed(left_line, left_meta, "min_x")
+    right_line, right_meta = _repick_sideline_if_needed(right_line, right_meta, "max_x")
+
+    if right_line is None and lines_left_use:
+        right_line, right_meta = _pick_rep_line(
+            lines_left_use,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="max_x",
+            angle_ref=sideline_angle,
+            max_angle_deg=max(sideline_max_angle_deg, 45.0),
+            min_len=min_len * 0.6,
+            line_mask=line_mask,
+            line_ids=line_ids_left_use,
+        )
+    sideline_fallback_used = False
+    if (left_line is None or right_line is None) and (len(lines_left_use) != len(lines_left)):
+        sideline_fallback_used = True
+        sideline_angle = sideline_angle_raw
+        left_line, left_meta = _pick_rep_line(
+            lines_left,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="min_x",
+            angle_ref=sideline_angle,
+            max_angle_deg=sideline_max_angle_deg,
+            min_len=min_len,
+            line_mask=line_mask,
+            line_ids=line_ids_left,
+        )
+        right_line, right_meta = _pick_rep_line(
+            lines_left,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="max_x",
+            angle_ref=sideline_angle,
+            max_angle_deg=sideline_max_angle_deg,
+            min_len=min_len,
+            line_mask=line_mask,
+            line_ids=line_ids_left,
+        )
+        if right_line is None and lines_left:
+            right_line, right_meta = _pick_rep_line(
+                lines_left,
+                y_ref=y_ref,
+                x_ref=x_ref,
+                pick="max_x",
+                angle_ref=sideline_angle,
+                max_angle_deg=max(sideline_max_angle_deg, 45.0),
+                min_len=min_len * 0.6,
+                line_mask=line_mask,
+                line_ids=line_ids_left,
+            )
     bottom_line, bottom_meta = _pick_rep_line(
         lines_bottom,
         y_ref=y_ref,
         x_ref=x_ref,
         pick="max_y",
         angle_ref=baseline_angle,
-        max_angle_deg=15.0,
+        max_angle_deg=baseline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
         line_ids=line_ids_bottom,
@@ -2672,7 +3349,7 @@ def _complete_corners_from_lines(
         x_ref=x_ref,
         pick="min_y",
         angle_ref=baseline_angle,
-        max_angle_deg=15.0,
+        max_angle_deg=baseline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
         line_ids=line_ids_bottom,
@@ -2686,6 +3363,11 @@ def _complete_corners_from_lines(
         "left_sideline_meta": left_meta,
         "right_sideline_meta": right_meta,
         "top_line_meta": top_meta,
+        "sideline_perp_tol_deg": float(sideline_perp_tol_deg),
+        "sideline_perp_filter": bool(sideline_perp_filter),
+        "sideline_candidates_before": int(len(lines_left)),
+        "sideline_candidates_after": int(len(lines_left_use)),
+        "sideline_fallback_used": bool(sideline_fallback_used),
     }
     if component_id is not None:
         meta["component_id"] = int(component_id)
@@ -2720,6 +3402,264 @@ def _complete_corners_from_lines(
     return completed, True, meta
 
 
+def _refine_bottom_baseline_postfit(
+    ordered_lb_rb_rt_lt: np.ndarray,
+    lines_bottom: Sequence[Tuple[float, float, float, float]],
+    lines_all: Sequence[Tuple[float, float, float, float]],
+    floor_bbox: Tuple[int, int, int, int],
+    line_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+    """
+    Post-fit baseline correction for "baseline vs doubles long service line" confusion.
+    Rules implemented:
+    1) bottom line disambiguation with nearby parallel pair
+    2) explicit 0.76m spacing prior in model coordinates
+    3) if there is a stronger stable line below current bottom, swap to lower one
+    """
+    enabled = _env_flag("BADC_POSTFIT_BASELINE_VERIFY", True)
+    ordered = np.asarray(ordered_lb_rb_rt_lt, dtype=np.float32).reshape(4, 2)
+    meta: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "used": False,
+        "reason": None,
+    }
+    if not enabled:
+        return ordered, False, meta
+    if (not lines_bottom and not lines_all) or ordered.shape != (4, 2):
+        meta["reason"] = "no_lines"
+        return ordered, False, meta
+
+    angle_tol_deg = float(_env_float("BADC_POSTFIT_BASELINE_ANGLE_TOL_DEG", 10.0))
+    min_seg_len_m = float(_env_float("BADC_POSTFIT_BASELINE_MIN_SEG_M", 0.65))
+    target_gap_m = float(_env_float("BADC_POSTFIT_BASELINE_TARGET_GAP_M", 0.76))
+    gap_tol_m = float(_env_float("BADC_POSTFIT_BASELINE_GAP_TOL_M", 0.22))
+    below_min_m = float(_env_float("BADC_POSTFIT_BASELINE_BELOW_MIN_M", 0.30))
+    below_max_m = float(_env_float("BADC_POSTFIT_BASELINE_BELOW_MAX_M", 1.30))
+    min_support = float(_env_float("BADC_POSTFIT_BASELINE_MIN_SUPPORT", 0.18))
+    min_improve_px = float(_env_float("BADC_POSTFIT_BASELINE_MIN_IMPROVE_PX", 3.0))
+    include_all = bool(_env_flag("BADC_POSTFIT_BASELINE_INCLUDE_ALL", True))
+    img_angle_tol_deg = float(_env_float("BADC_POSTFIT_BASELINE_IMG_ANGLE_TOL_DEG", 14.0))
+    img_pair_gap_tol_ratio = float(_env_float("BADC_POSTFIT_BASELINE_IMG_GAP_TOL_RATIO", 0.50))
+
+    model_corners = get_bwf_corners().astype(np.float32)
+    try:
+        H_i2m = cv2.getPerspectiveTransform(ordered.astype(np.float32), model_corners)
+    except Exception:
+        meta["reason"] = "bad_h_i2m"
+        return ordered, False, meta
+    if H_i2m is None or not np.all(np.isfinite(H_i2m)):
+        meta["reason"] = "bad_h_i2m"
+        return ordered, False, meta
+
+    src_lines: list[Tuple[float, float, float, float]] = []
+    src_lines.extend([(float(x1), float(y1), float(x2), float(y2)) for x1, y1, x2, y2 in lines_bottom])
+    if include_all:
+        src_lines.extend([(float(x1), float(y1), float(x2), float(y2)) for x1, y1, x2, y2 in lines_all])
+    if not src_lines:
+        meta["reason"] = "no_source_lines"
+        return ordered, False, meta
+
+    # Deduplicate by rounded endpoints (order-independent).
+    dedup: Dict[Tuple[int, int, int, int], Tuple[float, float, float, float]] = {}
+    for x1, y1, x2, y2 in src_lines:
+        p = (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+        q = (int(round(x2)), int(round(y2)), int(round(x1)), int(round(y1)))
+        key = p if p <= q else q
+        dedup[key] = (x1, y1, x2, y2)
+    src_lines = list(dedup.values())
+
+    tan_tol = math.tan(math.radians(max(1.0, angle_tol_deg)))
+    cands: list[Dict[str, Any]] = []
+    for x1, y1, x2, y2 in src_lines:
+        pts = np.array([[float(x1), float(y1)], [float(x2), float(y2)]], dtype=np.float32)
+        pts_m = project_points(H_i2m, pts)
+        if pts_m.shape != (2, 2) or not np.all(np.isfinite(pts_m)):
+            continue
+        dx_m = float(pts_m[1, 0] - pts_m[0, 0])
+        dy_m = float(pts_m[1, 1] - pts_m[0, 1])
+        seg_len_m = float(math.hypot(dx_m, dy_m))
+        if seg_len_m < min_seg_len_m:
+            continue
+        if abs(dy_m) > tan_tol * max(abs(dx_m), 1e-6):
+            continue
+        support = 0.5
+        if line_mask is not None and line_mask.size > 0:
+            support = float(_line_support((x1, y1, x2, y2), line_mask, samples=48))
+        cands.append(
+            {
+                "seg": (x1, y1, x2, y2),
+                "line": _line_from_points((x1, y1), (x2, y2)),
+                "y_m": float(0.5 * (pts_m[0, 1] + pts_m[1, 1])),
+                "x_span_m": float(abs(dx_m)),
+                "seg_len_m": float(seg_len_m),
+                "mid_y_img": float(0.5 * (y1 + y2)),
+                "support": float(support),
+                "score": float(max(0.0, support) * min(1.0, abs(dx_m) / 6.10)),
+            }
+        )
+    if not cands:
+        meta["reason"] = "no_horizontal_candidates"
+        return ordered, False, meta
+
+    cands.sort(key=lambda d: float(d["y_m"]))
+    meta["candidates"] = [
+        {
+            "y_m": float(c["y_m"]),
+            "mid_y_img": float(c["mid_y_img"]),
+            "support": float(c["support"]),
+            "score": float(c["score"]),
+            "len_m": float(c["seg_len_m"]),
+        }
+        for c in cands[:16]
+    ]
+    current_bottom_mid = float(0.5 * (ordered[0, 1] + ordered[1, 1]))
+    cur = min(cands, key=lambda d: abs(float(d["y_m"])))
+    current_ref_mid = float(cur["mid_y_img"])
+
+    chosen: Optional[Dict[str, Any]] = None
+    choose_reason = None
+
+    # Rule 2: explicit 0.76m pair near current bottom neighborhood.
+    best_pair = None
+    best_pair_score = float("-inf")
+    for i in range(len(cands)):
+        ci = cands[i]
+        for j in range(i + 1, len(cands)):
+            cj = cands[j]
+            dy = abs(float(ci["y_m"]) - float(cj["y_m"]))
+            if abs(dy - target_gap_m) > gap_tol_m:
+                continue
+            if min(float(ci["support"]), float(cj["support"])) < min_support:
+                continue
+            if min(abs(float(ci["y_m"])), abs(float(cj["y_m"]))) > 0.55:
+                continue
+            # Baseline should be lower in image (larger y pixel) among the near-parallel pair.
+            baseline_cand = ci if float(ci["mid_y_img"]) >= float(cj["mid_y_img"]) else cj
+            pair_score = float(
+                min(float(ci["score"]), float(cj["score"]))
+                + 0.25 * math.exp(-abs(dy - target_gap_m) / max(1e-6, 0.18))
+            )
+            if pair_score > best_pair_score:
+                best_pair_score = pair_score
+                best_pair = baseline_cand
+    if best_pair is not None and float(best_pair["mid_y_img"]) >= current_ref_mid - 1.0:
+        chosen = best_pair
+        choose_reason = "pair_0.76m"
+
+    # Rule 3: a stable strong line exists below current baseline.
+    if chosen is None:
+        below = [
+            c
+            for c in cands
+            if (-below_max_m <= float(c["y_m"]) <= -below_min_m) and float(c["support"]) >= min_support
+        ]
+        if below:
+            below.sort(
+                key=lambda c: (
+                    float(c["score"]) + 0.15 * math.exp(-abs(abs(float(c["y_m"])) - target_gap_m) / max(1e-6, 0.18)),
+                    float(c["mid_y_img"]),
+                ),
+                reverse=True,
+            )
+            cand = below[0]
+            if float(cand["mid_y_img"]) >= current_ref_mid + min_improve_px:
+                chosen = cand
+                choose_reason = "strong_line_below_bottom"
+
+    # Image-space fallback: parallel neighbor below current bottom with expected ~0.76m pixel gap.
+    if chosen is None:
+        H_m2i = cv2.getPerspectiveTransform(model_corners, ordered.astype(np.float32))
+        model_w = float(np.max(model_corners[:, 0]) - np.min(model_corners[:, 0]))
+        p_gap = project_points(
+            H_m2i,
+            np.array([[0.5 * model_w, 0.0], [0.5 * model_w, float(target_gap_m)]], dtype=np.float32),
+        )
+        expected_gap_px = float(abs(float(p_gap[1, 1]) - float(p_gap[0, 1]))) if p_gap.shape == (2, 2) else 0.0
+        expected_gap_px = max(6.0, expected_gap_px)
+        gap_tol_px = max(6.0, img_pair_gap_tol_ratio * expected_gap_px)
+
+        cur_line = _line_from_points((float(ordered[0, 0]), float(ordered[0, 1])), (float(ordered[1, 0]), float(ordered[1, 1])))
+        cur_ang = float(np.mod(math.atan2(float(ordered[1, 1] - ordered[0, 1]), float(ordered[1, 0] - ordered[0, 0])), math.pi))
+        x_ref = float(0.5 * (float(floor_bbox[0]) + float(floor_bbox[2])))
+        y_cur_ref = _y_at_x(cur["line"], x_ref)
+        if y_cur_ref is None:
+            y_cur_ref = current_ref_mid
+
+        best_img = None
+        best_img_score = float("-inf")
+        for c in cands:
+            x1, y1, x2, y2 = c["seg"]
+            ang = float(np.mod(math.atan2(float(y2 - y1), float(x2 - x1)), math.pi))
+            if _angle_distance(ang, cur_ang) > math.radians(max(3.0, img_angle_tol_deg)):
+                continue
+            yc = _y_at_x(c["line"], x_ref)
+            if yc is None:
+                yc = float(c["mid_y_img"])
+            dy_px = float(yc - y_cur_ref)
+            if dy_px < min_improve_px:
+                continue
+            if abs(dy_px - expected_gap_px) > gap_tol_px:
+                continue
+            sup = float(c["support"])
+            if sup < min_support:
+                continue
+            score_img = float(sup + 0.35 * math.exp(-abs(dy_px - expected_gap_px) / max(1e-6, 0.4 * expected_gap_px)))
+            if score_img > best_img_score:
+                best_img_score = score_img
+                best_img = c
+        if best_img is not None:
+            chosen = best_img
+            choose_reason = "img_parallel_below_expected_gap"
+            meta["expected_gap_px"] = float(expected_gap_px)
+            meta["gap_tol_px"] = float(gap_tol_px)
+
+    if chosen is None:
+        meta["reason"] = "no_swap_evidence"
+        meta["num_candidates"] = int(len(cands))
+        meta["current_bottom_mid_y"] = float(current_bottom_mid)
+        meta["current_near_y_model"] = float(cur["y_m"])
+        return ordered, False, meta
+
+    left_line = _line_from_points((float(ordered[3, 0]), float(ordered[3, 1])), (float(ordered[0, 0]), float(ordered[0, 1])))
+    right_line = _line_from_points((float(ordered[2, 0]), float(ordered[2, 1])), (float(ordered[1, 0]), float(ordered[1, 1])))
+    baseline_line = chosen["line"]
+    lb = _intersect_lines(left_line, baseline_line)
+    rb = _intersect_lines(right_line, baseline_line)
+    if lb is None or rb is None or not np.all(np.isfinite(lb)) or not np.all(np.isfinite(rb)):
+        meta["reason"] = "line_intersection_failed"
+        return ordered, False, meta
+    if float(lb[0]) > float(rb[0]):
+        lb, rb = rb, lb
+    refined = ordered.copy()
+    refined[0] = lb
+    refined[1] = rb
+
+    if not _is_convex_quad(refined):
+        meta["reason"] = "non_convex_after_swap"
+        return ordered, False, meta
+    ok, gate_reason, _gate_metrics = _passes_geom_gates(refined, floor_bbox)
+    if not ok:
+        meta["reason"] = f"geom_gate_{gate_reason}"
+        return ordered, False, meta
+
+    meta.update(
+        {
+            "used": True,
+            "reason": str(choose_reason),
+            "num_candidates": int(len(cands)),
+            "chosen_y_model": float(chosen["y_m"]),
+            "chosen_mid_y_img": float(chosen["mid_y_img"]),
+            "chosen_support": float(chosen["support"]),
+            "current_bottom_mid_y": float(current_bottom_mid),
+            "current_ref_mid_y": float(current_ref_mid),
+            "current_near_y_model": float(cur["y_m"]),
+            "target_gap_m": float(target_gap_m),
+            "gap_tol_m": float(gap_tol_m),
+        }
+    )
+    return refined, True, meta
+
+
 def _estimate_vanishing_point(
     lines: list[Tuple[float, float, float]],
     rng: np.random.Generator,
@@ -2749,6 +3689,446 @@ def _project_line_segments(H: np.ndarray) -> np.ndarray:
         uv = project_points(H, pts)
         segs.append([uv[0, 0], uv[0, 1], uv[1, 0], uv[1, 1]])
     return np.array(segs, dtype=np.float32)
+
+
+def _project_named_line_segments(H: np.ndarray) -> Dict[str, Tuple[float, float, float, float]]:
+    out: Dict[str, Tuple[float, float, float, float]] = {}
+    for ln in get_bwf_lines():
+        pts = np.array([ln.p1, ln.p2], dtype=np.float32)
+        uv = project_points(H, pts)
+        if uv.shape != (2, 2) or not np.all(np.isfinite(uv)):
+            continue
+        out[str(ln.name)] = (float(uv[0, 0]), float(uv[0, 1]), float(uv[1, 0]), float(uv[1, 1]))
+    return out
+
+
+def _court_role_prior_bonus(
+    H: np.ndarray,
+    mask: Optional[np.ndarray],
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Optional role prior:
+    - near baseline should have at least comparable support to near service lines
+    - near baseline should project lower than near short service line in image (y larger)
+    """
+    if not _env_flag("BADC_ROLE_PRIOR_ENABLE", False):
+        return 0.0, {}
+    if mask is None or mask.size == 0:
+        return 0.0, {}
+    named = _project_named_line_segments(H)
+    if not named:
+        return 0.0, {}
+    if "baseline_bottom" not in named or "short_near" not in named or "long_near_d" not in named:
+        return 0.0, {}
+    base_seg = named["baseline_bottom"]
+    short_seg = named["short_near"]
+    long_seg = named["long_near_d"]
+
+    s_base = float(_line_support(base_seg, mask, samples=72))
+    s_short = float(_line_support(short_seg, mask, samples=56))
+    s_long = float(_line_support(long_seg, mask, samples=56))
+    s_ref = max(s_short, s_long)
+    margin = s_base - s_ref
+    min_margin = float(_env_float("BADC_ROLE_PRIOR_MIN_MARGIN", 0.02))
+    w_margin = float(_env_float("BADC_ROLE_PRIOR_W", 8.0))
+    margin_term = w_margin * (margin - min_margin)
+
+    by = 0.5 * (base_seg[1] + base_seg[3])
+    sy = 0.5 * (short_seg[1] + short_seg[3])
+    orient_good = float(by > sy)
+    w_orient = float(_env_float("BADC_ROLE_PRIOR_ORIENT_W", 2.0))
+    orient_term = w_orient if orient_good > 0.5 else (-w_orient)
+
+    bonus = float(margin_term + orient_term)
+    cap = float(_env_float("BADC_ROLE_PRIOR_CAP", 10.0))
+    bonus = float(np.clip(bonus, -cap, cap))
+    meta = {
+        "baseline_support": float(s_base),
+        "short_near_support": float(s_short),
+        "long_near_support": float(s_long),
+        "support_margin": float(margin),
+        "orient_good": float(orient_good),
+        "bonus": float(bonus),
+    }
+    return bonus, meta
+
+
+def _unique_axis_targets(
+    pairs: Sequence[Tuple[float, float]],
+    tol: float = 1e-4,
+) -> list[Tuple[float, float]]:
+    if not pairs:
+        return []
+    items = sorted([(float(p), float(max(0.0, s))) for p, s in pairs], key=lambda t: t[0])
+    out: list[Tuple[float, float]] = []
+    for pos, span in items:
+        if not out:
+            out.append((pos, span))
+            continue
+        lp, ls = out[-1]
+        if abs(pos - lp) <= float(tol):
+            w0 = max(ls, 1e-6)
+            w1 = max(span, 1e-6)
+            mp = (lp * w0 + pos * w1) / (w0 + w1)
+            out[-1] = (float(mp), float(max(ls, span)))
+        else:
+            out.append((pos, span))
+    return out
+
+
+def _model_axis_targets() -> Tuple[list[Tuple[float, float]], list[Tuple[float, float]], float, float]:
+    """
+    Returns:
+    - horizontal targets: [(y_pos_m, expected_span_m), ...]
+    - vertical targets:   [(x_pos_m, expected_span_m), ...]
+    - model width (m), model length (m)
+    """
+    h_targets: list[Tuple[float, float]] = []
+    v_targets: list[Tuple[float, float]] = []
+    for ln in get_bwf_lines():
+        x1, y1 = float(ln.p1[0]), float(ln.p1[1])
+        x2, y2 = float(ln.p2[0]), float(ln.p2[1])
+        if abs(y1 - y2) <= 1e-6:
+            h_targets.append((0.5 * (y1 + y2), abs(x2 - x1)))
+        elif abs(x1 - x2) <= 1e-6:
+            v_targets.append((0.5 * (x1 + x2), abs(y2 - y1)))
+    h_targets = _unique_axis_targets(h_targets)
+    v_targets = _unique_axis_targets(v_targets)
+    corners = get_bwf_corners()
+    model_w = float(np.max(corners[:, 0]) - np.min(corners[:, 0]))
+    model_l = float(np.max(corners[:, 1]) - np.min(corners[:, 1]))
+    return h_targets, v_targets, model_w, model_l
+
+
+def _parse_float_csv(text: str, default: Sequence[float]) -> list[float]:
+    raw = str(text or "").strip()
+    if not raw:
+        return [float(v) for v in default]
+    vals: list[float] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            vals.append(float(p))
+        except Exception:
+            continue
+    if not vals:
+        return [float(v) for v in default]
+    return vals
+
+
+def _compress_axis_observations(
+    obs: Sequence[Tuple[float, float]],
+    tol: float,
+) -> list[Tuple[float, float]]:
+    if not obs:
+        return []
+    items = sorted([(float(p), float(max(0.0, ln))) for p, ln in obs], key=lambda t: t[0])
+    out: list[Tuple[float, float]] = []
+    for pos, ln in items:
+        if not out:
+            out.append((pos, ln))
+            continue
+        lp, ll = out[-1]
+        if abs(pos - lp) <= float(max(1e-6, tol)):
+            out[-1] = (0.5 * (lp + pos), max(ll, ln))
+        else:
+            out.append((pos, ln))
+    return out
+
+
+def _match_axis_target_support(
+    obs: Sequence[Tuple[float, float]],
+    target_pos: float,
+    target_span: float,
+    tol_pos: float,
+) -> Tuple[float, Optional[float], float]:
+    best_rank = float("-inf")
+    best_score = 0.0
+    best_pos: Optional[float] = None
+    best_raw_support = 0.0
+    for pos, ln in obs:
+        d = abs(float(pos) - float(target_pos))
+        if d > float(max(1e-6, tol_pos)):
+            continue
+        raw_support = float(ln) / float(max(target_span, 1e-6))
+        score = min(1.0, raw_support)
+        rank = float(score - 0.25 * (d / float(max(1e-6, tol_pos))))
+        if rank > best_rank:
+            best_rank = rank
+            best_score = float(score)
+            best_raw_support = float(raw_support)
+            best_pos = float(pos)
+    return float(best_score), best_pos, float(best_raw_support)
+
+
+def _evaluate_court_ratio_structure(
+    quad_img_lb_rb_rt_lt: np.ndarray,
+    lines_img: Sequence[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    angle_tol_deg: float = 12.0,
+    tol_h_m: float = 0.24,
+    tol_v_m: float = 0.22,
+    min_seg_len_m: float = 0.55,
+    model_margin_m: float = 1.2,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "score": 0.0,
+        "h_present": 0,
+        "v_present": 0,
+        "h_expected": 0,
+        "v_expected": 0,
+        "ratio_est": None,
+        "ratio_err": None,
+        "ratio_score": 0.0,
+        "h_score": 0.0,
+        "v_score": 0.0,
+        "h_geom_score": 0.0,
+        "v_geom_score": 0.0,
+        "key_score": 0.0,
+    }
+    if quad_img_lb_rb_rt_lt is None or quad_img_lb_rb_rt_lt.shape != (4, 2):
+        return out
+    if not lines_img:
+        return out
+    model_corners = get_bwf_corners().astype(np.float32)
+    quad = quad_img_lb_rb_rt_lt.astype(np.float32)
+    if not np.all(np.isfinite(quad)):
+        return out
+    try:
+        H_i2m = cv2.getPerspectiveTransform(quad, model_corners)
+    except Exception:
+        return out
+    if H_i2m is None or not np.all(np.isfinite(H_i2m)):
+        return out
+
+    h_targets, v_targets, model_w, model_l = _model_axis_targets()
+    if not h_targets or not v_targets:
+        return out
+    out["h_expected"] = int(len(h_targets))
+    out["v_expected"] = int(len(v_targets))
+
+    tan_tol = math.tan(math.radians(float(max(1.0, angle_tol_deg))))
+    h_obs: list[Tuple[float, float]] = []
+    v_obs: list[Tuple[float, float]] = []
+    m_margin = float(max(0.0, model_margin_m))
+    for x1, y1, x2, y2 in lines_img:
+        pts = np.array([[float(x1), float(y1)], [float(x2), float(y2)]], dtype=np.float32)
+        pts_m = project_points(H_i2m, pts)
+        if pts_m.shape != (2, 2) or not np.all(np.isfinite(pts_m)):
+            continue
+        mx = float(0.5 * (pts_m[0, 0] + pts_m[1, 0]))
+        my = float(0.5 * (pts_m[0, 1] + pts_m[1, 1]))
+        if (
+            mx < -m_margin
+            or mx > float(model_w + m_margin)
+            or my < -m_margin
+            or my > float(model_l + m_margin)
+        ):
+            continue
+        dx = float(pts_m[1, 0] - pts_m[0, 0])
+        dy = float(pts_m[1, 1] - pts_m[0, 1])
+        seg_len = float(math.hypot(dx, dy))
+        if seg_len < float(max(0.05, min_seg_len_m)):
+            continue
+        adx = abs(dx)
+        ady = abs(dy)
+        if ady <= tan_tol * max(adx, 1e-6):
+            h_obs.append((my, seg_len))
+        elif adx <= tan_tol * max(ady, 1e-6):
+            v_obs.append((mx, seg_len))
+
+    h_obs = _compress_axis_observations(h_obs, tol=max(0.05, tol_h_m * 0.5))
+    v_obs = _compress_axis_observations(v_obs, tol=max(0.05, tol_v_m * 0.5))
+    if not h_obs and not v_obs:
+        return out
+
+    h_scores: list[float] = []
+    h_pos_found: list[Optional[float]] = []
+    h_support_raw: list[float] = []
+    for y_exp, span_exp in h_targets:
+        s, pos, raw_s = _match_axis_target_support(h_obs, y_exp, span_exp, tol_h_m)
+        h_scores.append(float(s))
+        h_pos_found.append(pos)
+        h_support_raw.append(float(raw_s))
+    v_scores: list[float] = []
+    v_pos_found: list[Optional[float]] = []
+    v_support_raw: list[float] = []
+    for x_exp, span_exp in v_targets:
+        s, pos, raw_s = _match_axis_target_support(v_obs, x_exp, span_exp, tol_v_m)
+        v_scores.append(float(s))
+        v_pos_found.append(pos)
+        v_support_raw.append(float(raw_s))
+
+    present_thr = 0.22
+    h_present = int(sum(1 for s in h_scores if s >= present_thr))
+    v_present = int(sum(1 for s in v_scores if s >= present_thr))
+    h_score = float(np.mean(h_scores)) if h_scores else 0.0
+    v_score = float(np.mean(v_scores)) if v_scores else 0.0
+
+    h_errs: list[float] = []
+    for (y_exp, _), pos in zip(h_targets, h_pos_found):
+        if pos is None:
+            h_errs.append(1.0)
+        else:
+            h_errs.append(float(abs(pos - y_exp) / max(model_l, 1e-6)))
+    v_errs: list[float] = []
+    for (x_exp, _), pos in zip(v_targets, v_pos_found):
+        if pos is None:
+            v_errs.append(1.0)
+        else:
+            v_errs.append(float(abs(pos - x_exp) / max(model_w, 1e-6)))
+    h_err_mean = float(np.mean(h_errs)) if h_errs else 1.0
+    v_err_mean = float(np.mean(v_errs)) if v_errs else 1.0
+    h_geom_score = float(math.exp(-h_err_mean / 0.07))
+    v_geom_score = float(math.exp(-v_err_mean / 0.10))
+
+    ratio_est: Optional[float] = None
+    ratio_err: Optional[float] = None
+    ratio_score = 0.0
+    y0 = h_pos_found[0] if h_pos_found else None
+    y1 = h_pos_found[-1] if h_pos_found else None
+    x0 = v_pos_found[0] if v_pos_found else None
+    x1 = v_pos_found[-1] if v_pos_found else None
+    if y0 is not None and y1 is not None and x0 is not None and x1 is not None:
+        len_est = float(abs(y1 - y0))
+        wid_est = float(abs(x1 - x0))
+        if len_est > 1e-6 and wid_est > 1e-6:
+            ratio_est = float(len_est / wid_est)
+            ratio_target = float(model_l / max(model_w, 1e-6))
+            ratio_err = float(abs(ratio_est - ratio_target) / max(ratio_target, 1e-6))
+            ratio_score = float(math.exp(-ratio_err / 0.12))
+
+    key_hits = 0
+    if h_scores:
+        key_hits += int(h_scores[0] >= present_thr)
+        key_hits += int(h_scores[-1] >= present_thr)
+    if v_scores:
+        key_hits += int(v_scores[0] >= present_thr)
+        key_hits += int(v_scores[-1] >= present_thr)
+    key_score = float(key_hits / 4.0)
+
+    coverage_score = float(0.5 * h_score + 0.5 * v_score)
+    geom_score = float(0.5 * h_geom_score + 0.5 * v_geom_score)
+    score = float(0.55 * coverage_score + 0.20 * geom_score + 0.15 * ratio_score + 0.10 * key_score)
+    score = float(np.clip(score, 0.0, 1.0))
+
+    out.update(
+        {
+            "score": float(score),
+            "h_present": int(h_present),
+            "v_present": int(v_present),
+            "h_score": float(h_score),
+            "v_score": float(v_score),
+            "h_geom_score": float(h_geom_score),
+            "v_geom_score": float(v_geom_score),
+            "ratio_est": float(ratio_est) if ratio_est is not None else None,
+            "ratio_err": float(ratio_err) if ratio_err is not None else None,
+            "ratio_score": float(ratio_score),
+            "key_score": float(key_score),
+            "h_obs_count": int(len(h_obs)),
+            "v_obs_count": int(len(v_obs)),
+            "h_support_raw": [float(v) for v in h_support_raw],
+            "v_support_raw": [float(v) for v in v_support_raw],
+        }
+    )
+    return out
+
+
+def _scale_quad_about_center(quad_xy: np.ndarray, scale: float) -> np.ndarray:
+    c = np.mean(quad_xy, axis=0, keepdims=True)
+    out = c + (quad_xy - c) * float(scale)
+    return out.astype(np.float32)
+
+
+def _refine_quad_by_structure_scale(
+    ordered: np.ndarray,
+    lines_all: Sequence[Tuple[float, float, float, float]],
+    floor_bbox: Tuple[int, int, int, int],
+    img_w: int,
+    img_h: int,
+    scales: Sequence[float],
+    min_gain: float,
+    angle_tol_deg: float,
+    tol_h_m: float,
+    tol_v_m: float,
+    min_seg_len_m: float,
+    min_area_ratio_img: float,
+    aspect_min: float,
+    aspect_max: float,
+    min_bbox_w: float,
+    min_bbox_h: float,
+    min_edge: float,
+) -> Tuple[np.ndarray, Dict[str, Any], bool]:
+    base_meta = _evaluate_court_ratio_structure(
+        ordered,
+        lines_all,
+        img_w=img_w,
+        img_h=img_h,
+        angle_tol_deg=angle_tol_deg,
+        tol_h_m=tol_h_m,
+        tol_v_m=tol_v_m,
+        min_seg_len_m=min_seg_len_m,
+    )
+    best_quad = ordered.astype(np.float32).copy()
+    best_meta = dict(base_meta)
+    best_score = float(base_meta.get("score", 0.0))
+    improved = False
+    for s in scales:
+        ss = float(s)
+        if not np.isfinite(ss) or ss <= 0.0 or abs(ss - 1.0) < 1e-4:
+            continue
+        cand = _scale_quad_about_center(ordered, ss)
+        if not _is_convex_quad(cand):
+            continue
+        if float(_quad_area(cand)) < 1.0:
+            continue
+        ok, _gate_reason, _gate_metrics = _passes_geom_gates(cand, floor_bbox)
+        if not ok:
+            continue
+        bbox_w = float(np.max(cand[:, 0]) - np.min(cand[:, 0]))
+        bbox_h = float(np.max(cand[:, 1]) - np.min(cand[:, 1]))
+        if bbox_w < float(min_bbox_w) or bbox_h < float(min_bbox_h):
+            continue
+        cand_clip = cand.copy()
+        cand_clip[:, 0] = np.clip(cand_clip[:, 0], 0.0, float(max(0, img_w - 1)))
+        cand_clip[:, 1] = np.clip(cand_clip[:, 1], 0.0, float(max(0, img_h - 1)))
+        area_ratio_img = float(_quad_area(cand_clip)) / float(max(1, img_w * img_h))
+        if area_ratio_img < float(min_area_ratio_img):
+            continue
+        edge_min = float(np.min(_quad_edges(cand)))
+        if edge_min < float(min_edge):
+            continue
+        w1 = float(np.linalg.norm(cand[1] - cand[0]))
+        w2 = float(np.linalg.norm(cand[2] - cand[3]))
+        h1 = float(np.linalg.norm(cand[3] - cand[0]))
+        h2 = float(np.linalg.norm(cand[2] - cand[1]))
+        mean_w = 0.5 * (w1 + w2)
+        mean_h = 0.5 * (h1 + h2)
+        aspect_ratio = max(mean_w, mean_h) / max(min(mean_w, mean_h), 1e-6)
+        if aspect_ratio < float(aspect_min) or aspect_ratio > float(aspect_max):
+            continue
+        meta = _evaluate_court_ratio_structure(
+            cand,
+            lines_all,
+            img_w=img_w,
+            img_h=img_h,
+            angle_tol_deg=angle_tol_deg,
+            tol_h_m=tol_h_m,
+            tol_v_m=tol_v_m,
+            min_seg_len_m=min_seg_len_m,
+        )
+        sc = float(meta.get("score", 0.0))
+        if sc > best_score + float(max(0.0, min_gain)):
+            best_score = sc
+            best_quad = cand
+            best_meta = dict(meta)
+            best_meta["scaled_from"] = 1.0
+            best_meta["scaled_to"] = float(ss)
+            improved = True
+    return best_quad, best_meta, improved
 
 
 def _dist_points_to_segments(points: np.ndarray, segs: np.ndarray) -> np.ndarray:
@@ -2915,9 +4295,17 @@ def hough_lines_from_edges(
     max_gap_ratio: float = 0.02,
 ) -> list[Tuple[float, float, float, float]]:
     h, w = edges.shape[:2]
-    min_len = int(max(20, round(float(min(h, w)) * float(min_length_ratio))))
-    max_gap = int(max(5, round(float(min(h, w)) * float(max_gap_ratio))))
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold, minLineLength=min_len, maxLineGap=max_gap)
+    # Allow runtime tuning for thin/far lines.
+    thr = int(os.getenv("BADC_HOUGH_THRESHOLD", str(threshold)) or threshold)
+    minlen_rt = float(os.getenv("BADC_HOUGH_MINLEN_RATIO", str(min_length_ratio)) or min_length_ratio)
+    maxgap_rt = float(os.getenv("BADC_HOUGH_MAXGAP_RATIO", str(max_gap_ratio)) or max_gap_ratio)
+    minlen_px = int(os.getenv("BADC_HOUGH_MINLEN_PX", "20") or 20)
+    maxgap_px = int(os.getenv("BADC_HOUGH_MAXGAP_PX", "5") or 5)
+
+    min_len = int(max(minlen_px, round(float(min(h, w)) * float(minlen_rt))))
+    max_gap = int(max(maxgap_px, round(float(min(h, w)) * float(maxgap_rt))))
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, thr, minLineLength=min_len, maxLineGap=max_gap)
     if lines is None:
         return []
     out = []
@@ -2975,45 +4363,49 @@ def _merge_lines_by_rho(
 ) -> list[Tuple[Tuple[float, float, float], float]]:
     if not segments:
         return []
-    bins: Dict[int, Dict[str, float]] = {}
+    if rho_bin <= 0:
+        rho_bin = 1
+
+    # bin_id -> list[(line_abc, weight)]
+    bins: Dict[int, list[Tuple[Tuple[float, float, float], float]]] = {}
     for seg in segments:
         x1, y1, x2, y2 = seg
         length = float(math.hypot(x2 - x1, y2 - y1))
         if length <= 1e-3:
             continue
-        support = _line_support(seg, support_mask)
-        weight = float(length * (0.5 + 0.5 * support))
-        line = _line_from_points((x1, y1), (x2, y2))
-        rho = float(line[2])
+        line = _line_from_points((x1, y1), (x2, y2))  # normalized (a,b,c)
+        a, b, c = _canonicalize_line_abc(float(line[0]), float(line[1]), float(line[2]))
+        # Hough form: n·p = rho, with n=(a,b) unit normal and rho = -c
+        rho = float(-c)
         key = int(round(rho / float(rho_bin)))
-        item = bins.get(key)
-        if item is None:
-            bins[key] = {
-                "w": weight,
-                "a": weight * line[0],
-                "b": weight * line[1],
-                "c": weight * line[2],
-            }
-        else:
-            item["w"] += weight
-            item["a"] += weight * line[0]
-            item["b"] += weight * line[1]
-            item["c"] += weight * line[2]
+        w = float(_line_support(seg, support_mask, samples=24))
+        if w <= 1e-6:
+            w = float(max(1.0, length))
+        bins.setdefault(key, []).append(((a, b, c), w))
+
     merged: list[Tuple[Tuple[float, float, float], float]] = []
-    for item in bins.values():
-        wsum = float(item["w"])
-        if wsum <= 1e-6:
+    for _, items in bins.items():
+        if not items:
             continue
-        a = float(item["a"]) / wsum
-        b = float(item["b"]) / wsum
-        c = float(item["c"]) / wsum
-        norm = math.hypot(a, b)
-        if norm <= 1e-6:
+        # Use first item as reference to align normals inside this bin
+        a0, b0, c0 = items[0][0]
+        acc = np.zeros((3,), dtype=np.float64)
+        acc_w = 0.0
+        for (a, b, c), w in items:
+            # If normal points opposite to reference, flip to avoid cancellation
+            if (a * a0 + b * b0) < 0.0:
+                a, b, c = -a, -b, -c
+            acc += np.array([a, b, c], dtype=np.float64) * float(w)
+            acc_w += float(w)
+        if acc_w <= 1e-9:
             continue
-        a /= norm
-        b /= norm
-        c /= norm
-        merged.append(((a, b, c), wsum))
+        line_avg = acc / float(acc_w)
+        na, nb = float(line_avg[0]), float(line_avg[1])
+        norm = float(math.hypot(na, nb))
+        if norm <= 1e-9:
+            continue
+        line_avg = line_avg / norm
+        merged.append(((float(line_avg[0]), float(line_avg[1]), float(line_avg[2])), float(acc_w)))
     merged.sort(key=lambda item: item[1], reverse=True)
     return merged[: max(2, int(top_n))]
 
@@ -3048,14 +4440,44 @@ def _fit_court_homography_from_raw_floor_debug(
             k = np.ones((erode_k, erode_k), np.uint8)
             hough_roi_mask = cv2.erode(hough_roi_mask, k, iterations=1)
 
+        # Directional closing inside ROI to bridge occluded boundaries
+        close_v = int(os.getenv("BADC_RAW_FLOOR_HOUGH_CLOSE_V", "0") or 0)
+        close_h = int(os.getenv("BADC_RAW_FLOOR_HOUGH_CLOSE_H", "0") or 0)
+        edge_work = edge_map_.copy()
+        if close_v > 0:
+            kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, close_v)))
+            edge_work = cv2.morphologyEx(edge_work, cv2.MORPH_CLOSE, kv)
+        if close_h > 0:
+            kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, close_h), 1))
+            edge_work = cv2.morphologyEx(edge_work, cv2.MORPH_CLOSE, kh)
+
         segs = hough_lines_from_edges(
-            edge_map_,
+            edge_work,
             hough_roi_mask,
             min_length_ratio=raw_hough_minlen_ratio,
             threshold=raw_hough_threshold,
         )
         before = len(segs)
-        segs = _filter_segments_minlen(segs, raw_seg_minlen_px, max_keep=raw_seg_max_keep)
+
+        # Boundary-rescue: keep moderately-short vertical segments near left/right floor edges (occlusion-safe).
+        if int(os.getenv("BADC_RAW_FLOOR_RESQ_BOUNDARY", "1") or "0") == 1:
+            ys, xs = np.nonzero(hough_roi_mask > 0)
+            if len(xs) > 0:
+                bb = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+            else:
+                bb = None
+            segs = _filter_segments_minlen_with_boundary_rescue(
+                segs,
+                raw_seg_minlen_px,
+                floor_bbox_xyxy=bb,
+                max_keep=raw_seg_max_keep,
+                resq_enable=True,
+                resq_margin_frac=float(os.getenv("BADC_RAW_FLOOR_RESQ_MARGIN", "0.08")),
+                resq_minlen_ratio=float(os.getenv("BADC_RAW_FLOOR_RESQ_MINLEN_RATIO", "0.35")),
+                resq_vert_cos_max=float(os.getenv("BADC_RAW_FLOOR_RESQ_VERT_COS_MAX", "0.35")),
+            )
+        else:
+            segs = _filter_segments_minlen(segs, raw_seg_minlen_px, max_keep=raw_seg_max_keep)
         after = len(segs)
         return segs, before, after
     # -----------------------------------------------
@@ -3070,7 +4492,86 @@ def _fit_court_homography_from_raw_floor_debug(
     dt_p90 = float(np.percentile(dt, 90)) if dt.size > 0 else 0.0
     dt_oob = float(max(dt_p90, 15.0))
 
-    segments, seg_before0, seg_after0 = _run_hough_and_filter(edge_map, floor_roi_mask)
+    # Optional RANSAC merge to rescue thin far-court lines
+    use_ransac_merge = int(os.getenv("BADC_RAW_FLOOR_MERGE_RANSAC", "1")) != 0
+    ransac_segments: list[Tuple[float, float, float, float]] = []
+    ransac_tls_stats: Dict[str, int] = {"tls_num_input_pts": 0, "tls_num_finite_pts": 0, "tls_skipped_degenerate": 0}
+    if use_ransac_merge:
+        ransac_mask = white_mask_raw_floor_noblob if white_mask_raw_floor_noblob is not None else mask_thin
+        try:
+            r_max_lines = int(os.getenv("BADC_RAW_FLOOR_RANSAC_MAX_LINES", "12"))
+            r_iters = int(os.getenv("BADC_RAW_FLOOR_RANSAC_ITERS", "600"))
+            r_inlier_thr = float(os.getenv("BADC_RAW_FLOOR_RANSAC_INLIER_THR", "2.0"))
+            r_min_inliers = int(os.getenv("BADC_RAW_FLOOR_RANSAC_MIN_INLIERS", "90"))
+            r_min_len_ratio = float(os.getenv("BADC_RAW_FLOOR_RANSAC_MINLEN_RT", "0.10"))
+            r_seed = int(os.getenv("BADC_RAW_FLOOR_RANSAC_SEED", "0"))
+            rsegs, rstats = ransac_line_segments_from_mask(
+                ransac_mask.astype(np.uint8),
+                floor_roi_mask.astype(np.uint8),
+                max_lines=r_max_lines,
+                iters=r_iters,
+                inlier_thr=r_inlier_thr,
+                min_inliers=r_min_inliers,
+                min_length_ratio=r_min_len_ratio,
+                seed=r_seed,
+            )
+            ransac_segments = [(s.x1, s.y1, s.x2, s.y2) for s in rsegs]
+            ransac_tls_stats = dict(rstats) if isinstance(rstats, dict) else ransac_tls_stats
+        except Exception:
+            ransac_segments = []
+
+    def _merge_and_dedup_segments(
+        hough_segs: list[tuple[int, int, int, int]],
+        extra_segs: list[Tuple[float, float, float, float]],
+        *,
+        tol_px: int = 3,
+        max_extra: int = 50,
+    ) -> list[Tuple[float, float, float, float]]:
+        if not extra_segs:
+            return [(float(x1), float(y1), float(x2), float(y2)) for (x1, y1, x2, y2) in hough_segs]
+        extra_sorted = sorted(
+            extra_segs, key=lambda t: float(math.hypot(t[2] - t[0], t[3] - t[1])), reverse=True
+        )[: int(max_extra)]
+        out: list[Tuple[float, float, float, float]] = []
+        seen: set[Tuple[int, int, int, int]] = set()
+
+        def _key(x1: float, y1: float, x2: float, y2: float) -> Tuple[int, int, int, int]:
+            a = (x1, y1)
+            b = (x2, y2)
+            if (b[0] < a[0]) or (b[0] == a[0] and b[1] < a[1]):
+                a, b = b, a
+            return (
+                int(round(a[0] / tol_px)),
+                int(round(a[1] / tol_px)),
+                int(round(b[0] / tol_px)),
+                int(round(b[1] / tol_px)),
+            )
+
+        for x1, y1, x2, y2 in hough_segs:
+            k = _key(float(x1), float(y1), float(x2), float(y2))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((float(x1), float(y1), float(x2), float(y2)))
+
+        for x1, y1, x2, y2 in extra_sorted:
+            x1 = float(np.clip(x1, 0.0, float(w - 1)))
+            y1 = float(np.clip(y1, 0.0, float(h - 1)))
+            x2 = float(np.clip(x2, 0.0, float(w - 1)))
+            y2 = float(np.clip(y2, 0.0, float(h - 1)))
+            k = _key(x1, y1, x2, y2)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((x1, y1, x2, y2))
+        return out
+
+    # Optionally bypass Hough entirely and use RANSAC segments as the candidate set.
+    if _env_flag("BADC_RAW_FLOOR_USE_RANSAC_ONLY", False):
+        segments = [(float(s[0]), float(s[1]), float(s[2]), float(s[3])) for s in ransac_segments]
+        seg_before0 = seg_after0 = int(len(segments))
+    else:
+        segments, seg_before0, seg_after0 = _run_hough_and_filter(edge_map, floor_roi_mask)
     _, _, floor_bbox = _white_mask_stats(floor_roi_mask)
     floor_y_cut = int(floor_bbox[1])
     if floor_y_cut is not None:
@@ -3078,6 +4579,12 @@ def _fit_court_homography_from_raw_floor_debug(
         y1 = min(int(floor_y_cut) + 18, edge_map.shape[0])
         edge_map[y0:y1, :] = 0
         segments, seg_before1, seg_after1 = _run_hough_and_filter(edge_map, floor_roi_mask)
+
+    # merge Hough + RANSAC segments (dedup + bound clip)
+    seg_before_merge = int(len(segments))
+    segments = _merge_and_dedup_segments(segments, ransac_segments)
+    seg_after_merge = int(len(segments))
+
     angles_pair = _dominant_angles_from_segments(segments)
     if blob_mask is not None and angles_pair is not None:
         ang_a, ang_b = angles_pair
@@ -3102,7 +4609,21 @@ def _fit_court_homography_from_raw_floor_debug(
         lengths.append(length)
         centers_y.append(0.5 * (float(y1) + float(y2)))
     segments = segments_filtered
+    # init counters for metrics before potential early return
+    kept_ransac_a = 0
+    kept_ransac_b = 0
+
     metrics: Dict[str, Any] = {
+        "raw_floor_merge_ransac": int(1 if use_ransac_merge else 0),
+        "raw_floor_num_segments_hough": int(seg_before_merge),
+        "raw_floor_num_segments_merged": int(seg_after_merge),
+        "raw_floor_ransac_num_segments": int(len(ransac_segments)),
+        "raw_floor_ransac_added": int(max(seg_after_merge - seg_before_merge, 0)),
+        "raw_floor_ransac_kept_a": int(kept_ransac_a),
+        "raw_floor_ransac_kept_b": int(kept_ransac_b),
+        "raw_floor_ransac_tls_num_input_pts": int(ransac_tls_stats.get("tls_num_input_pts", 0)),
+        "raw_floor_ransac_tls_num_finite_pts": int(ransac_tls_stats.get("tls_num_finite_pts", 0)),
+        "raw_floor_ransac_tls_skipped_degenerate": int(ransac_tls_stats.get("tls_skipped_degenerate", 0)),
         "raw_floor_num_segments": int(len(segments)),
         "raw_floor_hough_threshold": int(raw_hough_threshold),
         "raw_floor_hough_minlen_ratio": float(raw_hough_minlen_ratio),
@@ -3155,49 +4676,124 @@ def _fit_court_homography_from_raw_floor_debug(
     # --- PATCH START: stabilize A/B split + FIX top_k truncation bug ---
     top_k = 40
 
-    def _take_topk(segs_in, scores_in, k):
-        """Take top-k segments but keep geometric coverage.
+    # Pre-merge Hough segments inside each orientation bucket (A/B) before Top-K.
+    # This reduces duplicate/fragmented segments that stack on the same physical line.
+    merge_segs = _env_flag("BADC_RAW_FLOOR_MERGE_SEGS", False)
+    merge_ang_tol_deg = _env_float("BADC_RAW_FLOOR_MERGE_ANG_TOL_DEG", 5.0)
+    merge_rho_bin_px = _env_float("BADC_RAW_FLOOR_MERGE_RHO_BIN_PX", 8.0)
+    merge_gap_px = _env_float("BADC_RAW_FLOOR_MERGE_GAP_PX", 25.0)
+    merge_filter_ang = _env_flag("BADC_RAW_FLOOR_MERGE_FILTER_ANG", False)
+    merge_min_keep = int(_env_int("BADC_RAW_FLOOR_MERGE_MIN_KEEP", 12))
+    merge_min_keep_bucket = int(_env_int("BADC_RAW_FLOOR_MERGE_MIN_KEEP_BUCKET", 8))
 
-        A pure top-k by score tends to keep multiple very similar segments on the same sideline
-        and can drop the weaker-but-critical opposite sideline / baseline, which collapses the fit.
-        This version ensures we keep both x-extremes and a few per x-bin before filling by score.
+    def _merge_collinear_segments(segs_in, scores_in):
         """
-        if len(segs_in) == 0:
-            return []
-        kk = min(int(k), int(len(segs_in)))
-        scores = np.asarray(scores_in, dtype=np.float32)
-        xs = np.asarray([(float(s[0]) + float(s[2])) * 0.5 for s in segs_in], dtype=np.float32)
+        Merge nearly-collinear segments that are close along the line direction.
+        - Bin by rho (perpendicular distance to the representative line normal)
+        - Within each rho-bin, merge 1D projected intervals with a gap threshold
+        Returns: (merged_segs_list, merged_scores_np)
+        """
+        if segs_in is None or len(segs_in) == 0:
+            return [], np.asarray([], dtype=np.float32)
 
-        order = np.argsort(scores)[::-1]
-        picked = []
-        picked_set: set[int] = set()
+        segs = np.asarray(segs_in, dtype=np.float32).reshape(-1, 4)
+        scores = np.asarray(scores_in, dtype=np.float32).reshape(-1)
+        dx = segs[:, 2] - segs[:, 0]
+        dy = segs[:, 3] - segs[:, 1]
+        lens = np.maximum(np.hypot(dx, dy), 1e-3).astype(np.float32)
 
-        def _add(i: int) -> None:
-            if i not in picked_set:
-                picked.append(i)
-                picked_set.add(i)
+        # Representative angle for this bucket (directionless): double-angle mean (theta == theta+pi).
+        ang = np.mod(np.arctan2(dy, dx), np.pi).astype(np.float32)
+        c2 = float(np.sum(np.cos(2.0 * ang) * lens))
+        s2 = float(np.sum(np.sin(2.0 * ang) * lens))
+        a0 = float(0.5 * math.atan2(s2, c2))
+        a0 = float(np.mod(a0, math.pi))
 
-        _add(int(order[0]))
-        _add(int(order[int(np.argmin(xs[order]))]))
-        _add(int(order[int(np.argmax(xs[order]))]))
+        # Optional: filter segments far from a0, but NEVER empty the bucket.
+        if merge_filter_ang:
+            ang_tol = math.radians(float(merge_ang_tol_deg))
+            da = np.abs(((ang - a0 + np.pi / 2) % np.pi) - np.pi / 2)
+            keep = da <= float(ang_tol)
+            if int(np.sum(keep)) >= int(merge_min_keep):
+                segs = segs[keep]
+                scores = scores[keep]
+                lens = lens[keep]
+                ang = ang[keep]
 
-        xmin, xmax = float(xs.min()), float(xs.max())
-        if xmax - xmin > 1e-3:
-            nb = 4
-            per_bin = max(1, kk // (nb * 2))
-            for b in range(nb):
-                lo = xmin + (xmax - xmin) * (b / nb)
-                hi = xmin + (xmax - xmin) * ((b + 1) / nb)
-                cand = [int(i) for i in order if xs[int(i)] >= lo and xs[int(i)] < hi]
-                for i in cand[:per_bin]:
-                    _add(i)
+        if segs.shape[0] == 0:
+            return segs_in, np.asarray(scores_in, dtype=np.float32)
 
-        for i in order:
-            _add(int(i))
-            if len(picked) >= kk:
-                break
+        ca, sa = math.cos(a0), math.sin(a0)
+        d = np.asarray([ca, sa], dtype=np.float32)        # direction
+        n = np.asarray([-sa, ca], dtype=np.float32)       # normal
 
-        return [segs_in[i] for i in picked[:kk]]
+        mids = 0.5 * (segs[:, 0:2] + segs[:, 2:4])
+        rho = (mids @ n).astype(np.float32)
+
+        bin_size = float(max(1.0, float(merge_rho_bin_px)))
+        keys = np.round(rho / bin_size).astype(np.int32)
+
+        merged_segs = []
+        merged_scores = []
+        for k in np.unique(keys):
+            idx = np.where(keys == k)[0]
+            if idx.size == 0:
+                continue
+
+            p1 = segs[idx, 0:2]
+            p2 = segs[idx, 2:4]
+            t1 = (p1 @ d).astype(np.float32)
+            t2 = (p2 @ d).astype(np.float32)
+            tmin = np.minimum(t1, t2)
+            tmax = np.maximum(t1, t2)
+
+            order = np.argsort(tmin)
+            idx = idx[order]
+            tmin = tmin[order]
+            tmax = tmax[order]
+
+            rho_bin = float(np.average(rho[idx], weights=lens[idx]))
+
+            cur_t0 = float(tmin[0])
+            cur_t1 = float(tmax[0])
+            cur_score = float(scores[idx[0]])
+            for j in range(1, int(idx.size)):
+                if float(tmin[j]) <= cur_t1 + float(merge_gap_px):
+                    cur_t0 = min(cur_t0, float(tmin[j]))
+                    cur_t1 = max(cur_t1, float(tmax[j]))
+                    cur_score += float(scores[idx[j]])
+                else:
+                    p0 = n * rho_bin + d * cur_t0
+                    p1e = n * rho_bin + d * cur_t1
+                    merged_segs.append([float(p0[0]), float(p0[1]), float(p1e[0]), float(p1e[1])])
+                    merged_scores.append(cur_score)
+                    cur_t0 = float(tmin[j])
+                    cur_t1 = float(tmax[j])
+                    cur_score = float(scores[idx[j]])
+
+            p0 = n * rho_bin + d * cur_t0
+            p1e = n * rho_bin + d * cur_t1
+            merged_segs.append([float(p0[0]), float(p0[1]), float(p1e[0]), float(p1e[1])])
+            merged_scores.append(cur_score)
+
+        if len(merged_segs) == 0:
+            return segs_in, np.asarray(scores_in, dtype=np.float32)
+        return merged_segs, np.asarray(merged_scores, dtype=np.float32)
+
+    def _take_topk(segs_in, scores_in, k):
+        # Allow disabling top-k truncation (useful for debugging missing far/left lines)
+        if _env_flag("BADC_RAW_FLOOR_TAKE_TOPK_DISABLE", False):
+            return segs_in
+
+        if int(k) <= 0 or len(segs_in) <= int(k):
+            return segs_in
+
+        scores = np.array(scores_in, dtype=np.float32)
+        order = np.argsort(-scores)  # descending
+
+        # Simple top-k by score (deterministic)
+        picked = order[: int(k)].tolist()
+        return [segs_in[i] for i in picked]
 
     # Prefer dominant-angle split when angles are well separated
     use_dom_split = False
@@ -3227,10 +4823,138 @@ def _fit_court_homography_from_raw_floor_debug(
     score_a = score_all[assign_a]
     score_b = score_all[~assign_a]
 
+    # Merge adjacent/collinear segments inside each bucket BEFORE top-k truncation.
+    if merge_segs:
+        seg_a0, score_a0 = seg_a, score_a
+        seg_b0, score_b0 = seg_b, score_b
+        metrics["raw_floor_num_segments_a_split"] = int(len(seg_a0))
+        metrics["raw_floor_num_segments_b_split"] = int(len(seg_b0))
+        seg_a, score_a = _merge_collinear_segments(seg_a0, score_a0)
+        seg_b, score_b = _merge_collinear_segments(seg_b0, score_b0)
+        metrics["raw_floor_num_segments_a_merged"] = int(len(seg_a))
+        metrics["raw_floor_num_segments_b_merged"] = int(len(seg_b))
+        # Safety: if merging wipes out a bucket, revert to pre-merge.
+        if int(len(seg_a)) < int(merge_min_keep_bucket):
+            metrics["raw_floor_merge_fallback_a"] = 1
+            seg_a, score_a = seg_a0, score_a0
+        if int(len(seg_b)) < int(merge_min_keep_bucket):
+            metrics["raw_floor_merge_fallback_b"] = 1
+            seg_b, score_b = seg_b0, score_b0
+
+    # --- PATCH: angle-peak re-split to prevent A/B role mix-ups ---
+    if int(os.getenv("BADC_RAW_FLOOR_ANGLE_RESPLIT", "1") or "0") == 1:
+        seg_a2, score_a2, seg_b2, score_b2, meta_resplit = _resplit_segments_by_angle_peaks(
+            seg_a,
+            score_a,
+            seg_b,
+            score_b,
+            min_keep_each=int(os.getenv("BADC_RAW_FLOOR_ANGLE_RESPLIT_MIN_KEEP", "8")),
+            min_sep_deg=float(os.getenv("BADC_RAW_FLOOR_ANGLE_RESPLIT_MIN_SEP_DEG", "55")),
+        )
+        metrics["raw_floor_angle_resplit"] = meta_resplit
+        if meta_resplit.get("used"):
+            seg_a, score_a = seg_a2, score_a2
+            seg_b, score_b = seg_b2, score_b2
+            metrics["raw_floor_num_segments_a_resplit"] = int(len(seg_a))
+            metrics["raw_floor_num_segments_b_resplit"] = int(len(seg_b))
+    # --- PATCH END ---
+
+    # Top-K truncation is applied AFTER the optional merge stage (see above)
     seg_a = _take_topk(seg_a, score_a, top_k)
     seg_b = _take_topk(seg_b, score_b, top_k)
+    metrics["raw_floor_num_segments_a_post_topk"] = int(len(seg_a))
+    metrics["raw_floor_num_segments_b_post_topk"] = int(len(seg_b))
+
+    # Optionally force-keep RANSAC segments even if they drop out of top-K (they can be thin/faint).
+    keep_ransac_always = _env_flag("BADC_RAW_FLOOR_KEEP_RANSAC_ALWAYS", True)
+    if keep_ransac_always and ransac_segments:
+        def _seg_key(seg):
+            x1, y1, x2, y2 = [int(round(float(v))) for v in seg]
+            if (x1, y1) <= (x2, y2):
+                return (x1, y1, x2, y2)
+            return (x2, y2, x1, y1)
+
+        ransac_keys = set(_seg_key(s) for s in ransac_segments)
+        keys_a = set(_seg_key(s) for s in seg_a)
+        keys_b = set(_seg_key(s) for s in seg_b)
+
+        for i in range(len(segments)):
+            k = _seg_key(segments[i])
+            if k not in ransac_keys:
+                continue
+            if bool(assign_a[i]):
+                if k not in keys_a:
+                    seg_a.append(segments[i])
+                    keys_a.add(k)
+                    kept_ransac_a += 1
+            else:
+                if k not in keys_b:
+                    seg_b.append(segments[i])
+                    keys_b.add(k)
+                    kept_ransac_b += 1
+
+    # Update metrics with final kept counts after optional RANSAC reinsertion.
+    metrics["raw_floor_ransac_kept_a"] = int(kept_ransac_a)
+    metrics["raw_floor_ransac_kept_b"] = int(kept_ransac_b)
+
     metrics["raw_floor_num_segments_a"] = int(len(seg_a))
     metrics["raw_floor_num_segments_b"] = int(len(seg_b))
+
+    # Optional *post-topk* segment merge.
+    # NOTE: pre-topk merge is already controlled by BADC_RAW_FLOOR_MERGE_SEGS (recommended).
+    # Post-topk merge can over-merge; keep it OFF by default.
+    merge_segs = _env_flag("BADC_RAW_FLOOR_POSTMERGE_SEGS", False)
+    merge_filter_ang = _env_flag("BADC_RAW_FLOOR_MERGE_FILTER_ANG", False)
+    merge_ang_tol_deg = float(os.getenv("BADC_RAW_FLOOR_MERGE_ANG_TOL_DEG", "5"))
+    merge_rho_bin_px = float(os.getenv("BADC_RAW_FLOOR_MERGE_RHO_BIN_PX", "12"))
+    merge_gap_px = float(os.getenv("BADC_RAW_FLOOR_MERGE_GAP_PX", "25"))
+    merge_min_len_px = float(os.getenv("BADC_RAW_FLOOR_MERGE_MIN_LEN_PX", "30"))
+    merge_min_keep = int(os.getenv("BADC_RAW_FLOOR_MERGE_MIN_KEEP", "12"))
+    merge_min_keep_bucket = int(os.getenv("BADC_RAW_FLOOR_MERGE_MIN_KEEP_BUCKET", "8"))
+
+    def _as_int_segs(_segs):
+        out = []
+        for s in _segs:
+            x1, y1, x2, y2 = s
+            out.append((int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))))
+        return out
+
+    seg_a_i = _as_int_segs(seg_a)
+    seg_b_i = _as_int_segs(seg_b)
+    metrics["raw_floor_segA_before"] = int(len(seg_a_i))
+    metrics["raw_floor_segB_before"] = int(len(seg_b_i))
+
+    if merge_filter_ang:
+        seg_a_i, metaA = _filter_segments_by_angle_keep_min(seg_a_i, merge_ang_tol_deg, merge_min_keep_bucket)
+        seg_b_i, metaB = _filter_segments_by_angle_keep_min(seg_b_i, merge_ang_tol_deg, merge_min_keep_bucket)
+        metrics["raw_floor_merge_filter_ang_A"] = metaA
+        metrics["raw_floor_merge_filter_ang_B"] = metaB
+
+    if merge_segs:
+        seg_a_i, metaMA = _merge_collinear_segments_by_rho(seg_a_i, merge_rho_bin_px, merge_gap_px, merge_min_len_px)
+        seg_b_i, metaMB = _merge_collinear_segments_by_rho(seg_b_i, merge_rho_bin_px, merge_gap_px, merge_min_len_px)
+        metrics["raw_floor_merge_segs_A"] = metaMA
+        metrics["raw_floor_merge_segs_B"] = metaMB
+
+        # If merging becomes too aggressive, fall back to unmerged but filtered segments.
+        if len(seg_a_i) < merge_min_keep:
+            metrics["raw_floor_merge_fallback_A"] = True
+            seg_a_i = _as_int_segs(seg_a)
+            if merge_filter_ang:
+                seg_a_i, metaA2 = _filter_segments_by_angle_keep_min(seg_a_i, merge_ang_tol_deg, merge_min_keep)
+                metrics["raw_floor_merge_filter_ang_A_fallback"] = metaA2
+        if len(seg_b_i) < merge_min_keep:
+            metrics["raw_floor_merge_fallback_B"] = True
+            seg_b_i = _as_int_segs(seg_b)
+            if merge_filter_ang:
+                seg_b_i, metaB2 = _filter_segments_by_angle_keep_min(seg_b_i, merge_ang_tol_deg, merge_min_keep)
+                metrics["raw_floor_merge_filter_ang_B_fallback"] = metaB2
+
+    # Use the (optionally) merged segments downstream
+    seg_a = seg_a_i
+    seg_b = seg_b_i
+    metrics["raw_floor_segA_after"] = int(len(seg_a))
+    metrics["raw_floor_segB_after"] = int(len(seg_b))
     # --- PATCH END ---
 
     hough_base = cv2.cvtColor(white_mask_raw_floor, cv2.COLOR_GRAY2BGR)
@@ -3270,7 +4994,13 @@ def _fit_court_homography_from_raw_floor_debug(
         ("service_near", np.array([[0.0, 4.72], [6.10, 4.72], [6.10, 0.76], [0.0, 0.76]], dtype=np.float32)),
     ]
 
-    Xw_full, w_full, _ = sample_model_points(points_per_meter=25.0, min_weight=0.3)
+    # Prefer full-court fits by default; service-box configs can be noisy. Re-enable via env if needed.
+    if int(os.getenv("BADC_RAW_FLOOR_DISABLE_SERVICE_CFG", "1") or "0") == 1:
+        model_cfgs = [cfg for cfg in model_cfgs if not str(cfg[0]).startswith("service")]
+
+    Xw_full, w_full, names_full = sample_model_points(points_per_meter=25.0, min_weight=0.3)
+    w_full, role_w_cfg = _apply_model_role_weights(names_full, w_full)
+    metrics["raw_floor_model_role_weights"] = role_w_cfg
     best_H = None
     best_score = float("-inf")
     best_cfg = None
@@ -3279,6 +5009,8 @@ def _fit_court_homography_from_raw_floor_debug(
     best_area_ratio_img: Optional[float] = None
     best_ymax_ratio: Optional[float] = None
     best_bottom_support: Optional[float] = None
+    best_role_prior_bonus: Optional[float] = None
+    best_role_prior_meta: Optional[Dict[str, float]] = None
     num_quads = 0
     num_scored = 0
     rejects = {
@@ -3315,7 +5047,7 @@ def _fit_court_homography_from_raw_floor_debug(
     roi_area = float(np.count_nonzero(floor_roi_mask)) or img_area
     min_thin_ratio = 0.0
     top5: list[Tuple[float, np.ndarray, str]] = []
-    top3_main: list[Tuple[float, float, float, float]] = []
+    top3_main: list[Tuple[float, float, float, float, int, float]] = []
     relaxed_pass = 0
     vp_a = _estimate_vanishing_point([ln[0] for ln in lines_a], rng) if lines_a else None
     vp_b = _estimate_vanishing_point([ln[0] for ln in lines_b], rng) if lines_b else None
@@ -3333,6 +5065,10 @@ def _fit_court_homography_from_raw_floor_debug(
     max_oob_frac_hard = float(os.getenv("BADC_FIT_MAX_OOB_FRAC", "0.70"))
     allow_small_quads = int(os.getenv("BADC_FIT_ALLOW_SMALL_QUADS", "0")) == 1
     vp_min_dist = float(os.getenv("BADC_FIT_MIN_VP_DIST", "0.0"))  # 0 disables
+    role_prior_enabled = bool(_env_flag("BADC_ROLE_PRIOR_ENABLE", False))
+    role_prior_mask = white_mask_raw_floor_noblob if white_mask_raw_floor_noblob is not None else white_mask_raw_floor
+    metrics["raw_floor_role_prior_enabled"] = bool(role_prior_enabled)
+    metrics["raw_floor_role_prior_mask"] = "raw_floor_noblob"
 
     def _vp_dist_ok(vp_xy: Optional[np.ndarray], w_: int, h_: int) -> bool:
         if vp_xy is None:
@@ -3342,6 +5078,9 @@ def _fit_court_homography_from_raw_floor_debug(
         cx, cy = 0.5 * float(w_), 0.5 * float(h_)
         d = float(math.hypot(float(vp_xy[0]) - cx, float(vp_xy[1]) - cy))
         return d >= vp_min_dist * float(max(w_, h_))
+    qrt_min_bbox_w_frac = float(_env_float("BADC_QRT_MIN_BBOX_W_FRAC", 0.08))
+    qrt_min_bbox_h_frac = float(_env_float("BADC_QRT_MIN_BBOX_H_FRAC", 0.06))
+    qrt_min_edge_frac = float(_env_float("BADC_QRT_MIN_EDGE_FRAC", 0.05))
     for relax_scale in (1.0, 0.7):
         if relax_scale < 1.0:
             relaxed_pass = 1
@@ -3353,12 +5092,14 @@ def _fit_court_homography_from_raw_floor_debug(
         best_area_ratio_img = None
         best_ymax_ratio = None
         best_bottom_support = None
+        best_role_prior_bonus = None
+        best_role_prior_meta = None
         num_scored = 0
         top5 = []
         top3_main = []
-        deg_bbox_w = 0.08 * float(w) * float(relax_scale)
-        deg_bbox_h = 0.06 * float(h) * float(relax_scale)
-        deg_edge = 0.05 * float(min(h, w)) * float(relax_scale)
+        deg_bbox_w = float(max(1.0, qrt_min_bbox_w_frac * float(w) * float(relax_scale)))
+        deg_bbox_h = float(max(1.0, qrt_min_bbox_h_frac * float(h) * float(relax_scale)))
+        deg_edge = float(max(1.0, qrt_min_edge_frac * float(min(h, w)) * float(relax_scale)))
         for i in range(len(lines_a)):
             for j in range(i + 1, len(lines_a)):
                 la1 = lines_a[i][0]
@@ -3525,12 +5266,17 @@ def _fit_court_homography_from_raw_floor_debug(
                             )
                             score_val = float(score_val + penalty + thin_penalty)
                             bottom_support = _bottom_support_from_loss(loss_info, ymax_ratio, h, tau_px=5.0)
+                            role_bonus = 0.0
+                            role_meta: Dict[str, float] = {}
+                            if role_prior_enabled:
+                                role_bonus, role_meta = _court_role_prior_bonus(H, role_prior_mask)
                             score_final = float(
                                 score_val
                                 + 6.0 * math.log(max(area_ratio_img, 1e-6))
                                 + 3.0 * ymean_ratio
                                 + 2.0 * ymax_ratio
                                 + 4.0 * bottom_support
+                                + float(role_bonus)
                             )
                             num_scored += 1
                             if score_final > best_score:
@@ -3542,6 +5288,8 @@ def _fit_court_homography_from_raw_floor_debug(
                                 best_area_ratio_img = float(area_ratio_img)
                                 best_ymax_ratio = float(ymax_ratio)
                                 best_bottom_support = float(bottom_support)
+                                best_role_prior_bonus = float(role_bonus)
+                                best_role_prior_meta = dict(role_meta) if role_meta else None
                             top5.append((score_final, img_pts.copy(), cfg_name))
                             top3_main.append((score_final, area_ratio_img, ymax_ratio, bottom_support))
         if best_H is not None:
@@ -3596,6 +5344,10 @@ def _fit_court_homography_from_raw_floor_debug(
             "raw_floor_best_model_config": best_cfg,
             "raw_floor_oob_points": int(best_oob),
             "raw_floor_best_mixer": best_mixer_parts if isinstance(best_mixer_parts, dict) else None,
+            "raw_floor_best_role_prior_bonus": float(best_role_prior_bonus)
+            if best_role_prior_bonus is not None
+            else None,
+            "raw_floor_best_role_prior_meta": best_role_prior_meta if isinstance(best_role_prior_meta, dict) else None,
             "raw_floor_selected_area_ratio": float(best_area_ratio_img)
             if best_area_ratio_img is not None
             else None,
@@ -3866,19 +5618,45 @@ def _init_from_line_clusters(
     if len(horiz_lines) < 2 or len(vert_lines) < 2:
         return None, None
     h, w = dt.shape[:2]
-    center = (float(w) * 0.5, float(h) * 0.5)
-    min_sep = 0.05 * float(min(h, w))
+    # Use floor_bbox center (not full-frame center) to decide outer/inner lines.
+    # This avoids picking diagonals as extremes when ROI is bottom-biased.
+    if floor_bbox is not None and len(floor_bbox) == 4:
+        bx0, by0, bx1, by1 = [float(v) for v in floor_bbox]
+        center = (0.5 * (bx0 + bx1), 0.5 * (by0 + by1))
+        min_sep_frac = _env_float("BADC_RAW_FLOOR_MIN_SEP_FRAC", 0.0)
+        min_sep = min_sep_frac * float(min(max(1.0, bx1 - bx0), max(1.0, by1 - by0)))
+    else:
+        center = (float(w) * 0.5, float(h) * 0.5)
+        min_sep_frac = _env_float("BADC_RAW_FLOOR_MIN_SEP_FRAC", 0.0)
+        min_sep = min_sep_frac * float(min(h, w))
 
     def _select_outer(lines: list[LineSeg]) -> Tuple[list[LineSeg], list[LineSeg]]:
+        # Keep extremes by signed distance, even if weak, then fill by weight.
         scored = [(ln, _line_signed_distance(ln.line, center)) for ln in lines]
         scored.sort(key=lambda item: item[1])
+
         span = max(2, int(top_k) * 2)
-        low_candidates = [ln for ln, _ in scored[:span]]
-        high_candidates = [ln for ln, _ in scored[-span:]]
-        low_candidates.sort(key=lambda ln: float(ln.weight), reverse=True)
-        high_candidates.sort(key=lambda ln: float(ln.weight), reverse=True)
-        low = low_candidates[: max(1, int(top_k))]
-        high = high_candidates[: max(1, int(top_k))]
+        k = max(1, int(top_k))
+
+        low_scored = scored[:span]
+        high_scored = scored[-span:]
+
+        extreme_low = low_scored[0][0]
+        extreme_high = high_scored[-1][0]
+
+        def _fill_by_weight(scored_list, extreme_ln):
+            rest = [ln for ln, _ in scored_list if ln is not extreme_ln]
+            rest.sort(key=lambda ln: float(ln.weight), reverse=True)
+            out = [extreme_ln]
+            for ln in rest:
+                if ln not in out:
+                    out.append(ln)
+                if len(out) >= k:
+                    break
+            return out
+
+        low = _fill_by_weight(low_scored, extreme_low)
+        high = _fill_by_weight(high_scored, extreme_high)
         return low, high
 
     h_low, h_high = _select_outer(horiz_lines)
@@ -4090,6 +5868,16 @@ def ransac_init_homography(
                 vp_long=vp_long,
                 vp_short=vp_short,
             )
+            area_ratio_img = float(info.get("area_ratio", 0.0))
+
+            # For service-box configs, penalize tiny quads and add a base penalty so full-court wins when plausible.
+            if str(cfg_name).startswith("service"):
+                service_min_area = float(os.getenv("BADC_RAW_FLOOR_SERVICE_MIN_AREA_RATIO", "0.02"))
+                service_pen = float(os.getenv("BADC_RAW_FLOOR_SERVICE_PEN", "250.0"))
+                if area_ratio_img < service_min_area:
+                    rejects["area"] += 1
+                    continue
+                score += service_pen
             if score < best_score:
                 best_score = float(score)
                 best_H = H
@@ -4514,6 +6302,8 @@ def _fit_court_homography_hough(
     component_area: Optional[int] = None,
 ) -> CourtFitResult:
     rng = np.random.default_rng(0)
+    save_raw_debug = _env_flag("BADC_SAVE_RAW_FLOOR_DEBUG", True)
+    raw_debug_save: Optional[Dict[str, Any]] = None
     debug_dir: Optional[str] = None
     debug_prefix: str = "court_fit"
     floor_mask, floor_debug = get_floor_roi_mask_debug(frame_bgr)
@@ -4602,9 +6392,25 @@ def _fit_court_homography_hough(
     floor_roi_source = "floor_mask"
     floor_y_cut = floor_debug.get("floor_y_cut")
     x0, y0, x1, y1 = _white_mask_stats(floor_mask)[2]
+
+    # Ensure dimensions are defined before padding
+    h, w = floor_mask.shape[:2]
+
+    # Expand floor ROI bbox via env knobs to avoid missing near-border lines.
+    pad_px = int(os.getenv("BADC_FLOOR_ROI_BBOX_PAD_PX", "0") or 0)
+    pad_frac = float(os.getenv("BADC_FLOOR_ROI_BBOX_PAD_FRAC", "0.0") or 0.0)
+    pad = max(pad_px, int(round(pad_frac * float(min(h, w)))))
+    if pad > 0:
+        floor_debug["floor_roi_bbox_pad"] = int(pad)
+
+    x0p = max(0, int(x0) - pad)
+    y0p = max(0, int(y0) - pad)
+    x1p = min(w - 1, int(x1) + pad)
+    y1p = min(h - 1, int(y1) + pad)
     bbox_mask = np.zeros_like(floor_mask)
-    if x1 > x0 and y1 > y0:
-        bbox_mask[y0 : y1 + 1, x0 : x1 + 1] = 255
+    orig_floor_mask = floor_mask.copy()
+    if x1p > x0p and y1p > y0p:
+        bbox_mask[y0p : y1p + 1, x0p : x1p + 1] = 255
     if floor_y_cut is not None:
         bbox_mask[: int(floor_y_cut), :] = 0
     green_ratio = None
@@ -4617,16 +6423,189 @@ def _fit_court_homography_hough(
             floor_roi_mask = bbox_mask
             floor_roi_source = "bbox_fallback"
         else:
-            d = 21
+            # --- Flood-fill based pick of main floor region (bottom seeds) ---
+            green_bin = ((green_mask > 0).astype(np.uint8) * 255)
+            green_in_bbox = cv2.bitwise_and(green_bin, bbox_mask)
+
+            h, w = green_in_bbox.shape[:2]
+            seed_y_frac = float(os.getenv("BADC_FLOOR_ROI_SEED_Y_FRAC", "0.93") or 0.93)
+            seed_y = int(round(seed_y_frac * float(max(h - 1, 0))))
+            seed_xs_str = os.getenv("BADC_FLOOR_ROI_SEED_XS", "0.20,0.40,0.60,0.80")
+            seed_x_fracs = []
+            for s in seed_xs_str.split(","):
+                s = s.strip()
+                if not s:
+                    continue
+                try:
+                    seed_x_fracs.append(float(s))
+                except Exception:
+                    pass
+            if not seed_x_fracs:
+                seed_x_fracs = [0.2, 0.4, 0.6, 0.8]
+            radius = int(os.getenv("BADC_FLOOR_ROI_SEED_RADIUS", "60") or 60)
+            radius = max(5, radius)
+
+            picked = np.zeros_like(green_in_bbox)
+
+            def _find_nearest_green(xc: int, yc: int, r: int):
+                x0p = max(0, xc - r)
+                x1p = min(w - 1, xc + r)
+                y0p = max(0, yc - r)
+                y1p = min(h - 1, yc + r)
+                win = green_in_bbox[y0p : y1p + 1, x0p : x1p + 1]
+                ys, xs = np.where(win > 0)
+                if len(xs) == 0:
+                    return None
+                ix = int(np.median(xs)) + x0p
+                iy = int(np.median(ys)) + y0p
+                return (ix, iy)
+
+            for fx in seed_x_fracs:
+                sx = int(round(fx * float(max(w - 1, 0))))
+                pt = _find_nearest_green(sx, seed_y, radius)
+                if pt is None:
+                    continue
+                ff_img = green_in_bbox.copy()
+                ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+                cv2.floodFill(ff_img, ff_mask, seedPoint=pt, newVal=255)
+                comp = (ff_mask[1:-1, 1:-1] > 0).astype(np.uint8) * 255
+                picked = cv2.bitwise_or(picked, comp)
+
+            picked_area = int(np.count_nonzero(picked))
+            min_area_frac = float(os.getenv("BADC_FLOOR_ROI_PICK_MIN_AREA_FRAC", "0.01") or 0.01)
+            if picked_area < int(min_area_frac * h * w):
+                picked = green_in_bbox
+                floor_roi_source = "green_flood_fallback"
+            else:
+                floor_roi_source = "green_flood"
+            floor_debug["floor_roi_picked_area"] = int(np.count_nonzero(picked))
+
+            # gentle close to fill small holes / gaps
+            close_k = int(os.getenv("BADC_FLOOR_ROI_GREEN_CLOSE", "19") or 19)
+            close_k = max(3, close_k)
+            if close_k % 2 == 0:
+                close_k += 1
+            k_close = np.ones((close_k, close_k), np.uint8)
+            picked = cv2.morphologyEx(picked, cv2.MORPH_CLOSE, k_close, iterations=1)
+            floor_debug["floor_roi_green_close"] = int(close_k)
+
+            # small dilation (optionally only bottom part to avoid expanding upwards)
+            d = int(os.getenv("BADC_FLOOR_ROI_GREEN_DILATE", "15") or 15)
+            d = max(3, d)
+            if d % 2 == 0:
+                d += 1
+            iters = int(os.getenv("BADC_FLOOR_ROI_GREEN_DILATE_ITERS", "1") or 1)
+            iters = max(1, int(iters))
+            h_dil, w_dil = picked.shape[:2]
+            bottom_only = int(os.getenv("BADC_FLOOR_ROI_DILATE_BOTTOM_ONLY", "0") or 0)
+            y_frac = float(os.getenv("BADC_FLOOR_ROI_DILATE_Y_FRAC", "0.55") or 0.55)
+            # Split based on original floor mask (more stable than picked-only)
+            y_split_for_floor = None
+            if bottom_only:
+                ys0 = np.where(orig_floor_mask > 0)[0]
+                if ys0.size > 0:
+                    y0g = int(ys0.min())
+                    y1g = int(ys0.max())
+                    y_split = int(round(float(y0g) + y_frac * float(max(y1g - y0g, 1))))
+                else:
+                    y_split = int(round(y_frac * float(h_dil)))
+                y_split = int(max(0, min(h_dil - 1, y_split)))
+                y_split_for_floor = int(y_split)
+                floor_debug["floor_roi_y_split"] = int(y_split)
+                try:
+                    last_metrics["floor_roi_dilate_y_split"] = int(y_split)
+                except Exception:
+                    pass
+            floor_debug["floor_roi_dilate_bottom_only"] = int(bottom_only)
+
             k = np.ones((d, d), np.uint8)
-            green_dil = cv2.dilate((green_mask > 0).astype(np.uint8) * 255, k, iterations=1)
-            floor_roi_mask = cv2.bitwise_and(green_dil, bbox_mask)
-            floor_roi_source = "green_dilated"
+
+            if bottom_only:
+                bottom_mask = np.zeros_like(picked)
+                bottom_mask[y_split:, :] = 255
+                picked_top = cv2.bitwise_and(picked, cv2.bitwise_not(bottom_mask))
+                picked_bot = cv2.bitwise_and(picked, bottom_mask)
+                picked_bot = cv2.dilate(picked_bot, k, iterations=iters)
+                picked_bot = cv2.bitwise_and(picked_bot, bottom_mask)
+                picked = cv2.bitwise_or(picked_top, picked_bot)
+            else:
+                picked = cv2.dilate(picked, k, iterations=iters)
+            floor_debug["floor_roi_green_dilate"] = int(d)
+            floor_debug["floor_roi_green_dilate_iters"] = int(iters)
+
+            floor_roi_mask = picked
+            floor_roi_source = floor_roi_source or "green_flood"
+
+            # Optional: expand into a thin band of non-green floor near picked region
+            band_px = int(os.getenv("BADC_FLOOR_ROI_FLOOR_BAND_PX", "0") or 0)
+            if band_px > 0:
+                band_px = max(1, int(band_px))
+                src = np.where(picked > 0, 0, 255).astype(np.uint8)
+                dist = cv2.distanceTransform(src, cv2.DIST_L2, 3)
+                band = (dist <= float(band_px)).astype(np.uint8) * 255
+                band = cv2.bitwise_and(band, bbox_mask)
+                # Top part stays clipped to original floor; bottom may extend outside if allowed.
+                allow_bottom_outside = int(os.getenv("BADC_FLOOR_ROI_BAND_ALLOW_OUTSIDE_ORIG_BOTTOM", "1") or 1)
+                if allow_bottom_outside:
+                    band_top = band.copy()
+                    band_bot = band.copy()
+                    band_top[y_split_for_floor:, :] = 0
+                    band_bot[:y_split_for_floor, :] = 0
+                    band_top = cv2.bitwise_and(band_top, orig_floor_mask)
+                    band = cv2.bitwise_or(band_top, band_bot)
+                    floor_debug["floor_roi_band_allow_outside_orig_bottom"] = 1
+                else:
+                    band = cv2.bitwise_and(band, orig_floor_mask)
+                    floor_debug["floor_roi_band_allow_outside_orig_bottom"] = 0
+                if int(os.getenv("BADC_FLOOR_ROI_BAND_BOTTOM_ONLY", "0") or 0) and y_split_for_floor is not None:
+                    band[:y_split_for_floor, :] = 0
+                    floor_debug["floor_roi_band_bottom_only"] = 1
+                floor_roi_mask = cv2.bitwise_or(floor_roi_mask, band)
+                floor_debug["floor_roi_floor_band_px"] = int(band_px)
+                floor_debug["floor_roi_floor_band_area"] = int(np.count_nonzero(band))
     else:
         floor_roi_mask = bbox_mask
         floor_roi_source = "bbox_fallback"
+    # Optional: post dilate final ROI
+    post_d = int(os.getenv("BADC_FLOOR_ROI_POST_DILATE", "0") or 0)
+    if post_d > 0:
+        post_d = max(3, int(post_d))
+        if post_d % 2 == 0:
+            post_d += 1
+        k = np.ones((post_d, post_d), np.uint8)
+        floor_roi_mask = cv2.dilate(floor_roi_mask, k, iterations=1)
+        floor_debug["floor_roi_post_dilate"] = int(post_d)
+
+    # keep_true_floor settings
+    keep_true_floor = int(os.getenv("BADC_FLOOR_ROI_KEEP_TRUE_FLOOR", "1") or 0) == 1
+    keep_true_floor_top_only = int(os.getenv("BADC_FLOOR_ROI_KEEP_TRUE_FLOOR_TOP_ONLY", "1") or 0) == 1
+
     if floor_y_cut is not None:
         floor_roi_mask[: int(floor_y_cut), :] = 0
+
+    # Add back any original green pixels in the bottom part that flood/pick/dilate may have missed
+    if bottom_only:
+        mask_low = np.zeros((h, w), dtype=np.uint8)
+        mask_low[y_split_for_floor:, :] = 255
+        add_back = cv2.bitwise_and(green_in_bbox, mask_low)
+        floor_roi_mask = cv2.bitwise_or(floor_roi_mask, add_back)
+
+    # Apply true floor constraint: either keep strict OR top-only strict when bottom dilation is used
+    if keep_true_floor:
+        if keep_true_floor_top_only and (y_split_for_floor is not None) and bottom_only:
+            top = cv2.bitwise_and(floor_roi_mask, orig_floor_mask)
+            top[y_split_for_floor:, :] = 0
+            bot = floor_roi_mask.copy()
+            bot[:y_split_for_floor, :] = 0
+            floor_roi_mask = cv2.bitwise_or(top, bot)
+            floor_debug["floor_roi_keep_true_floor_top_only"] = 1
+            try:
+                last_metrics["floor_roi_keep_true_floor_top_only"] = 1
+            except Exception:
+                pass
+        else:
+            floor_roi_mask = cv2.bitwise_and(floor_roi_mask, orig_floor_mask)
+
     floor_mask = floor_roi_mask
     floor_debug["floor_roi_source"] = floor_roi_source
     if green_ratio is not None:
@@ -4773,7 +6752,8 @@ def _fit_court_homography_hough(
 
     corners_world = get_bwf_corners()
     Xw_ransac, _, _ = sample_model_points(points_per_meter=30.0, min_weight=0.6)
-    Xw_full, w_full, _ = sample_model_points(points_per_meter=30.0, min_weight=0.3)
+    Xw_full, w_full, names_full = sample_model_points(points_per_meter=30.0, min_weight=0.3)
+    w_full, role_w_cfg = _apply_model_role_weights(names_full, w_full)
     foot_points = _foot_points_from_boxes(person_boxes, frame_bgr.shape[0])
 
     base_metrics = {
@@ -4854,6 +6834,7 @@ def _fit_court_homography_hough(
         "linepix_green_only_used": False,
         "max_inside_count": 0,
         "selection_reason": "not_selected",
+        "model_role_weights": role_w_cfg,
     }
     # ===== Farin2005 meters-based matcher hook (after noblob, needs base_metrics) =====
     matcher = os.environ.get("BADC_COURT_MATCHER", "legacy").strip().lower()
@@ -4994,7 +6975,7 @@ def _fit_court_homography_hough(
             floor_roi_overlay=floor_roi_overlay,
             seed_bottom_mask=floor_debug.get("seed_bottom_mask"),
             green_mask=floor_debug.get("green_mask"),
-            largest_cc_mask=floor_debug.get("largest_cc_mask"),
+            largest_cc_mask=None,
             exg_row_plot=floor_debug.get("exg_row_plot"),
             linepix_mask=linepix_mask_vis,
             linepix_mask_pre=linepix_mask_pre_vis,
@@ -5015,10 +6996,55 @@ def _fit_court_homography_hough(
             return _fail_result("R_dt_invalid")
 
     tau_line = 6
-    disable_floor_gate = os.getenv("BADC_DISABLE_FLOOR_GATE", "").strip() == "1"
+    disable_floor_gate = os.getenv(
+        "BADC_LINEPIX_DISABLE_FLOOR_GATE",
+        os.getenv("BADC_DISABLE_FLOOR_GATE", "1"),  # default: disable extra floor_gate AND
+    ).strip() == "1"
+
+    # linepix base & floor ROI application
+    # IMPORTANT: "BADC_LINEPIX_SOURCE" is a legacy knob that previously selected the base.
+    # If the new knob "BADC_LINEPIX_MASK_BASE" is explicitly provided, it MUST take precedence.
     force_postblob = os.getenv("BADC_FORCE_LINEPIX_POSTBLOB", "").strip() == "1"
-    linepix_source = os.getenv("BADC_LINEPIX_SOURCE", "mask").strip().lower()
+    apply_floor_roi = os.getenv("BADC_LINEPIX_APPLY_FLOOR_ROI_TO_MASK", "1").strip() != "0"
+    # Keep this opt-in; default off so linepix/overlay behavior is not silently overridden.
+    linepix_direct_noblob = _env_flag("BADC_LINEPIX_DIRECT_NO_BLOB", False)
+    mask_base = os.getenv("BADC_LINEPIX_MASK_BASE", "noblob").strip().lower()
+    mask_base_explicit = ("BADC_LINEPIX_MASK_BASE" in os.environ)
+    legacy_source = None
+    if (not mask_base_explicit) and ("BADC_LINEPIX_SOURCE" in os.environ):
+        legacy_source = os.getenv("BADC_LINEPIX_SOURCE", "").strip().lower()
+        if legacy_source in ("mask", "postblob"):
+            mask_base = "postblob"
+        elif legacy_source in ("noblob", "raw_noblob"):
+            mask_base = "noblob"
+        elif legacy_source in ("preblob", "raw_preblob"):
+            mask_base = "preblob"
+        elif legacy_source in ("clean",):
+            mask_base = "clean"
+        elif legacy_source in ("edges",):
+            mask_base = "edges"
+    if force_postblob:
+        mask_base = "postblob"
+
+    use_bbox_for_linepix_gate = _env_flag("BADC_LINEPIX_FLOOR_GATE_USE_BBOX", True)
+
+    def _pick_linepix_base(base: str) -> Optional[np.ndarray]:
+        b = (base or "").lower()
+        if b in ("noblob", "raw_noblob"):
+            return None if white_mask_raw_floor_noblob is None else white_mask_raw_floor_noblob.copy()
+        if b in ("preblob", "raw_preblob"):
+            return None if white_mask_raw_floor_preblob is None else white_mask_raw_floor_preblob.copy()
+        if b in ("postblob", "mask"):
+            return None if white_mask_raw_floor_postblob is None else white_mask_raw_floor_postblob.copy()
+        if b in ("clean", "white_mask_clean"):
+            return None if white_mask_clean is None else white_mask_clean.copy()
+        if b in ("edges",):
+            return None
+        return None if white_mask_raw_floor_noblob is None else white_mask_raw_floor_noblob.copy()
+
     linepix_mask = None
+    linepix_pre_gate: Optional[np.ndarray] = None
+    linepix_source = f"base:{mask_base}"
     if linepix_mask_override is not None:
         linepix_source = "override"
         linepix_mask = linepix_mask_override.copy()
@@ -5030,29 +7056,90 @@ def _fit_court_homography_hough(
             linepix_mask = cv2.cvtColor(linepix_mask, cv2.COLOR_BGR2GRAY)
         linepix_mask = (linepix_mask > 0).astype(np.uint8) * 255
     else:
-        if force_postblob:
-            linepix_source = "postblob_forced"
-            linepix_mask = white_mask_raw_floor_postblob.copy()
-        elif linepix_source in ("mask", "postblob"):
-            linepix_mask = white_mask_raw_floor_postblob.copy()
-            min_lp = int(0.001 * float(h * w))
-            if linepix_source == "mask" and int(np.count_nonzero(linepix_mask)) < min_lp:
-                linepix_mask = None
-                linepix_source = "canny"
-        elif linepix_source in ("noblob", "raw_noblob"):
-            # Use the raw floor white mask before blob filtering (often best for line geometry).
-            linepix_mask = white_mask_raw_floor_noblob.copy()
-            min_lp = int(0.001 * float(h * w))
-            if int(np.count_nonzero(linepix_mask)) < min_lp:
-                linepix_mask = None
-                linepix_source = "canny"
+        linepix_mask = _pick_linepix_base(mask_base)
+        min_lp = int(0.001 * float(h * w))
+        if linepix_mask is not None and int(np.count_nonzero(linepix_mask)) < min_lp:
+            linepix_mask = None
         if linepix_mask is None:
             linepix_source = "canny"
             if frame_bgr is not None:
                 edges = cv2.Canny(gray, 30, 110)
-                linepix_mask = cv2.bitwise_and(edges, floor_mask)
+                linepix_mask = edges
             else:
                 linepix_mask = white_mask_clean.copy()
+
+    if linepix_direct_noblob and linepix_mask_override is None and isinstance(white_mask_raw_floor_noblob, np.ndarray):
+        linepix_mask = white_mask_raw_floor_noblob.copy()
+        linepix_source = "direct_noblob"
+        # Keep direct noblob untouched unless user explicitly disables this bypass.
+        apply_floor_roi = False
+
+    # Pixel-count diagnostics (for report.json)
+    def _nz_u8(m: Optional[np.ndarray]) -> int:
+        if not isinstance(m, np.ndarray) or m.size == 0:
+            return 0
+        mm = m
+        if mm.ndim == 3:
+            mm = cv2.cvtColor(mm, cv2.COLOR_BGR2GRAY)
+        if mm.dtype != np.uint8:
+            mm = mm.astype(np.uint8)
+        return int(np.count_nonzero(mm))
+
+    try:
+        base_metrics["pix_white_mask_raw_floor_noblob"] = _nz_u8(white_mask_raw_floor_noblob)
+    except Exception:
+        pass
+    try:
+        base_metrics["pix_linepix_base_before_roi"] = _nz_u8(linepix_mask)
+    except Exception:
+        pass
+
+    # Keep a copy before further gates for optional RANSAC source selection.
+    linepix_pre_gate = linepix_mask.copy() if isinstance(linepix_mask, np.ndarray) else None
+
+    # Apply floor ROI to mask base (default ON)
+    if apply_floor_roi and linepix_mask is not None and floor_mask is not None:
+        # NOTE: strict AND with floor_mask can erase boundary lines that sit on (or slightly outside)
+        # the green/lab floor ROI. To avoid losing the outer sidelines near the image border, we
+        # optionally gate by an *expanded bbox* of the floor ROI instead of the ROI mask itself.
+        pad_px = int(os.environ.get("BADC_LINEPIX_FLOOR_BBOX_PAD_PX", "40") or "40")
+        if pad_px > 0:
+            ys, xs = np.where(floor_mask > 0)
+            if xs.size > 0 and ys.size > 0:
+                x0, x1 = int(xs.min()), int(xs.max())
+                y0, y1 = int(ys.min()), int(ys.max())
+                x0 = max(0, x0 - pad_px); y0 = max(0, y0 - pad_px)
+                x1 = min(linepix_mask.shape[1] - 1, x1 + pad_px)
+                y1 = min(linepix_mask.shape[0] - 1, y1 + pad_px)
+                bbox_mask = np.zeros_like(floor_mask)
+                bbox_mask[y0:y1+1, x0:x1+1] = 255
+                linepix_mask = cv2.bitwise_and(linepix_mask, bbox_mask)
+            else:
+                # Fallback to original behavior if floor_mask is empty.
+                linepix_mask = cv2.bitwise_and(linepix_mask, floor_mask)
+        else:
+            linepix_mask = cv2.bitwise_and(linepix_mask, floor_mask)
+
+    try:
+        base_metrics["pix_linepix_after_roi"] = _nz_u8(linepix_mask)
+    except Exception:
+        pass
+
+    # Record selection for later debug; metrics may not exist yet at this scope.
+    if "metrics" in locals() and isinstance(metrics, dict):
+        metrics["linepix_mask_base"] = mask_base
+        metrics["linepix_apply_floor_roi"] = int(apply_floor_roi)
+        metrics["linepix_direct_noblob"] = int(linepix_direct_noblob)
+        if legacy_source is not None:
+            metrics["linepix_source_legacy"] = legacy_source
+        metrics["linepix_source"] = linepix_source
+    else:
+        floor_debug["linepix_mask_base"] = mask_base
+        floor_debug["linepix_apply_floor_roi"] = int(apply_floor_roi)
+        floor_debug["linepix_direct_noblob"] = int(linepix_direct_noblob)
+        if legacy_source is not None:
+            floor_debug["linepix_source_legacy"] = legacy_source
+        floor_debug["linepix_source"] = linepix_source
     # Normalize to binary uint8 {0,255} for downstream ops and debug visibility.
     if isinstance(linepix_mask, np.ndarray):
         if linepix_mask.ndim == 3:
@@ -5062,32 +7149,17 @@ def _fit_court_homography_hough(
         linepix_mask = ((linepix_mask > 0).astype(np.uint8) * 255)
     num_linepix_points_pre = int(np.count_nonzero(linepix_mask))
     linepix_mask_pre = linepix_mask.copy()
-    num_linepix_points_post_floor = num_linepix_points_pre
-    floor_gate_keep_ratio = None
+    # floor_gate is now for metrics only; do NOT crop linepix to avoid losing far-end lines.
+    floor_gate_keep_ratio = 1.0
     floor_gate_applied = False
-    floor_gate_mask = floor_mask
-    cc_mask = floor_debug.get("largest_cc_mask")
-    if floor_debug.get("fallback_mode") == "lab_seed" and isinstance(cc_mask, np.ndarray):
-        if int(np.count_nonzero(cc_mask)) > 0:
-            floor_gate_mask = cc_mask
-    if manual_x_range and floor_gate_mask is not None:
-        xg0, xg1 = manual_x_range
-        floor_gate_mask = floor_gate_mask.copy()
-        floor_gate_mask[:, :xg0] = 0
-        floor_gate_mask[:, xg1 + 1 :] = 0
-    if (not disable_floor_gate) and floor_gate_mask is not None and linepix_mask_override is None:
-        d = int(tau_line) + 6
-        k = np.ones((2 * d + 1, 2 * d + 1), np.uint8)
-        floor_gate = cv2.dilate(floor_gate_mask, k, iterations=1)
-        linepix_mask = cv2.bitwise_and(linepix_mask, floor_gate)
-        num_linepix_points_post_floor = int(np.count_nonzero(linepix_mask))
-        floor_gate_keep_ratio = float(num_linepix_points_post_floor) / float(max(num_linepix_points_pre, 1))
-        floor_gate_applied = True
-        if floor_gate_keep_ratio < 0.60:
-            linepix_mask = linepix_mask_pre
-            num_linepix_points_post_floor = num_linepix_points_pre
-            floor_gate_keep_ratio = 1.0
-            floor_gate_applied = False
+    num_linepix_points_post_floor = num_linepix_points_pre
+    floor_gate_mask = floor_mask.copy()
+    # Treat floor_bbox rectangle as valid floor area for diagnostics.
+    bx0, by0, bx1, by1 = floor_bbox
+    bx0 = max(0, min(bx0, w - 1)); bx1 = max(0, min(bx1, w))
+    by0 = max(0, min(by0, h - 1)); by1 = max(0, min(by1, h))
+    if bx1 > bx0 and by1 > by0:
+        floor_gate_mask[by0:by1, bx0:bx1] = 255
     green_mask = floor_debug.get("green_mask")
     if not isinstance(green_mask, np.ndarray) or green_mask.size == 0:
         b, g, r = cv2.split(frame_bgr)
@@ -5106,8 +7178,22 @@ def _fit_court_homography_hough(
     green_dil = cv2.dilate(green_mask, np.ones((5, 5), np.uint8), iterations=1)
 
     # Green-mask gating with fallback
-    green_only_env = os.environ.get("BADC_LINEPIX_GREEN_ONLY", "1").strip()
-    green_only = green_only_env not in ("0", "false", "False", "no", "NO", "")
+    # If apply_floor_roi is ON and the user did NOT explicitly set BADC_LINEPIX_GREEN_ONLY,
+    # default green_only to OFF to avoid wiping the ROI expansion.
+    green_only_env_raw = os.environ.get("BADC_LINEPIX_GREEN_ONLY", None)
+    green_only_defaulted_off_due_to_roi = False
+    green_only_defaulted_off_due_to_direct_noblob = False
+    if linepix_direct_noblob and (green_only_env_raw is None):
+        green_only = False
+        green_only_env = "(default-off-due-to-direct_noblob)"
+        green_only_defaulted_off_due_to_direct_noblob = True
+    elif apply_floor_roi and (green_only_env_raw is None):
+        green_only = False
+        green_only_env = "(default-off-due-to-apply_floor_roi)"
+        green_only_defaulted_off_due_to_roi = True
+    else:
+        green_only_env = (green_only_env_raw if green_only_env_raw is not None else "1").strip()
+        green_only = green_only_env not in ("0", "false", "False", "no", "NO", "off", "OFF")
     green_keep_min = float(os.environ.get("BADC_GREEN_KEEP_MIN", "0.60"))
     green_gate_mode = os.environ.get("BADC_GREEN_GATE_MODE", "erode").strip().lower()
     erode_k = int(os.environ.get("BADC_GREEN_ERODE_K", "7"))
@@ -5140,7 +7226,8 @@ def _fit_court_homography_hough(
     _before = int(cv2.countNonZero(linepix_mask))
     _after = _before
     _keep = 1.0
-    if green_only:
+    bypass_cleanup = _env_flag("BADC_LINEPIX_BYPASS_CLEANUP", False) or linepix_direct_noblob
+    if (not bypass_cleanup) and green_only:
         _gated = cv2.bitwise_and(linepix_mask, green_mask_for_gate)
         _after = int(cv2.countNonZero(_gated))
         _keep = float(_after) / float(max(1, _before))
@@ -5148,18 +7235,62 @@ def _fit_court_homography_hough(
             linepix_mask = _gated
             green_applied = True
     base_metrics["linepix_green_only_used"] = bool(green_applied)
+    base_metrics["linepix_green_only_env"] = green_only_env_raw if green_only_env_raw is not None else "<unset>"
+    base_metrics["linepix_green_only_effective"] = bool(green_only)
+    base_metrics["linepix_green_only_defaulted_off_due_to_roi"] = bool(green_only_defaulted_off_due_to_roi)
+    base_metrics["linepix_green_only_defaulted_off_due_to_direct_noblob"] = bool(
+        green_only_defaulted_off_due_to_direct_noblob
+    )
     base_metrics["green_keep_ratio"] = float(_keep)
     base_metrics["green_linepix_before"] = int(_before)
     base_metrics["green_linepix_after"] = int(_after)
+    base_metrics["pix_linepix_before_green"] = int(_before)
+    base_metrics["pix_linepix_after_green"] = int(_after)
     line_like_mask = _line_like_mask(linepix_mask)
-    linepix_mask = _remove_small_speckles(linepix_mask, min_area=8, min_aspect=3.0, min_long=10)
+    if not bypass_cleanup:
+        # Linepix cleanup can accidentally delete weak far-court horizontals.
+        # Make it tunable so we can diagnose "mask has it" vs "cleanup killed it".
+        lp_speckle_min_area = int(os.getenv("BADC_LINEPIX_SPECKLE_MIN_AREA", "8"))
+        lp_speckle_min_aspect = float(os.getenv("BADC_LINEPIX_SPECKLE_MIN_ASPECT", "3.0"))
+        lp_speckle_min_long = int(os.getenv("BADC_LINEPIX_SPECKLE_MIN_LONG", "10"))
+        linepix_mask = _remove_small_speckles(
+            linepix_mask,
+            min_area=lp_speckle_min_area,
+            min_aspect=lp_speckle_min_aspect,
+            min_long=lp_speckle_min_long,
+        )
     num_linepix_points = int(np.count_nonzero(linepix_mask))
+    try:
+        base_metrics["pix_linepix_final"] = int(num_linepix_points)
+    except Exception:
+        pass
     h_lp, w_lp = linepix_mask.shape[:2]
     total_lp = max(1, num_linepix_points)
-    left_lp = int(np.count_nonzero(linepix_mask[:, : w_lp // 2]))
-    right_lp = int(np.count_nonzero(linepix_mask[:, w_lp // 2 :]))
-    top_lp = int(np.count_nonzero(linepix_mask[: h_lp // 2, :]))
-    bottom_lp = int(np.count_nonzero(linepix_mask[h_lp // 2 :, :]))
+
+    # Compute ratios inside floor bbox/ROI to avoid bias when ROI sits mostly at bottom.
+    x0, y0, x1, y1 = 0, 0, w_lp, h_lp
+    try:
+        if isinstance(floor_bbox, (list, tuple)) and len(floor_bbox) == 4:
+            fx0, fy0, fx1, fy1 = [int(round(v)) for v in floor_bbox]
+            fx0 = max(0, min(w_lp, fx0))
+            fx1 = max(0, min(w_lp, fx1))
+            fy0 = max(0, min(h_lp, fy0))
+            fy1 = max(0, min(h_lp, fy1))
+            if fx1 > fx0 and fy1 > fy0:
+                x0, y0, x1, y1 = fx0, fy0, fx1, fy1
+    except Exception:
+        pass
+
+    roi_lp = linepix_mask[y0:y1, x0:x1]
+    h_r, w_r = roi_lp.shape[:2] if roi_lp is not None else (0, 0)
+    if h_r <= 0 or w_r <= 0:
+        roi_lp = linepix_mask
+        h_r, w_r = roi_lp.shape[:2]
+
+    left_lp = int(np.count_nonzero(roi_lp[:, : w_r // 2]))
+    right_lp = int(np.count_nonzero(roi_lp[:, w_r // 2 :]))
+    top_lp = int(np.count_nonzero(roi_lp[: h_r // 2, :]))
+    bottom_lp = int(np.count_nonzero(roi_lp[h_r // 2 :, :]))
     if frame_bgr is not None:
         # Visualization only: optionally draw linepix on top of floor_roi_overlay (raw frame + green ROI overlay).
         overlay_base = os.getenv("BADC_LINEPIX_OVERLAY_BASE", "raw").strip().lower()
@@ -5204,10 +7335,17 @@ def _fit_court_homography_hough(
         _dump_mask("linepix_pre_gate", linepix_mask_pre)
         _dump_mask("linepix_post_gate", linepix_mask)
 
-    if not skip_component_split:
+    # Component split is helpful when the mask is very noisy, but it can also
+    # collapse coverage to only one side of the court if bridged CCs split at the net/occluders.
+    # Default: disable when apply_floor_roi_to_mask is true (we want full-ROI coverage).
+    comp_split_default = "0" if (apply_floor_roi or linepix_direct_noblob) else "1"
+    comp_split_enabled = bool(int(os.getenv("BADC_LINEPIX_COMPONENT_SPLIT", comp_split_default)))
+    if (not skip_component_split) and comp_split_enabled:
         # Bridge fragmented far-court lines into larger components for Hough.
-        cc_kernel = np.ones((7, 7), np.uint8)
-        cc_mask = cv2.dilate(linepix_mask, cc_kernel, iterations=2)
+        cc_kernel_sz = int(os.getenv("BADC_LINEPIX_CC_KERNEL", "7"))
+        cc_dilate_iters = int(os.getenv("BADC_LINEPIX_CC_DILATE_ITERS", "2"))
+        cc_kernel = np.ones((cc_kernel_sz, cc_kernel_sz), np.uint8)
+        cc_mask = cv2.dilate(linepix_mask, cc_kernel, iterations=cc_dilate_iters)
         num_cc, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(cc_mask, connectivity=8)
         components: list[Tuple[int, int, Tuple[int, int, int, int]]] = []
         for idx in range(1, int(num_cc)):
@@ -5221,7 +7359,7 @@ def _fit_court_homography_hough(
             bbox_xyxy = (x, y, x + w_cc - 1, y + h_cc - 1)
             components.append((idx, area, bbox_xyxy))
         components.sort(key=lambda item: item[1], reverse=True)
-        top_k = 6
+        top_k = int(os.getenv("BADC_LINEPIX_CC_TOPK", "6"))
         component_stats_top3: list[Dict[str, Any]] = []
         component_results: list[Dict[str, Any]] = []
         img_area = float(max(1, linepix_mask.shape[0] * linepix_mask.shape[1]))
@@ -5299,6 +7437,9 @@ def _fit_court_homography_hough(
                     "stat": comp_stat,
                 }
             )
+        max_inside_count = 0
+        selection_reason = "none"
+        best_stat = {}
         if component_results:
             max_inside_count = max(item["inside_count"] for item in component_results)
             if max_inside_count > 0:
@@ -5307,14 +7448,11 @@ def _fit_court_homography_hough(
             else:
                 candidates = component_results
                 selection_reason = "bbox_area_then_score"
-            if max_inside_count <= 0:
-                candidates = sorted(
-                    candidates,
-                    key=lambda item: (item.get("bbox_area_ratio", 0.0), item.get("score_total", -1e9)),
-                    reverse=True,
-                )
-            else:
-                candidates.sort(key=lambda item: item["score_total"], reverse=True)
+            candidates = sorted(
+                candidates,
+                key=lambda item: (item.get("bbox_area_ratio", 0.0), item.get("score_total", -1e9)),
+                reverse=True,
+            )
             best_item = candidates[0]
             best_res = best_item["res"]
             best_stat = best_item["stat"]
@@ -5327,11 +7465,79 @@ def _fit_court_homography_hough(
                 best_metrics["score_total_sel"] = float(best_score)
                 best_metrics["max_inside_count"] = int(max_inside_count)
                 best_metrics["selection_reason"] = selection_reason
+            # If no inside counts, keep full-mask path instead of early-return.
+        if max_inside_count <= 0:
+            base_metrics["component_split_fallback_full"] = True
+            base_metrics["component_split_selected_component_id"] = int(best_stat.get("component_id", -1))
+            base_metrics["component_split_selection_reason"] = selection_reason
+        else:
             return best_res
-        # Fall back to single-component processing if none found.
+    # Fall back to single-component processing if none found.
+
+    # ------------------ Optional short-circuit: use raw-floor Hough fit only ------------------
+    if _env_flag("BADC_FORCE_RAW_FLOOR_ONLY", False):
+        H_raw, raw_metrics, raw_debug = _fit_court_homography_from_raw_floor_debug(
+            white_mask_raw_floor_postblob,
+            frame_bgr.shape,
+            floor_roi_mask=floor_mask,
+            white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+        )
+        metrics = {**base_metrics, **(raw_metrics or {})}
+        if H_raw is not None:
+            corners_raw = project_points(H_raw, get_bwf_corners()).astype(np.float32)
+            raw_score = float(raw_metrics.get("raw_floor_best_score", 0.0)) if isinstance(raw_metrics, dict) else 0.0
+            conf = float(np.exp(-0.02 * raw_score))
+            return CourtFitResult(
+                H=H_raw,
+                corners=corners_raw,
+                confidence=conf,
+                metrics=metrics,
+                reason="R_ok_raw_floor_forced",
+                method_used="raw_floor_forced",
+                white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+                white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+                white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+                floor_roi_mask=floor_mask,
+                floor_roi_overlay=floor_roi_overlay,
+            )
+        else:
+            return CourtFitResult(
+                H=None,
+                corners=None,
+                confidence=0.0,
+                metrics=metrics,
+                reason="R_raw_floor_failed_forced",
+                method_used="raw_floor_forced",
+                white_mask_raw_floor_preblob=white_mask_raw_floor_preblob,
+                white_mask_raw_floor_postblob=white_mask_raw_floor_postblob,
+                white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+                floor_roi_mask=floor_mask,
+                floor_roi_overlay=floor_roi_overlay,
+            )
+
+# Select mask for RANSAC (diagnostic knob to see if cleanup killed weak lines)
+    ransac_mask_source = _env_str("BADC_RANSAC_MASK_SOURCE", "linepix").strip().lower()
+    ransac_mask = linepix_mask
+    if ransac_mask_source in ("noblob", "raw_floor_noblob", "rawfloor_noblob"):
+        if white_mask_raw_floor_noblob is not None:
+            ransac_mask = white_mask_raw_floor_noblob
+        elif linepix_pre_gate is not None:
+            ransac_mask = linepix_pre_gate
+    elif ransac_mask_source in ("pre_gate", "linepix_pre_gate", "pregate"):
+        if linepix_pre_gate is not None:
+            ransac_mask = linepix_pre_gate
+
+    try:
+        base_metrics["ransac_mask_source"] = ransac_mask_source
+        base_metrics["ransac_mask_nz"] = int(np.count_nonzero(ransac_mask)) if isinstance(ransac_mask, np.ndarray) else 0
+        base_metrics["linepix_mask_nz"] = int(np.count_nonzero(linepix_mask)) if isinstance(linepix_mask, np.ndarray) else 0
+        base_metrics["linepix_pre_gate_nz"] = int(np.count_nonzero(linepix_pre_gate)) if isinstance(linepix_pre_gate, np.ndarray) else None
+        base_metrics["white_mask_raw_floor_noblob_nz"] = int(np.count_nonzero(white_mask_raw_floor_noblob)) if isinstance(white_mask_raw_floor_noblob, np.ndarray) else None
+    except Exception:
+        pass
 
     segments, tls_stats = ransac_line_segments_from_mask(
-        linepix_mask,
+        ransac_mask,
         floor_mask,
         max_lines=30,
         iters=800,
@@ -5356,6 +7562,502 @@ def _fit_court_homography_hough(
     lines_all = [(seg.x1, seg.y1, seg.x2, seg.y2) for seg in segments]
     line_ids_all = list(range(len(lines_all)))
     x0, y0, x1, y1 = floor_bbox
+    # Use frame size if available; otherwise fall back to mask size.
+    if frame_bgr is not None:
+        H_img, W_img = frame_bgr.shape[:2]
+    else:
+        H_img, W_img = linepix_mask.shape[:2]
+
+    # Optional right-strip rescue:
+    # - debug overlay: draw extra right-side lines on ransac_lines_img
+    # - apply-to-fit: inject rescued lines into lines_all/line_ids_all for downstream A/B split and fitting
+    debug_right_rescue_enabled = _env_flag("BADC_RANSAC_DEBUG_RIGHT_RESCUE", False)
+    apply_right_rescue_to_fit = _env_flag(
+        "BADC_RANSAC_RIGHT_RESCUE_APPLY",
+        _env_flag("BADC_RANSAC_RIGHT_RESCUE", False),
+    )
+    run_right_rescue = bool(debug_right_rescue_enabled or apply_right_rescue_to_fit)
+    debug_right_rescue_used = False
+    debug_right_rescue_lines: list[Tuple[float, float, float, float]] = []
+    right_rescue_fit_lines: list[Tuple[float, float, float, float]] = []
+    right_rescue_applied_to_fit = False
+    right_rescue_fit_added = 0
+    debug_right_rescue_mode = _env_str("BADC_RANSAC_DEBUG_RIGHT_RESCUE_MODE", "baseline").strip().lower()
+    if debug_right_rescue_mode not in ("vertical", "baseline", "auto"):
+        debug_right_rescue_mode = "baseline"
+    debug_right_rescue_mask_source = _env_str(
+        "BADC_RANSAC_DEBUG_RIGHT_RESCUE_MASK_SOURCE",
+        _env_str("BADC_RANSAC_RIGHT_RESCUE_MASK_SOURCE", "preblob"),
+    ).strip().lower()
+    debug_right_rescue_strip: Optional[list[int]] = None
+    debug_right_rescue_target_theta_deg: Optional[float] = None
+    if run_right_rescue:
+        rescue_mask = ransac_mask
+        if debug_right_rescue_mask_source in ("linepix", "linepix_mask"):
+            rescue_mask = linepix_mask
+        elif debug_right_rescue_mask_source in ("pre_gate", "linepix_pre_gate", "pregate"):
+            if linepix_pre_gate is not None:
+                rescue_mask = linepix_pre_gate
+        elif debug_right_rescue_mask_source in ("noblob", "raw_floor_noblob", "rawfloor_noblob"):
+            if white_mask_raw_floor_noblob is not None:
+                rescue_mask = white_mask_raw_floor_noblob
+        elif debug_right_rescue_mask_source in ("preblob", "raw_floor_preblob", "rawfloor_preblob"):
+            if white_mask_raw_floor_preblob is not None:
+                rescue_mask = white_mask_raw_floor_preblob
+
+        if isinstance(rescue_mask, np.ndarray):
+            rescue_u8 = rescue_mask
+            if rescue_u8.ndim == 3:
+                rescue_u8 = cv2.cvtColor(rescue_u8, cv2.COLOR_BGR2GRAY)
+            rescue_u8 = ((rescue_u8 > 0).astype(np.uint8) * 255)
+
+            fb_w = max(1, int(x1 - x0))
+            fb_h = max(1, int(y1 - y0))
+            strip_frac = float(
+                _env_float(
+                    "BADC_RANSAC_DEBUG_RIGHT_RESCUE_STRIP_FRAC",
+                    _env_float("BADC_RANSAC_RIGHT_RESCUE_STRIP_FRAC", 0.20),
+                )
+            )
+            top_expand_frac = float(
+                _env_float(
+                    "BADC_RANSAC_DEBUG_RIGHT_RESCUE_TOP_EXPAND_FRAC",
+                    _env_float("BADC_RANSAC_RIGHT_RESCUE_TOP_EXPAND_FRAC", 0.40),
+                )
+            )
+            strip_w = max(8, int(round(strip_frac * float(fb_w))))
+            xs0 = max(0, int(round(float(x1) - float(strip_w))))
+            xs1 = min(int(W_img - 1), int(x1))
+            ys0 = max(0, int(round(float(y0) - float(top_expand_frac) * float(fb_h))))
+            ys1 = min(int(H_img - 1), int(y1))
+            if xs1 > xs0 and ys1 > ys0:
+                debug_right_rescue_strip = [int(xs0), int(ys0), int(xs1), int(ys1)]
+                roi = np.zeros_like(rescue_u8)
+                roi[int(ys0) : int(ys1) + 1, int(xs0) : int(xs1) + 1] = 255
+
+                canny_low = int(max(10, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_CANNY_LOW", 40)))
+                canny_high = int(max(canny_low + 1, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_CANNY_HIGH", 120)))
+                edges_rescue = cv2.Canny(rescue_u8, canny_low, canny_high)
+                edges_rescue = cv2.bitwise_and(edges_rescue, roi)
+
+                rescue_thr = int(max(6, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_THRESHOLD", 10)))
+                rescue_minlen_ratio = float(
+                    _env_float(
+                        "BADC_RANSAC_DEBUG_RIGHT_RESCUE_MIN_LENGTH_RATIO",
+                        _env_float("BADC_RANSAC_RIGHT_RESCUE_MIN_LENGTH_RATIO", 0.02),
+                    )
+                )
+                rescue_minlen_px = int(max(12, round(float(min(H_img, W_img)) * float(rescue_minlen_ratio))))
+                rescue_max_gap_px = int(max(2, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_MAX_GAP_PX", 6)))
+                rescue_lines = cv2.HoughLinesP(
+                    edges_rescue,
+                    1,
+                    np.pi / 180.0,
+                    rescue_thr,
+                    minLineLength=rescue_minlen_px,
+                    maxLineGap=rescue_max_gap_px,
+                )
+
+                angle_tol_deg = float(
+                    _env_float(
+                        "BADC_RANSAC_DEBUG_RIGHT_RESCUE_ANGLE_TOL_DEG",
+                        _env_float("BADC_RANSAC_RIGHT_RESCUE_ANGLE_TOL_DEG", 28.0),
+                    )
+                )
+                baseline_angle_tol_deg = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_ANGLE_TOL_DEG", max(8.0, angle_tol_deg))
+                )
+                baseline_min_cos = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_MIN_COS", 0.60)
+                )
+                baseline_min_cos = float(max(0.05, min(0.98, baseline_min_cos)))
+                baseline_extend_left_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_EXTEND_LEFT_STRIPS", 1.6)
+                )
+                baseline_extend_right_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_EXTEND_RIGHT_STRIPS", 0.1)
+                )
+                baseline_right_trim_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_RIGHT_TRIM_STRIPS", 0.50)
+                )
+                baseline_min_span_px = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_MIN_SPAN_PX", 220.0)
+                )
+                baseline_auto_len = _env_flag("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_AUTO_LEN", True)
+                baseline_scan_left_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SCAN_LEFT_STRIPS", 4.0)
+                )
+                baseline_scan_right_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SCAN_RIGHT_STRIPS", 0.6)
+                )
+                baseline_scan_samples = int(max(80, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SCAN_SAMPLES", 220)))
+                baseline_support_radius = int(max(1, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_RADIUS", 3)))
+                baseline_support_thr = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_THR", 0.024)
+                )
+                baseline_smooth_k = int(max(3, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SMOOTH_K", 11)))
+                if (baseline_smooth_k % 2) == 0:
+                    baseline_smooth_k += 1
+                baseline_min_run = int(max(4, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_MIN_RUN", 10)))
+                baseline_support_pad_px = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_PAD_PX", 12.0)
+                )
+                baseline_auto_min_left_strips = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_AUTO_MIN_LEFT_STRIPS", 2.5)
+                )
+                baseline_perp_tol_deg = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_PERP_TOL_DEG", 24.0)
+                )
+                baseline_inter_y_margin_px = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_INTER_Y_MARGIN_PX", 60.0)
+                )
+                baseline_left_cross_backoff_px = float(
+                    _env_float("BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_LEFT_CROSS_BACKOFF_PX", 300.0)
+                )
+                dedup_tol_px = float(
+                    _env_float(
+                        "BADC_RANSAC_DEBUG_RIGHT_RESCUE_DEDUP_TOL_PX",
+                        _env_float("BADC_RANSAC_RIGHT_RESCUE_DEDUP_TOL_PX", 8.0),
+                    )
+                )
+                rescue_max_keep = int(max(1, _env_int("BADC_RANSAC_DEBUG_RIGHT_RESCUE_MAX_LINES", 1)))
+
+                # Near-vertical in image => |dx| / len should be small.
+                cos_abs_max = float(max(0.0, min(1.0, math.sin(math.radians(angle_tol_deg)))))
+                use_vertical_mode = (debug_right_rescue_mode == "vertical")
+                if debug_right_rescue_mode in ("baseline", "auto"):
+                    use_vertical_mode = False
+                target_theta = None
+                if not use_vertical_mode:
+                    base_angles = []
+                    base_weights = []
+                    for x1s, y1s, x2s, y2s in lines_all:
+                        dxs = float(x2s - x1s)
+                        dys = float(y2s - y1s)
+                        ll = float(math.hypot(dxs, dys))
+                        if ll <= 1e-3:
+                            continue
+                        if (abs(dxs) / ll) < baseline_min_cos:
+                            continue
+                        base_angles.append(float(_seg_theta_undirected(x1s, y1s, x2s, y2s)))
+                        base_weights.append(ll)
+                    if base_angles:
+                        ang_arr = np.array(base_angles, dtype=np.float32)
+                        w_arr = np.array(base_weights, dtype=np.float32)
+                        c2 = float(np.sum(w_arr * np.cos(2.0 * ang_arr)))
+                        s2 = float(np.sum(w_arr * np.sin(2.0 * ang_arr)))
+                        if abs(c2) + abs(s2) > 1e-6:
+                            target_theta = float(0.5 * math.atan2(s2, c2))
+                            if target_theta < 0.0:
+                                target_theta += math.pi
+                    if target_theta is None:
+                        best_line = None
+                        best_key = -1.0
+                        for x1s, y1s, x2s, y2s in lines_all:
+                            dxs = float(x2s - x1s)
+                            dys = float(y2s - y1s)
+                            ll = float(math.hypot(dxs, dys))
+                            if ll <= 1e-3:
+                                continue
+                            key = (abs(dxs) / ll) * ll
+                            if key > best_key:
+                                best_key = key
+                                best_line = (x1s, y1s, x2s, y2s)
+                        if best_line is not None:
+                            target_theta = float(_seg_theta_undirected(*best_line))
+                    if target_theta is None:
+                        use_vertical_mode = True
+                    else:
+                        debug_right_rescue_target_theta_deg = float(math.degrees(target_theta))
+
+                y_ref = float(ys1)
+                x_ref = float(xs1)
+                existing_refs: list[float] = []
+                for x1s, y1s, x2s, y2s in lines_all:
+                    dxs = float(x2s - x1s)
+                    dys = float(y2s - y1s)
+                    ll = float(math.hypot(dxs, dys))
+                    if ll <= 1e-3:
+                        continue
+                    line_s = _line_from_points((x1s, y1s), (x2s, y2s))
+                    if use_vertical_mode:
+                        if abs(dxs) / ll > cos_abs_max:
+                            continue
+                        xb = _x_at_y(line_s, y_ref)
+                        if xb is not None and math.isfinite(float(xb)):
+                            existing_refs.append(float(xb))
+                    else:
+                        angs = float(_seg_theta_undirected(x1s, y1s, x2s, y2s))
+                        if _angle_distance(angs, float(target_theta)) > math.radians(baseline_angle_tol_deg):
+                            continue
+                        yb = _y_at_x(line_s, x_ref)
+                        if yb is not None and math.isfinite(float(yb)):
+                            existing_refs.append(float(yb))
+
+                cand: list[Tuple[float, float, float, float, float, float, float]] = []
+                if rescue_lines is not None:
+                    for xr1, yr1, xr2, yr2 in rescue_lines[:, 0]:
+                        x1r = float(xr1)
+                        y1r = float(yr1)
+                        x2r = float(xr2)
+                        y2r = float(yr2)
+                        dxr = x2r - x1r
+                        dyr = y2r - y1r
+                        ll = float(math.hypot(dxr, dyr))
+                        if ll < float(rescue_minlen_px):
+                            continue
+                        line_r = _line_from_points((x1r, y1r), (x2r, y2r))
+                        ang = float(_seg_theta_undirected(x1r, y1r, x2r, y2r))
+                        mxr = 0.5 * (x1r + x2r)
+                        maxx = max(x1r, x2r)
+                        if mxr < float(xs0) and maxx < float(xs0):
+                            continue
+                        if use_vertical_mode:
+                            if abs(dxr) / max(ll, 1e-6) > cos_abs_max:
+                                continue
+                            ref_val = _x_at_y(line_r, y_ref)
+                            if ref_val is None or (not math.isfinite(float(ref_val))):
+                                ref_val = mxr
+                        else:
+                            if _angle_distance(ang, float(target_theta)) > math.radians(baseline_angle_tol_deg):
+                                continue
+                            if (abs(dxr) / max(ll, 1e-6)) < (baseline_min_cos * 0.7):
+                                continue
+                            ref_val = _y_at_x(line_r, x_ref)
+                            if ref_val is None or (not math.isfinite(float(ref_val))):
+                                ref_val = 0.5 * (y1r + y2r)
+                        ref_val = float(ref_val)
+                        if any(abs(ref_val - ex) <= dedup_tol_px for ex in existing_refs):
+                            continue
+                        if any(abs(ref_val - c[4]) <= dedup_tol_px for c in cand):
+                            continue
+                        cand.append((x1r, y1r, x2r, y2r, ref_val, ll, ang))
+
+                if use_vertical_mode:
+                    # Prefer the rightmost candidates, then longer segments.
+                    cand.sort(key=lambda t: (t[4], t[5]), reverse=True)
+                else:
+                    # Prefer long lines around the current baseline family.
+                    y_med = float(np.median(existing_refs)) if existing_refs else float(0.5 * (ys0 + ys1))
+                    cand.sort(key=lambda t: (-t[5], abs(t[4] - y_med), -max(t[0], t[2])))
+
+                for x1r, y1r, x2r, y2r, ref_val, _ll, _ang in cand[:rescue_max_keep]:
+                    existing_refs.append(float(ref_val))
+                    debug_right_rescue_lines.append((x1r, y1r, x2r, y2r))
+                    line_dbg = _line_from_points((x1r, y1r), (x2r, y2r))
+                    if use_vertical_mode:
+                        x_top = _x_at_y(line_dbg, float(ys0))
+                        x_bot = _x_at_y(line_dbg, float(ys1))
+                        if (
+                            x_top is not None
+                            and x_bot is not None
+                            and math.isfinite(float(x_top))
+                            and math.isfinite(float(x_bot))
+                        ):
+                            pt1 = (int(round(float(x_top))), int(round(float(ys0))))
+                            pt2 = (int(round(float(x_bot))), int(round(float(ys1))))
+                        else:
+                            pt1 = (int(round(x1r)), int(round(y1r)))
+                            pt2 = (int(round(x2r)), int(round(y2r)))
+                    else:
+                        scan_xl = float(max(0, x0, float(xs0) - baseline_scan_left_strips * float(strip_w)))
+                        scan_xr = float(min(W_img - 1, x1, float(xs1) + baseline_scan_right_strips * float(strip_w)))
+                        if scan_xr <= scan_xl + 8.0:
+                            scan_xl = float(max(0, x0, float(xs0) - baseline_extend_left_strips * float(strip_w)))
+                            scan_xr = float(min(W_img - 1, x1, float(xs1) + baseline_extend_right_strips * float(strip_w)))
+
+                        xl = float(max(0, x0, float(xs0) - baseline_extend_left_strips * float(strip_w)))
+                        xr = float(
+                            min(
+                                W_img - 1,
+                                x1,
+                                float(xs1) + baseline_extend_right_strips * float(strip_w)
+                                - baseline_right_trim_strips * float(strip_w),
+                            )
+                        )
+                        if xr <= xl + 8.0:
+                            xr = float(min(W_img - 1, x1, float(xs1)))
+
+                        if baseline_auto_len and scan_xr > scan_xl + 8.0:
+                            xs_scan = np.linspace(scan_xl, scan_xr, baseline_scan_samples, dtype=np.float32)
+                            sup = np.zeros((baseline_scan_samples,), dtype=np.float32)
+                            for i_s, x_s in enumerate(xs_scan):
+                                y_s = _y_at_x(line_dbg, float(x_s))
+                                if y_s is None or (not math.isfinite(float(y_s))):
+                                    continue
+                                xi = int(round(float(x_s)))
+                                yi = int(round(float(y_s)))
+                                if xi < 0 or xi >= int(W_img) or yi < 0 or yi >= int(H_img):
+                                    continue
+                                xlo = max(0, xi - baseline_support_radius)
+                                xhi = min(int(W_img - 1), xi + baseline_support_radius)
+                                ylo = max(0, yi - baseline_support_radius)
+                                yhi = min(int(H_img - 1), yi + baseline_support_radius)
+                                patch = rescue_u8[ylo : yhi + 1, xlo : xhi + 1]
+                                if patch.size <= 0:
+                                    continue
+                                sup[i_s] = float(np.count_nonzero(patch)) / float(patch.size)
+
+                            if baseline_smooth_k > 1:
+                                kernel = np.ones((baseline_smooth_k,), dtype=np.float32) / float(baseline_smooth_k)
+                                sup_s = np.convolve(sup, kernel, mode="same")
+                            else:
+                                sup_s = sup
+
+                            active = sup_s >= float(baseline_support_thr)
+                            runs: list[Tuple[int, int]] = []
+                            st = None
+                            for ii, ok in enumerate(active.tolist()):
+                                if ok and st is None:
+                                    st = ii
+                                if (not ok) and st is not None:
+                                    if (ii - st) >= baseline_min_run:
+                                        runs.append((int(st), int(ii - 1)))
+                                    st = None
+                            if st is not None and (len(active) - st) >= baseline_min_run:
+                                runs.append((int(st), int(len(active) - 1)))
+
+                            if runs:
+                                x_mid = float(0.5 * (x1r + x2r))
+                                best_run = None
+                                best_score = -1e9
+                                for rs, re in runs:
+                                    x_rs = float(xs_scan[rs])
+                                    x_re = float(xs_scan[re])
+                                    run_len = max(1.0, x_re - x_rs)
+                                    mean_sup = float(np.mean(sup_s[rs : re + 1]))
+                                    contains_mid = (x_rs <= x_mid <= x_re)
+                                    score = float(run_len + 260.0 * mean_sup + 0.06 * x_re + (120.0 if contains_mid else 0.0))
+                                    if score > best_score:
+                                        best_score = score
+                                        best_run = (x_rs, x_re)
+                                if best_run is not None:
+                                    xl = float(best_run[0] - baseline_support_pad_px)
+                                    xr = float(best_run[1] + baseline_support_pad_px)
+
+                        # Further clip by intersections with roughly perpendicular existing lines.
+                        x_mid = float(0.5 * (x1r + x2r))
+                        perp_xs: list[float] = []
+                        for x1s, y1s, x2s, y2s in lines_all:
+                            ang_s = float(_seg_theta_undirected(x1s, y1s, x2s, y2s))
+                            dperp = abs(_angle_distance(ang_s, float(target_theta)) - 0.5 * math.pi)
+                            if dperp > math.radians(baseline_perp_tol_deg):
+                                continue
+                            ln_s = _line_from_points((x1s, y1s), (x2s, y2s))
+                            p_int = _intersect_lines(line_dbg, ln_s)
+                            if p_int is None:
+                                continue
+                            px = float(p_int[0])
+                            py = float(p_int[1])
+                            if not (math.isfinite(px) and math.isfinite(py)):
+                                continue
+                            if px < float(x0 - 40) or px > float(x1 + 40):
+                                continue
+                            if py < float(y0 - baseline_inter_y_margin_px) or py > float(y1 + baseline_inter_y_margin_px):
+                                continue
+                            perp_xs.append(px)
+                        if perp_xs:
+                            left_cross = max([v for v in perp_xs if v <= x_mid], default=None)
+                            right_cross = min([v for v in perp_xs if v >= x_mid], default=None)
+                            if left_cross is not None:
+                                xl = max(xl, float(left_cross) - baseline_left_cross_backoff_px)
+                            if right_cross is not None:
+                                xr = min(xr, float(right_cross))
+
+                        if baseline_auto_len:
+                            min_left_cover_x = float(xs0) - baseline_auto_min_left_strips * float(strip_w)
+                            xl = min(xl, float(min_left_cover_x))
+
+                        xl = float(max(0, x0, min(xl, float(W_img - 1))))
+                        xr = float(max(0, x0, min(xr, float(W_img - 1))))
+                        if xr <= xl + 8.0:
+                            xr = float(min(W_img - 1, x1))
+                            xl = float(max(0, x0, xr - baseline_min_span_px))
+                        yl = _y_at_x(line_dbg, xl)
+                        yr = _y_at_x(line_dbg, xr)
+                        if (
+                            yl is not None
+                            and yr is not None
+                            and math.isfinite(float(yl))
+                            and math.isfinite(float(yr))
+                        ):
+                            pt1 = (int(round(xl)), int(round(float(yl))))
+                            pt2 = (int(round(xr)), int(round(float(yr))))
+                        else:
+                            pt1 = (int(round(x1r)), int(round(y1r)))
+                            pt2 = (int(round(x2r)), int(round(y2r)))
+                    seg_fit = (float(pt1[0]), float(pt1[1]), float(pt2[0]), float(pt2[1]))
+                    if math.hypot(seg_fit[2] - seg_fit[0], seg_fit[3] - seg_fit[1]) >= 8.0:
+                        right_rescue_fit_lines.append(seg_fit)
+
+                    if debug_right_rescue_enabled or apply_right_rescue_to_fit:
+                        cv2.line(
+                            ransac_lines_img,
+                            pt1,
+                            pt2,
+                            (40, 255, 40),
+                            4,
+                        )
+                        cv2.circle(ransac_lines_img, pt1, 5, (40, 255, 40), -1)
+                        cv2.circle(ransac_lines_img, pt2, 5, (40, 255, 40), -1)
+                debug_right_rescue_used = len(right_rescue_fit_lines) > 0
+
+    # Optionally inject rescued lines into the actual fitting pool.
+    if apply_right_rescue_to_fit and right_rescue_fit_lines:
+        apply_angle_tol_deg = float(_env_float("BADC_RANSAC_RIGHT_RESCUE_APPLY_ANGLE_TOL_DEG", 3.0))
+        apply_dist_tol_px = float(_env_float("BADC_RANSAC_RIGHT_RESCUE_APPLY_DIST_TOL_PX", 10.0))
+        apply_angle_tol = math.radians(apply_angle_tol_deg)
+
+        existing_lines = list(lines_all)
+        next_line_id = (max(line_ids_all) + 1) if line_ids_all else 0
+
+        for x1r, y1r, x2r, y2r in right_rescue_fit_lines:
+            dxr = float(x2r - x1r)
+            dyr = float(y2r - y1r)
+            llr = float(math.hypot(dxr, dyr))
+            if llr < 8.0:
+                continue
+
+            ang_r = float(np.mod(math.atan2(dyr, dxr), math.pi))
+            mxr = 0.5 * (float(x1r) + float(x2r))
+            myr = 0.5 * (float(y1r) + float(y2r))
+            dup = False
+
+            for x1e, y1e, x2e, y2e in existing_lines:
+                dxe = float(x2e - x1e)
+                dye = float(y2e - y1e)
+                lle = float(math.hypot(dxe, dye))
+                if lle <= 1e-3:
+                    continue
+                ang_e = float(np.mod(math.atan2(dye, dxe), math.pi))
+                if _angle_distance(ang_r, ang_e) > apply_angle_tol:
+                    continue
+                line_e = _line_from_points((x1e, y1e), (x2e, y2e))
+                d_mid = abs(_line_signed_distance(line_e, (mxr, myr)))
+                if d_mid <= apply_dist_tol_px:
+                    dup = True
+                    break
+
+            if dup:
+                continue
+
+            lines_all.append((float(x1r), float(y1r), float(x2r), float(y2r)))
+            line_ids_all.append(int(next_line_id))
+            existing_lines.append((float(x1r), float(y1r), float(x2r), float(y2r)))
+            next_line_id += 1
+            right_rescue_fit_added += 1
+
+        right_rescue_applied_to_fit = right_rescue_fit_added > 0
+
+    # Expand floor bbox upward/lateral to keep far-court lines that sit just above green ROI.
+    expand_top_frac = float(os.environ.get("BADC_FLOOR_BBOX_EXPAND_TOP_FRAC", "0.35"))
+    expand_lr_frac = float(os.environ.get("BADC_FLOOR_BBOX_EXPAND_LR_FRAC", "0.05"))
+    bb_w = max(1, int(x1 - x0))
+    bb_h = max(1, int(y1 - y0))
+    x0e = max(0, int(round(x0 - expand_lr_frac * bb_w)))
+    x1e = min(W_img - 1, int(round(x1 + expand_lr_frac * bb_w)))
+    y0e = max(0, int(round(y0 - expand_top_frac * bb_h)))
+    y1e = min(H_img - 1, int(round(y1)))
 
     # --- PATCH: do NOT hard-kill lines near the top of floor bbox ---
     # Old behavior: reject any segment whose midpoint is within top 5% of floor bbox.
@@ -5375,13 +8077,21 @@ def _fit_court_homography_hough(
     reject_mid_topshort = 0
     filtered = []
     filtered_ids: list[int] = []
+    # Optionally bypass pruning: keep all RANSAC lines to avoid empty A/B groups when lines are sparse.
+    force_ransac_ab = _env_flag("BADC_RAW_FLOOR_FORCE_RANSAC_AB", True)
 
     for idx, (x1s, y1s, x2s, y2s) in enumerate(lines_all):
         mx = 0.5 * (float(x1s) + float(x2s))
         my = 0.5 * (float(y1s) + float(y2s))
 
-        # must be inside floor bbox
-        if mx < float(x0) or mx > float(x1) or my < float(y0) or my > float(y1):
+        if force_ransac_ab:
+            filtered.append((float(x1s), float(y1s), float(x2s), float(y2s)))
+            if idx < len(line_ids_all):
+                filtered_ids.append(line_ids_all[idx])
+            continue
+
+        # must be inside expanded floor bbox
+        if mx < float(x0e) or mx > float(x1e) or my < float(y0e) or my > float(y1e):
             reject_mid_outside += 1
             continue
 
@@ -5465,6 +8175,18 @@ def _fit_court_homography_hough(
                 float(v)
                 for v in sorted([seg.length for seg in segments], reverse=True)[:10]
             ],
+            "debug_right_rescue_enabled": bool(debug_right_rescue_enabled),
+            "debug_right_rescue_used": bool(debug_right_rescue_used),
+            "debug_right_rescue_mode": str(debug_right_rescue_mode),
+            "debug_right_rescue_num_lines": int(len(debug_right_rescue_lines)),
+            "debug_right_rescue_mask_source": str(debug_right_rescue_mask_source),
+            "debug_right_rescue_strip": debug_right_rescue_strip,
+            "debug_right_rescue_target_theta_deg": float(debug_right_rescue_target_theta_deg)
+            if debug_right_rescue_target_theta_deg is not None
+            else None,
+            "right_rescue_apply_to_fit_enabled": bool(apply_right_rescue_to_fit),
+            "right_rescue_applied_to_fit": bool(right_rescue_applied_to_fit),
+            "right_rescue_fit_added": int(right_rescue_fit_added),
             "reject_mid_outside": int(reject_mid_outside),
             "num_hough_lines": int(len(lines_all)),
             "tls_num_input_pts": int(tls_stats.get("tls_num_input_pts", 0)),
@@ -5497,24 +8219,145 @@ def _fit_court_homography_hough(
         best_center2 = float((center1 + math.pi * 0.5) % math.pi)
     center2 = best_center2
 
-    band = math.radians(25.0)
+    # Orientation band for splitting RANSAC lines into two families (A/B).
+    # In strong perspective, the same world-parallel family can span a wider angle range
+    # (near side more "vertical", far side more "slanted"). A too-tight band can drop
+    # critical boundary lines (e.g., near-left sideline).
+    band_deg = float(os.getenv("BADC_ORI_BAND_DEG", "25.0"))
+    band = math.radians(band_deg)
+    band_soft_deg = float(os.getenv("BADC_ORI_BAND_SOFT_DEG", "45.0"))
+    band_soft = math.radians(band_soft_deg)
+    soft_minlen_frac = float(os.getenv("BADC_ORI_SOFT_MINLEN_FRAC", "0.45"))
+    soft_minlen_max_px = float(os.getenv("BADC_ORI_SOFT_MINLEN_MAX_PX", "300.0"))
+    ori_assign_nearest = _env_flag("BADC_ORI_ASSIGN_NEAREST", False)
+    ori_enable_soft_assign = _env_flag("BADC_ORI_ENABLE_SOFT_ASSIGN", True)
+    ori_soft_keep_boundary = _env_flag("BADC_ORI_SOFT_KEEP_BOUNDARY", True)
+    ori_soft_boundary_margin_frac = float(os.getenv("BADC_ORI_SOFT_BOUNDARY_MARGIN_FRAC", "0.08"))
+    ori_boundary_fallback = _env_flag("BADC_ORI_BOUNDARY_FALLBACK", True)
+    ori_boundary_fallback_max_angle_deg = float(os.getenv("BADC_ORI_BOUNDARY_FALLBACK_MAX_ANGLE_DEG", str(band_soft_deg)))
+    ori_force_nearest_remaining = _env_flag("BADC_ORI_FORCE_NEAREST_REMAINING", True)
+    ori_force_nearest_max_add = int(max(0, _env_int("BADC_ORI_FORCE_NEAREST_MAX_ADD", 4)))
+    ori_force_nearest_minlen_frac = float(os.getenv("BADC_ORI_FORCE_NEAREST_MINLEN_FRAC", "0.40"))
+    ori_force_nearest_max_angle_deg = float(os.getenv("BADC_ORI_FORCE_NEAREST_MAX_ANGLE_DEG", "58.0"))
+    bbox_x0, bbox_y0, bbox_x1, bbox_y1 = [float(v) for v in floor_bbox]
+    max_w = float(np.max(weights)) if isinstance(weights, np.ndarray) and weights.size > 0 else 1.0
     linesA = []
     linesB = []
     line_ids_A: list[int] = []
     line_ids_B: list[int] = []
     maskA = np.zeros_like(white_mask_clean)
     maskB = np.zeros_like(white_mask_clean)
-    for (x1, y1, x2, y2), ang, lid in zip(lines_all, angles, line_ids_angles):
+    ori_nearest_added = 0
+    unassigned = []  # (x1,y1,x2,y2, ang, lid, w)
+    for (x1s, y1s, x2s, y2s), ang, lid, w in zip(lines_all, angles, line_ids_angles, weights):
         d1 = _angle_distance(float(ang), center1)
         d2 = _angle_distance(float(ang), center2)
         if d1 <= band and d1 <= d2:
-            linesA.append((x1, y1, x2, y2))
+            linesA.append((x1s, y1s, x2s, y2s))
             line_ids_A.append(int(lid))
-            cv2.line(maskA, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+            cv2.line(maskA, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
         elif d2 <= band:
-            linesB.append((x1, y1, x2, y2))
+            linesB.append((x1s, y1s, x2s, y2s))
             line_ids_B.append(int(lid))
-            cv2.line(maskB, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1)
+            cv2.line(maskB, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+        else:
+            if ori_assign_nearest:
+                if d1 <= d2:
+                    linesA.append((x1s, y1s, x2s, y2s))
+                    line_ids_A.append(int(lid))
+                    cv2.line(maskA, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+                else:
+                    linesB.append((x1s, y1s, x2s, y2s))
+                    line_ids_B.append(int(lid))
+                    cv2.line(maskB, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+                ori_nearest_added += 1
+            else:
+                unassigned.append((x1s, y1s, x2s, y2s, float(ang), int(lid), float(w)))
+
+    ori_unassigned_initial = int(len(unassigned))
+
+    # Soft-assign long unassigned lines back to the nearest family with a wider band.
+    # This prevents missing critical boundaries under perspective.
+    ori_soft_added = 0
+    if ori_enable_soft_assign and unassigned and band_soft > band:
+        min_w = min(soft_minlen_frac * max_w, soft_minlen_max_px)
+        boundary_margin_px = max(4.0, ori_soft_boundary_margin_frac * float(max(1.0, bbox_x1 - bbox_x0)))
+        for x1s, y1s, x2s, y2s, ang, lid, w in unassigned:
+            d1 = _angle_distance(float(ang), center1)
+            d2 = _angle_distance(float(ang), center2)
+            if min(d1, d2) > band_soft:
+                continue
+            if w < min_w:
+                if not ori_soft_keep_boundary:
+                    continue
+                near_left = min(float(x1s), float(x2s)) <= bbox_x0 + boundary_margin_px
+                near_right = max(float(x1s), float(x2s)) >= bbox_x1 - boundary_margin_px
+                if not (near_left or near_right):
+                    continue
+            if d1 <= d2:
+                linesA.append((x1s, y1s, x2s, y2s))
+                line_ids_A.append(int(lid))
+                cv2.line(maskA, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            else:
+                linesB.append((x1s, y1s, x2s, y2s))
+                line_ids_B.append(int(lid))
+                cv2.line(maskB, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            ori_soft_added += 1
+
+    # Boundary fallback: keep near-left/right boundary lines even when soft assign is disabled.
+    ori_boundary_fallback_added = 0
+    if ori_boundary_fallback and unassigned:
+        remaining = []
+        boundary_margin_px = max(4.0, ori_soft_boundary_margin_frac * float(max(1.0, bbox_x1 - bbox_x0)))
+        fallback_max_angle = math.radians(float(max(5.0, ori_boundary_fallback_max_angle_deg)))
+        for x1s, y1s, x2s, y2s, ang, lid, w in unassigned:
+            near_left = min(float(x1s), float(x2s)) <= bbox_x0 + boundary_margin_px
+            near_right = max(float(x1s), float(x2s)) >= bbox_x1 - boundary_margin_px
+            if not (near_left or near_right):
+                remaining.append((x1s, y1s, x2s, y2s, ang, lid, w))
+                continue
+            d1 = _angle_distance(float(ang), center1)
+            d2 = _angle_distance(float(ang), center2)
+            if min(d1, d2) > fallback_max_angle:
+                remaining.append((x1s, y1s, x2s, y2s, ang, lid, w))
+                continue
+            if d1 <= d2:
+                linesA.append((x1s, y1s, x2s, y2s))
+                line_ids_A.append(int(lid))
+                cv2.line(maskA, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            else:
+                linesB.append((x1s, y1s, x2s, y2s))
+                line_ids_B.append(int(lid))
+                cv2.line(maskB, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            ori_boundary_fallback_added += 1
+        unassigned = remaining
+
+    # Final rescue: if some lines are still unassigned, keep a few long ones by nearest center.
+    ori_force_nearest_added = 0
+    if ori_force_nearest_remaining and unassigned and ori_force_nearest_max_add > 0:
+        remaining = []
+        min_w_force = max(20.0, ori_force_nearest_minlen_frac * max_w)
+        max_angle_force = math.radians(float(max(10.0, ori_force_nearest_max_angle_deg)))
+        cand = sorted(unassigned, key=lambda t: float(t[6]), reverse=True)
+        for x1s, y1s, x2s, y2s, ang, lid, w in cand:
+            if ori_force_nearest_added >= ori_force_nearest_max_add:
+                remaining.append((x1s, y1s, x2s, y2s, ang, lid, w))
+                continue
+            d1 = _angle_distance(float(ang), center1)
+            d2 = _angle_distance(float(ang), center2)
+            if float(w) < min_w_force or min(d1, d2) > max_angle_force:
+                remaining.append((x1s, y1s, x2s, y2s, ang, lid, w))
+                continue
+            if d1 <= d2:
+                linesA.append((x1s, y1s, x2s, y2s))
+                line_ids_A.append(int(lid))
+                cv2.line(maskA, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            else:
+                linesB.append((x1s, y1s, x2s, y2s))
+                line_ids_B.append(int(lid))
+                cv2.line(maskB, (int(x1s), int(y1s)), (int(x2s), int(y2s)), 255, 1)
+            ori_force_nearest_added += 1
+        unassigned = remaining
 
     if len(linesA) < 3 or len(linesB) < 3:
         band = math.radians(30.0)
@@ -5567,6 +8410,27 @@ def _fit_court_homography_hough(
         cv2.line(hough_lines_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
     base_metrics["num_hough_lines_a"] = int(len(linesA))
     base_metrics["num_hough_lines_b"] = int(len(linesB))
+    base_metrics["ori_center1_deg"] = float(np.degrees(center1))
+    base_metrics["ori_center2_deg"] = float(np.degrees(center2))
+    base_metrics["ori_band_deg"] = float(band_deg)
+    base_metrics["ori_band_soft_deg"] = float(band_soft_deg)
+    base_metrics["ori_soft_minlen_frac"] = float(soft_minlen_frac)
+    base_metrics["ori_soft_minlen_max_px"] = float(soft_minlen_max_px)
+    base_metrics["ori_assign_nearest"] = bool(ori_assign_nearest)
+    base_metrics["ori_enable_soft_assign"] = bool(ori_enable_soft_assign)
+    base_metrics["ori_soft_keep_boundary"] = bool(ori_soft_keep_boundary)
+    base_metrics["ori_boundary_fallback"] = bool(ori_boundary_fallback)
+    base_metrics["ori_boundary_fallback_max_angle_deg"] = float(ori_boundary_fallback_max_angle_deg)
+    base_metrics["ori_force_nearest_remaining"] = bool(ori_force_nearest_remaining)
+    base_metrics["ori_force_nearest_max_add"] = int(ori_force_nearest_max_add)
+    base_metrics["ori_force_nearest_minlen_frac"] = float(ori_force_nearest_minlen_frac)
+    base_metrics["ori_force_nearest_max_angle_deg"] = float(ori_force_nearest_max_angle_deg)
+    base_metrics["ori_nearest_added"] = int(ori_nearest_added)
+    base_metrics["ori_soft_added"] = int(ori_soft_added)
+    base_metrics["ori_boundary_fallback_added"] = int(ori_boundary_fallback_added)
+    base_metrics["ori_force_nearest_added"] = int(ori_force_nearest_added)
+    base_metrics["ori_unassigned_initial"] = int(ori_unassigned_initial)
+    base_metrics["ori_unassigned_final"] = int(len(unassigned))
     if len(linesA) < 3 or len(linesB) < 3:
         return _fail_result(
             "R_hough_lines",
@@ -5636,7 +8500,7 @@ def _fit_court_homography_hough(
             manual_metrics["reject_reason"] = "R_manual_line_filter_loosen_left"
         if not bottom_lines and bottom_scored:
             bottom_scored_sorted = sorted(bottom_scored, key=lambda v: float(v[3] + v[5]))
-            bottom_lines = [seg for (seg, *_rest) in bottom_scored_sorted[:8]]
+            bottom_lines = [seg for (seg, *_rest) in bottom_scored_sorted[:10]]
             manual_metrics["reject_reason"] = "R_manual_line_filter_loosen_bottom"
         if left_lines and bottom_lines:
             manual_left_lines = left_lines
@@ -5751,23 +8615,50 @@ def _fit_court_homography_hough(
             lines_bottom,
             mask_bottom,
             angle_ref=center_bottom,
-            top_k=8 if manual_bottom_lines else 6,
+            top_k=10 if manual_bottom_lines else 6,
             max_pairs=3,
             max_angle_deg=90.0 if manual_bottom_lines else 15.0,
         )
     # Force extreme boundary combinations to be considered
     if len(lines_left) >= 2:
-        lines_left_sorted = sorted(lines_left, key=lambda seg: min(float(seg[0]), float(seg[2])))
-        left_seg, right_seg = lines_left_sorted[0], lines_left_sorted[-1]
-        line_left_ext = _line_from_points((left_seg[0], left_seg[1]), (left_seg[2], left_seg[3]))
-        line_right_ext = _line_from_points((right_seg[0], right_seg[1]), (right_seg[2], right_seg[3]))
-        pairsA.append(((line_left_ext, line_right_ext), 1e6))
+        # Pick the two most separated parallels by signed distance to the floor bbox center.
+        # (Using min(x)/min(y) is unstable under perspective and for diagonal stray segments.)
+        cx = 0.5 * (float(floor_bbox[0]) + float(floor_bbox[2]))
+        cy = 0.5 * (float(floor_bbox[1]) + float(floor_bbox[3]))
+        scored = []
+        for x1s, y1s, x2s, y2s in lines_left:
+            line = _line_from_points((x1s, y1s), (x2s, y2s))
+            if "_canonicalize_line_abc" in globals():
+                try:
+                    line = _canonicalize_line_abc(*line)
+                except Exception:
+                    pass
+            d = _line_signed_distance(line, (cx, cy))
+            scored.append((d, line))
+        scored.sort(key=lambda t: t[0])
+        line_min = scored[0][1]
+        line_max = scored[-1][1]
+        if line_min != line_max:
+            pairsA.append(((line_min, line_max), 1e6))
     if len(lines_bottom) >= 2:
-        lines_bottom_sorted = sorted(lines_bottom, key=lambda seg: min(float(seg[1]), float(seg[3])))
-        bottom_seg, top_seg = lines_bottom_sorted[-1], lines_bottom_sorted[0]
-        line_bottom_ext = _line_from_points((bottom_seg[0], bottom_seg[1]), (bottom_seg[2], bottom_seg[3]))
-        line_top_ext = _line_from_points((top_seg[0], top_seg[1]), (top_seg[2], top_seg[3]))
-        pairsB.append(((line_bottom_ext, line_top_ext), 1e6))
+        # Same idea for the orthogonal direction.
+        cx = 0.5 * (float(floor_bbox[0]) + float(floor_bbox[2]))
+        cy = 0.5 * (float(floor_bbox[1]) + float(floor_bbox[3]))
+        scored = []
+        for x1s, y1s, x2s, y2s in lines_bottom:
+            line = _line_from_points((x1s, y1s), (x2s, y2s))
+            if "_canonicalize_line_abc" in globals():
+                try:
+                    line = _canonicalize_line_abc(*line)
+                except Exception:
+                    pass
+            d = _line_signed_distance(line, (cx, cy))
+            scored.append((d, line))
+        scored.sort(key=lambda t: t[0])
+        line_min = scored[0][1]
+        line_max = scored[-1][1]
+        if line_min != line_max:
+            pairsB.append(((line_min, line_max), 1e6))
     if manual_lt and manual_rt and manual_rb and manual_left_lines and manual_bottom_lines:
         def _seg_line_and_dist(segments, pt):
             px, py = float(pt[0]), float(pt[1])
@@ -5860,6 +8751,44 @@ def _fit_court_homography_hough(
     vp_b = _estimate_vanishing_point(
         [_line_from_points((x1, y1), (x2, y2)) for x1, y1, x2, y2 in linesB], rng
     )
+    role_prior_enabled = bool(_env_flag("BADC_ROLE_PRIOR_ENABLE", False))
+    role_prior_mask_mode = _env_str("BADC_ROLE_PRIOR_MASK", "linepix").strip().lower()
+    role_prior_mask = linepix_mask if role_prior_mask_mode == "linepix" else white_mask_clean
+    if role_prior_mask is None or role_prior_mask.size == 0 or int(np.count_nonzero(role_prior_mask)) == 0:
+        role_prior_mask = white_mask_clean
+        role_prior_mask_mode = "white_mask_clean"
+    base_metrics["role_prior_enabled"] = bool(role_prior_enabled)
+    base_metrics["role_prior_mask"] = str(role_prior_mask_mode)
+    qrt_min_bbox_w_frac = float(_env_float("BADC_QRT_MIN_BBOX_W_FRAC", 0.08))
+    qrt_min_bbox_h_frac = float(_env_float("BADC_QRT_MIN_BBOX_H_FRAC", 0.06))
+    qrt_min_edge_frac = float(_env_float("BADC_QRT_MIN_EDGE_FRAC", 0.05))
+    ratio_verify_enabled = bool(_env_flag("BADC_COURT_RATIO_VERIFY", False))
+    ratio_verify_hard_gate = bool(_env_flag("BADC_COURT_RATIO_VERIFY_HARD_GATE", False))
+    ratio_verify_weight = float(_env_float("BADC_COURT_RATIO_VERIFY_W", 10.0))
+    ratio_verify_min_score = float(_env_float("BADC_COURT_RATIO_VERIFY_MIN_SCORE", 0.56))
+    ratio_verify_min_h = int(_env_int("BADC_COURT_RATIO_MIN_H_LINES", 4))
+    ratio_verify_min_v = int(_env_int("BADC_COURT_RATIO_MIN_V_LINES", 3))
+    ratio_verify_angle_tol = float(_env_float("BADC_COURT_RATIO_ANGLE_TOL_DEG", 12.0))
+    ratio_verify_tol_h = float(_env_float("BADC_COURT_RATIO_TOL_H_M", 0.24))
+    ratio_verify_tol_v = float(_env_float("BADC_COURT_RATIO_TOL_V_M", 0.22))
+    ratio_verify_min_seg = float(_env_float("BADC_COURT_RATIO_MIN_SEG_M", 0.55))
+    ratio_verify_expand = bool(_env_flag("BADC_COURT_RATIO_VERIFY_EXPAND", True))
+    ratio_verify_expand_scales = _parse_float_csv(
+        _env_str("BADC_COURT_RATIO_VERIFY_SCALES", "1.00,1.03,0.97,1.06,0.94"),
+        [1.0, 1.03, 0.97, 1.06, 0.94],
+    )
+    ratio_verify_expand_min_gain = float(_env_float("BADC_COURT_RATIO_VERIFY_EXPAND_MIN_GAIN", 0.03))
+    base_metrics["court_ratio_verify_enabled"] = bool(ratio_verify_enabled)
+    base_metrics["court_ratio_verify_hard_gate"] = bool(ratio_verify_hard_gate)
+    base_metrics["court_ratio_verify_weight"] = float(ratio_verify_weight)
+    base_metrics["court_ratio_verify_min_score"] = float(ratio_verify_min_score)
+    base_metrics["court_ratio_verify_min_h_lines"] = int(ratio_verify_min_h)
+    base_metrics["court_ratio_verify_min_v_lines"] = int(ratio_verify_min_v)
+    base_metrics["court_ratio_verify_expand"] = bool(ratio_verify_expand)
+    base_metrics["court_ratio_verify_expand_scales"] = [float(v) for v in ratio_verify_expand_scales]
+    best_ratio_meta: Optional[Dict[str, Any]] = None
+    best_ratio_bonus: Optional[float] = None
+    ratio_refine_used = False
     for relax_scale in (1.0, 0.7):
         if relax_scale < 1.0:
             relaxed_pass = 1
@@ -5873,10 +8802,14 @@ def _fit_court_homography_hough(
         best_area_ratio_img = None
         best_ymax_ratio = None
         best_bottom_support = None
+        best_role_prior_bonus = None
+        best_role_prior_meta = None
+        best_ratio_meta = None
+        best_ratio_bonus = None
         top3_main = []
-        deg_bbox_w = 0.08 * float(w) * float(relax_scale)
-        deg_bbox_h = 0.06 * float(h) * float(relax_scale)
-        deg_edge = 0.05 * float(min(h, w)) * float(relax_scale)
+        deg_bbox_w = float(max(1.0, qrt_min_bbox_w_frac * float(w) * float(relax_scale)))
+        deg_bbox_h = float(max(1.0, qrt_min_bbox_h_frac * float(h) * float(relax_scale)))
+        deg_edge = float(max(1.0, qrt_min_edge_frac * float(min(h, w)) * float(relax_scale)))
         min_area_ratio_img = float(os.environ.get("BADC_QRT_MIN_AREA_RATIO_IMG", "0.04"))
         aspect_min = float(os.environ.get("BADC_QRT_ASPECT_MIN", "1.4"))
         aspect_max = float(os.environ.get("BADC_QRT_ASPECT_MAX", "3.0"))
@@ -5968,7 +8901,41 @@ def _fit_court_homography_hough(
                     anchor_score = float(math.exp(-err_mean / 200.0))
                     score_final *= (0.8 + 0.2 * anchor_score)
                     best_anchor_score = anchor_score
-                score_total = float(score_final + inside_bonus)
+                area_ratio = float(loss_info.get("area_ratio", 0.0))
+                area_w = _env_float("BADC_QUAD_AREA_PRIOR_W", 2.5)
+                area_min = _env_float("BADC_QUAD_AREA_PRIOR_MIN", 0.10)
+                area_bonus = area_w * area_ratio
+                if area_ratio < area_min:
+                    area_bonus -= area_w * 3.0 * (area_min - area_ratio)
+                role_bonus = 0.0
+                role_meta: Dict[str, float] = {}
+                if role_prior_enabled:
+                    role_bonus, role_meta = _court_role_prior_bonus(H_cand, role_prior_mask)
+                ratio_meta: Optional[Dict[str, Any]] = None
+                ratio_bonus = 0.0
+                ratio_score_val = 0.0
+                if ratio_verify_enabled:
+                    ratio_meta = _evaluate_court_ratio_structure(
+                        ordered,
+                        lines_all,
+                        img_w=w,
+                        img_h=h,
+                        angle_tol_deg=ratio_verify_angle_tol,
+                        tol_h_m=ratio_verify_tol_h,
+                        tol_v_m=ratio_verify_tol_v,
+                        min_seg_len_m=ratio_verify_min_seg,
+                    )
+                    ratio_score_val = float(ratio_meta.get("score", 0.0))
+                    ratio_h_ok = int(ratio_meta.get("h_present", 0)) >= int(max(1, ratio_verify_min_h))
+                    ratio_v_ok = int(ratio_meta.get("v_present", 0)) >= int(max(1, ratio_verify_min_v))
+                    ratio_pass = bool(ratio_score_val >= ratio_verify_min_score and ratio_h_ok and ratio_v_ok)
+                    ratio_bonus = float(ratio_verify_weight * ratio_score_val)
+                    ratio_meta = dict(ratio_meta)
+                    ratio_meta["pass"] = bool(ratio_pass)
+                    ratio_meta["bonus"] = float(ratio_bonus)
+                    if ratio_verify_hard_gate and not ratio_pass:
+                        continue
+                score_total = float(score_final + inside_bonus + area_bonus + float(role_bonus) + float(ratio_bonus))
                 if score_total > best_score:
                     best_score = score_total
                     best_score_base = float(score_final)
@@ -5983,9 +8950,53 @@ def _fit_court_homography_hough(
                     best_bottom_support = float(bottom_support)
                     best_inside_count = int(inside_count_val)
                     best_inside_bonus = float(inside_bonus)
-                top3_main.append((score_total, area_ratio_img, ymax_ratio, bottom_support, inside_count_val))
+                    best_role_prior_bonus = float(role_bonus)
+                    best_role_prior_meta = dict(role_meta) if role_meta else None
+                    best_ratio_bonus = float(ratio_bonus)
+                    best_ratio_meta = dict(ratio_meta) if isinstance(ratio_meta, dict) else None
+                top3_main.append(
+                    (score_total, area_ratio_img, ymax_ratio, bottom_support, int(inside_count_val), float(ratio_score_val))
+                )
         if best_pairA is not None and best_pairB is not None and best_ordered is not None:
             break
+
+    if (
+        ratio_verify_enabled
+        and ratio_verify_expand
+        and best_ordered is not None
+        and isinstance(best_ratio_meta, dict)
+        and not bool(best_ratio_meta.get("pass", False))
+    ):
+        min_area_ratio_img_ref = float(os.environ.get("BADC_QRT_MIN_AREA_RATIO_IMG", "0.04"))
+        aspect_min_ref = float(os.environ.get("BADC_QRT_ASPECT_MIN", "1.4"))
+        aspect_max_ref = float(os.environ.get("BADC_QRT_ASPECT_MAX", "3.0"))
+        min_bbox_w_ref = float(max(1.0, qrt_min_bbox_w_frac * float(w)))
+        min_bbox_h_ref = float(max(1.0, qrt_min_bbox_h_frac * float(h)))
+        min_edge_ref = float(max(1.0, qrt_min_edge_frac * float(min(h, w))))
+        refined_quad, refined_meta, refined = _refine_quad_by_structure_scale(
+            best_ordered,
+            lines_all,
+            floor_bbox=floor_bbox,
+            img_w=w,
+            img_h=h,
+            scales=ratio_verify_expand_scales,
+            min_gain=ratio_verify_expand_min_gain,
+            angle_tol_deg=ratio_verify_angle_tol,
+            tol_h_m=ratio_verify_tol_h,
+            tol_v_m=ratio_verify_tol_v,
+            min_seg_len_m=ratio_verify_min_seg,
+            min_area_ratio_img=min_area_ratio_img_ref,
+            aspect_min=aspect_min_ref,
+            aspect_max=aspect_max_ref,
+            min_bbox_w=min_bbox_w_ref,
+            min_bbox_h=min_bbox_h_ref,
+            min_edge=min_edge_ref,
+        )
+        if refined and float(refined_meta.get("score", 0.0)) > float(best_ratio_meta.get("score", 0.0)):
+            best_ordered = refined_quad
+            best_ratio_meta = dict(refined_meta)
+            best_ratio_bonus = float(ratio_verify_weight * float(best_ratio_meta.get("score", 0.0)))
+            ratio_refine_used = True
 
     base_metrics["reject_roi_corner"] = int(reject_roi_corner)
     base_metrics["reject_manual_anchor"] = int(reject_manual_anchor)
@@ -6004,8 +9015,9 @@ def _fit_court_homography_hough(
             "ymax_ratio": float(y),
             "bottom_support": float(b),
             "inside_count": int(ic),
+            "ratio_struct_score": float(rs),
         }
-        for s, a, y, b, ic in top3_main[:3]
+        for s, a, y, b, ic, rs in top3_main[:3]
     ]
     base_metrics["selected_area_ratio"] = float(best_area_ratio_img) if best_area_ratio_img is not None else None
     base_metrics["selected_ymax_ratio"] = float(best_ymax_ratio) if best_ymax_ratio is not None else None
@@ -6018,6 +9030,11 @@ def _fit_court_homography_hough(
         base_metrics.update(best_mixer_parts)
     base_metrics["score_base"] = float(best_score_base) if best_score_base is not None else None
     base_metrics["score_total"] = float(best_score) if best_score != float("-inf") else None
+    base_metrics["role_prior_bonus"] = float(best_role_prior_bonus) if best_role_prior_bonus is not None else None
+    base_metrics["role_prior_meta"] = best_role_prior_meta if isinstance(best_role_prior_meta, dict) else None
+    base_metrics["court_ratio_refine_used"] = bool(ratio_refine_used)
+    base_metrics["court_ratio_bonus"] = float(best_ratio_bonus) if best_ratio_bonus is not None else None
+    base_metrics["court_ratio_meta"] = best_ratio_meta if isinstance(best_ratio_meta, dict) else None
     base_metrics["inside_count"] = int(best_inside_count) if best_inside_count is not None else 0
     base_metrics["inside_bonus"] = float(best_inside_bonus) if best_inside_bonus is not None else 0.0
     base_metrics["score_final"] = base_metrics["score_base"]
@@ -6202,6 +9219,7 @@ def _fit_court_homography_hough(
             }
             if metrics.get("selected_component_id") is None:
                 metrics["selected_component_id"] = int(base_metrics.get("component_id") or 0)
+            raw_debug_save = raw_debug
             return CourtFitResult(
                 H=H_raw,
                 corners=corners_out,
@@ -6277,8 +9295,22 @@ def _fit_court_homography_hough(
     completion_reject_reason = None
     if ordered is not None and lines_left and lines_bottom:
         lines_left_comp, line_ids_left_comp = _filter_lines_for_completion(lines_left, line_ids_left, ordered)
-        lines_bottom_comp, line_ids_bottom_comp = _filter_lines_for_completion(lines_bottom, line_ids_bottom, ordered)
         floor_h = float(max(1.0, float(floor_bbox[3] - floor_bbox[1])))
+        comp_bottom_extra_px = _env_float(
+            "BADC_COMPLETION_BOTTOM_EXTRA_PX",
+            _env_float("BADC_COMPLETION_BOTTOM_EXTRA_FRAC", 0.22) * floor_h,
+        )
+        lines_bottom_comp, line_ids_bottom_comp = _filter_lines_for_completion(
+            lines_bottom,
+            line_ids_bottom,
+            ordered,
+            margin_px=8.0,
+            margin_top_px=8.0,
+            margin_bottom_px=max(8.0, float(comp_bottom_extra_px)),
+        )
+        base_metrics["completion_bottom_extra_px"] = float(max(8.0, float(comp_bottom_extra_px)))
+        base_metrics["completion_bottom_lines_before"] = int(len(lines_bottom))
+        base_metrics["completion_bottom_lines_after"] = int(len(lines_bottom_comp))
         y_sorted = np.sort(ordered[:, 1])
         bottom_min = float(y_sorted[-2]) if y_sorted.size >= 2 else float(np.max(ordered[:, 1]))
         out_of_frame = np.any(
@@ -6339,6 +9371,21 @@ def _fit_court_homography_hough(
         base_metrics["left_sideline_meta"] = completion_meta.get("left_sideline_meta")
         base_metrics["right_sideline_meta"] = completion_meta.get("right_sideline_meta")
         base_metrics["top_line_meta"] = completion_meta.get("top_line_meta")
+
+    postfit_baseline_used = False
+    postfit_baseline_meta: Dict[str, Any] = {}
+    if ordered is not None:
+        refined_ordered, postfit_baseline_used, postfit_baseline_meta = _refine_bottom_baseline_postfit(
+            ordered,
+            lines_bottom=lines_bottom,
+            lines_all=lines_all,
+            floor_bbox=floor_bbox,
+            line_mask=linepix_mask,
+        )
+        if postfit_baseline_used:
+            ordered = refined_ordered
+    base_metrics["postfit_baseline_verify_used"] = bool(postfit_baseline_used)
+    base_metrics["postfit_baseline_verify_meta"] = postfit_baseline_meta if isinstance(postfit_baseline_meta, dict) else None
 
     H_best = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), ordered.astype(np.float32))
     cover_points = _sample_white_points(white_mask_clean, max_points=1500, rng=rng)
@@ -6530,6 +9577,20 @@ def _fit_court_homography_hough(
     }
     if metrics.get("selected_component_id") is None:
         metrics["selected_component_id"] = int(base_metrics.get("component_id") or 0)
+
+    # Generate raw-floor debug overlays even when main Hough path succeeds, so downstream
+    # report assets (raw_floor_* overlays) are populated.
+    if raw_debug_save is None and save_raw_debug:
+        try:
+            _Hdbg, _mdbg, raw_debug_save = _fit_court_homography_from_raw_floor_debug(
+                white_mask_raw_floor_postblob,
+                frame_bgr.shape,
+                floor_roi_mask=floor_mask,
+                white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
+            )
+        except Exception:
+            raw_debug_save = None
+
     return CourtFitResult(
         H=H_best,
         corners=corners_out,
@@ -6561,6 +9622,14 @@ def _fit_court_homography_hough(
         ori_mask_a=maskA,
         ori_mask_b=maskB,
         hough_lines_img=hough_lines_img,
+        raw_floor_hough_lines_img=(raw_debug_save or {}).get("hough_lines"),
+        raw_floor_dt_debug=(raw_debug_save or {}).get("dt"),
+        raw_floor_model_overlay=(raw_debug_save or {}).get("overlay_raw"),
+        raw_floor_top5_overlay=(raw_debug_save or {}).get("overlay_top5"),
+        raw_floor_preprocessed=(raw_debug_save or {}).get("preprocessed"),
+        raw_floor_edges=(raw_debug_save or {}).get("edges"),
+        raw_floor_hough_lines_a=(raw_debug_save or {}).get("hough_lines_a"),
+        raw_floor_hough_lines_b=(raw_debug_save or {}).get("hough_lines_b"),
     )
 
 
@@ -6622,8 +9691,10 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
     dt_rand_p90 = float(np.percentile(dt_rand, 90)) if dt_rand.size > 0 else None
 
     corners_world = get_bwf_corners()
-    Xw_ransac, w_ransac, _ = sample_model_points(points_per_meter=30.0, min_weight=0.6)
-    Xw_full, w_full, _ = sample_model_points(points_per_meter=30.0, min_weight=0.3)
+    Xw_ransac, w_ransac, names_ransac = sample_model_points(points_per_meter=30.0, min_weight=0.6)
+    Xw_full, w_full, names_full = sample_model_points(points_per_meter=30.0, min_weight=0.3)
+    w_ransac, role_w_cfg_ransac = _apply_model_role_weights(names_ransac, w_ransac)
+    w_full, role_w_cfg_full = _apply_model_role_weights(names_full, w_full)
 
     base_metrics = {
         "model": MODEL_ID,
@@ -6653,6 +9724,8 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         "lsd_dirB_path": None,
         "debug_init_path": None,
         "dt_debug_path": None,
+        "model_role_weights": role_w_cfg_full,
+        "model_role_weights_ransac": role_w_cfg_ransac,
     }
 
     if clean_ratio < 0.001 or clean_ratio > 0.25:

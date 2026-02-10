@@ -110,9 +110,13 @@ def analyse_video(
     use_model_fit = court_method in ("model_fit", "model_fit_bwf")
     model_fit_method = vision_cfg.get("model_fit_method", "lsd")
     allow_fallback_lsd = vision_cfg.get("model_fit_allow_fallback_lsd", True)
+    court_detect_once = bool(vision_cfg.get("court_detect_once", use_model_fit))
+    court_detect_frame_idx = int(vision_cfg.get("court_detect_frame_idx", 0))
     print("[CFG] court_detector_method =", vision_cfg.get("court_detector_method"))
     print("[CFG] model_fit_method      =", vision_cfg.get("model_fit_method"))
     print("[CFG] allow_fallback_lsd    =", vision_cfg.get("model_fit_allow_fallback_lsd", True))
+    print("[CFG] court_detect_once     =", court_detect_once)
+    print("[CFG] court_detect_frame_idx=", court_detect_frame_idx)
     court_detector = (
         CourtDetector(
             edge_top_min=edge_top_min,
@@ -161,101 +165,216 @@ def analyse_video(
 
         if court_corners is None and (detect_court_corners or use_court_roi):
             # Try multiple early frames and keep the best-scoring detection.
+            # When single-frame lock is enabled, optionally fallback-scan if the chosen frame is weak.
             samples = int(vision_cfg.get("court_detect_samples", 10))
             stride = int(vision_cfg.get("court_detect_stride", 5))
             samples = max(1, samples)
             stride = max(1, stride)
-            if use_model_fit:
+            if court_detect_once:
                 samples = 1
-                stride = 1
 
-            best = None  # (confidence, corners, meta, fit)
-            best_fail = None  # (confidence, meta, fit)
-            for i in range(samples):
-                fi = int(i * stride)
-                if fi == 0:
-                    bgr_i = first_bgr
-                else:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-                    ok_i, bgr_i = cap.read()
-                    if not ok_i or bgr_i is None:
-                        break
-                if use_model_fit:
-                    fit = fit_court_homography(
-                        bgr_i,
-                        method=model_fit_method,
-                        allow_fallback_lsd=allow_fallback_lsd,
-                    )
-                    print("[FIT] method_used =", fit.method_used, "reason =", fit.reason)
-                    metrics = fit.metrics if isinstance(fit.metrics, dict) else {}
-                    print(
-                        "[FIT] raw_full_ratio=",
-                        metrics.get("white_mask_raw_full_ratio"),
-                        "raw_floor_ratio=",
-                        metrics.get("white_mask_raw_floor_ratio"),
-                        "clean_ratio=",
-                        metrics.get("white_mask_clean_ratio"),
-                        "floor_roi_ratio=",
-                        metrics.get("floor_roi_ratio"),
-                        "floor_bbox=",
-                        metrics.get("floor_bbox"),
-                        "fallback_floor_roi=",
-                        metrics.get("fallback_floor_roi"),
-                        "fallback_mode=",
-                        metrics.get("fallback_mode"),
-                        "floor_y_cut=",
-                        metrics.get("floor_y_cut"),
-                    )
-                    conf = float(fit.confidence)
-                    reason = str(fit.reason)
-                    metrics = fit.metrics
-                    meta_i = {
-                        "source": "auto",
-                        "confidence": conf,
-                        "reason": reason,
-                        "frame_idx": fi,
-                        "metrics": metrics,
-                    }
-                    if fit.corners is None:
-                        if best_fail is None or conf > float(best_fail[0]):
-                            best_fail = (conf, meta_i, fit)
+            detect_mode = "single_frame" if court_detect_once else "best_of_samples"
+            detect_fallback_on_fail = bool(vision_cfg.get("court_detect_fallback_on_fail", True))
+            detect_fallback_samples = int(vision_cfg.get("court_detect_fallback_samples", 24))
+            detect_fallback_stride = int(vision_cfg.get("court_detect_fallback_stride", 10))
+            detect_fallback_min_conf = float(vision_cfg.get("court_detect_fallback_min_conf", 0.45))
+            detect_fallback_min_score = float(vision_cfg.get("court_detect_fallback_min_score", 120.0))
+            detect_fallback_samples = max(2, detect_fallback_samples)
+            detect_fallback_stride = max(1, detect_fallback_stride)
+            sample_frame_indices = (
+                [max(0, int(court_detect_frame_idx))]
+                if court_detect_once
+                else [int(i * stride) for i in range(samples)]
+            )
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            max_frame_idx = max(0, total_frames - 1) if total_frames > 0 else None
+
+            def _clip_unique_indices(indices: List[int]) -> List[int]:
+                out: List[int] = []
+                seen = set()
+                for fi_raw in indices:
+                    fi = int(fi_raw)
+                    if max_frame_idx is not None:
+                        fi = max(0, min(fi, max_frame_idx))
+                    else:
+                        fi = max(0, fi)
+                    if fi in seen:
                         continue
-                    corners_i = fit.corners.tolist()
-                    if best is None or conf > float(best[0]):
-                        best = (conf, corners_i, meta_i, fit)
-                else:
-                    rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
-                    lines = court_detector.detect_court(rgb) if court_detector is not None else None
-                    conf = float(court_detector.last_confidence or 0.0) if court_detector is not None else 0.0
-                    reason = str(court_detector.last_reason or "unknown") if court_detector is not None else "unknown"
-                    edge_support = (
-                        [float(v) for v in court_detector.last_edge_support]
-                        if court_detector is not None and isinstance(court_detector.last_edge_support, list)
-                        else None
-                    )
-                    metrics = (
-                        court_detector.last_metrics
-                        if court_detector is not None and isinstance(court_detector.last_metrics, dict)
-                        else None
-                    )
-                    meta_i = {
-                        "source": "auto",
-                        "confidence": conf,
-                        "reason": reason,
-                        "frame_idx": fi,
-                        "edge_support": edge_support,
-                        "metrics": metrics,
-                    }
-                    if lines is None or lines.corners is None:
-                        if best_fail is None or conf > float(best_fail[0]):
-                            best_fail = (conf, meta_i, None)
+                    seen.add(fi)
+                    out.append(fi)
+                return out
+
+            sample_frame_indices = _clip_unique_indices(sample_frame_indices)
+
+            def _candidate_score(conf: float, reason: str, metrics: Optional[Dict[str, Any]]) -> float:
+                m = metrics if isinstance(metrics, dict) else {}
+                score = 100.0 * float(conf)
+                r = str(reason or "")
+                if r == "OK":
+                    score += 100.0
+                elif r.startswith("R_fit_poor"):
+                    score -= 35.0
+                elif r.startswith("R_hough"):
+                    score -= 25.0
+                elif r.startswith("R_"):
+                    score -= 20.0
+
+                na = float(m.get("num_hough_lines_a", 0) or 0)
+                nb = float(m.get("num_hough_lines_b", 0) or 0)
+                npairs_a = float(m.get("num_hough_pairs_a", 0) or 0)
+                npairs_b = float(m.get("num_hough_pairs_b", 0) or 0)
+                if na > 0 or nb > 0:
+                    score += min(35.0, 1.4 * (na + nb))
+                if na > 0 and nb > 0:
+                    ratio = min(na, nb) / max(na, nb)
+                    score += 40.0 * float(ratio)
+                if npairs_a > 0 or npairs_b > 0:
+                    score += min(24.0, 3.0 * (npairs_a + npairs_b))
+
+                # Penalize structurally unstable hypotheses.
+                score -= 2.0 * float(m.get("reject_aspect_ratio", 0) or 0)
+                score -= 0.8 * float(m.get("reject_area_ratio_low", 0) or 0)
+                score -= 0.6 * float(m.get("reject_degenerate_min_edge", 0) or 0)
+                return float(score)
+
+            def _candidate_good(meta: Dict[str, Any]) -> bool:
+                conf_i = float(meta.get("confidence", 0.0) or 0.0)
+                score_i = float(meta.get("candidate_score", -1e9) or -1e9)
+                reason_i = str(meta.get("reason", ""))
+                return bool(reason_i == "OK" and conf_i >= detect_fallback_min_conf and score_i >= detect_fallback_min_score)
+
+            best = None  # (score, confidence, corners, meta, fit)
+            best_fail = None  # (score, confidence, meta, fit)
+            checked_indices: List[int] = []
+            fallback_used = False
+
+            def _maybe_update_best(
+                score_i: float,
+                conf_i: float,
+                corners_i: Optional[List[List[float]]],
+                meta_i: Dict[str, Any],
+                fit_i: Any,
+            ) -> None:
+                nonlocal best, best_fail
+                if corners_i is None:
+                    if best_fail is None or score_i > float(best_fail[0]) or (
+                        score_i == float(best_fail[0]) and conf_i > float(best_fail[1])
+                    ):
+                        best_fail = (score_i, conf_i, meta_i, fit_i)
+                    return
+                if best is None or score_i > float(best[0]) or (score_i == float(best[0]) and conf_i > float(best[1])):
+                    best = (score_i, conf_i, corners_i, meta_i, fit_i)
+
+            def _eval_candidates(indices: List[int]) -> None:
+                for fi in indices:
+                    if fi in checked_indices:
                         continue
-                    corners_i = lines.corners.tolist()
-                    if best is None or conf > float(best[0]):
-                        best = (conf, corners_i, meta_i, None)
+                    checked_indices.append(int(fi))
+                    if fi == 0:
+                        bgr_i = first_bgr
+                    else:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                        ok_i, bgr_i = cap.read()
+                        if not ok_i or bgr_i is None:
+                            continue
+                    if use_model_fit:
+                        fit_i = fit_court_homography(
+                            bgr_i,
+                            method=model_fit_method,
+                            allow_fallback_lsd=allow_fallback_lsd,
+                        )
+                        print("[FIT] method_used =", fit_i.method_used, "reason =", fit_i.reason)
+                        metrics_i = fit_i.metrics if isinstance(fit_i.metrics, dict) else {}
+                        print(
+                            "[FIT] raw_full_ratio=",
+                            metrics_i.get("white_mask_raw_full_ratio"),
+                            "raw_floor_ratio=",
+                            metrics_i.get("white_mask_raw_floor_ratio"),
+                            "clean_ratio=",
+                            metrics_i.get("white_mask_clean_ratio"),
+                            "floor_roi_ratio=",
+                            metrics_i.get("floor_roi_ratio"),
+                            "floor_bbox=",
+                            metrics_i.get("floor_bbox"),
+                            "fallback_floor_roi=",
+                            metrics_i.get("fallback_floor_roi"),
+                            "fallback_mode=",
+                            metrics_i.get("fallback_mode"),
+                            "floor_y_cut=",
+                            metrics_i.get("floor_y_cut"),
+                        )
+                        conf_i = float(fit_i.confidence)
+                        reason_i = str(fit_i.reason)
+                        score_i = _candidate_score(conf_i, reason_i, metrics_i)
+                        meta_i = {
+                            "source": "auto",
+                            "confidence": conf_i,
+                            "reason": reason_i,
+                            "frame_idx": int(fi),
+                            "detect_mode": detect_mode,
+                            "lock_enabled": bool(court_detect_once),
+                            "metrics": fit_i.metrics,
+                            "candidate_score": float(score_i),
+                        }
+                        corners_i = fit_i.corners.tolist() if fit_i.corners is not None else None
+                        _maybe_update_best(score_i, conf_i, corners_i, meta_i, fit_i)
+                    else:
+                        rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
+                        lines = court_detector.detect_court(rgb) if court_detector is not None else None
+                        conf_i = float(court_detector.last_confidence or 0.0) if court_detector is not None else 0.0
+                        reason_i = str(court_detector.last_reason or "unknown") if court_detector is not None else "unknown"
+                        edge_support_i = (
+                            [float(v) for v in court_detector.last_edge_support]
+                            if court_detector is not None and isinstance(court_detector.last_edge_support, list)
+                            else None
+                        )
+                        metrics_i = (
+                            court_detector.last_metrics
+                            if court_detector is not None and isinstance(court_detector.last_metrics, dict)
+                            else None
+                        )
+                        score_i = _candidate_score(conf_i, reason_i, metrics_i if isinstance(metrics_i, dict) else None)
+                        meta_i = {
+                            "source": "auto",
+                            "confidence": conf_i,
+                            "reason": reason_i,
+                            "frame_idx": int(fi),
+                            "detect_mode": detect_mode,
+                            "lock_enabled": bool(court_detect_once),
+                            "edge_support": edge_support_i,
+                            "metrics": metrics_i,
+                            "candidate_score": float(score_i),
+                        }
+                        corners_i = lines.corners.tolist() if (lines is not None and lines.corners is not None) else None
+                        _maybe_update_best(score_i, conf_i, corners_i, meta_i, None)
+
+            _eval_candidates(sample_frame_indices)
+
+            # Single-frame mode fallback: if target frame is weak, scan more frames and pick the best.
+            if court_detect_once and detect_fallback_on_fail:
+                best_meta = best[3] if best is not None else None
+                if best_meta is None or not _candidate_good(best_meta):
+                    fallback_indices: List[int] = [0]
+                    fallback_indices.extend([int(i * detect_fallback_stride) for i in range(detect_fallback_samples)])
+                    swing = max(2, detect_fallback_samples // 4)
+                    for d in range(1, swing + 1):
+                        fallback_indices.append(int(court_detect_frame_idx - d * detect_fallback_stride))
+                        fallback_indices.append(int(court_detect_frame_idx + d * detect_fallback_stride))
+                    fallback_indices = _clip_unique_indices(fallback_indices)
+                    fallback_indices = [fi for fi in fallback_indices if fi not in checked_indices]
+                    if fallback_indices:
+                        fallback_used = True
+                        detect_mode = "single_frame_with_fallback"
+                        _eval_candidates(fallback_indices)
 
             if best is not None:
-                conf, corners_i, meta_i, fit = best
+                _score, conf, corners_i, meta_i, fit = best
+                meta_i = dict(meta_i)
+                meta_i["detect_mode"] = detect_mode
+                meta_i["lock_enabled"] = bool(court_detect_once)
+                meta_i["sample_frame_indices"] = [int(v) for v in checked_indices]
+                meta_i["sample_frame_count"] = int(len(checked_indices))
+                meta_i["fallback_used"] = bool(fallback_used)
                 if use_model_fit:
                     debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                     debug_path = vision_cfg.get("model_fit_debug_path", None)
@@ -416,7 +535,13 @@ def analyse_video(
             else:
                 # Auto detector rejected all candidates.
                 if best_fail is not None:
-                    _conf, _meta, fit = best_fail
+                    _score, _conf, _meta, fit = best_fail
+                    _meta = dict(_meta) if isinstance(_meta, dict) else {}
+                    _meta["detect_mode"] = detect_mode
+                    _meta["lock_enabled"] = bool(court_detect_once)
+                    _meta["sample_frame_indices"] = [int(v) for v in checked_indices]
+                    _meta["sample_frame_count"] = int(len(checked_indices))
+                    _meta["fallback_used"] = bool(fallback_used)
                     if use_model_fit:
                         debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                         debug_path = vision_cfg.get("model_fit_debug_path", None)
