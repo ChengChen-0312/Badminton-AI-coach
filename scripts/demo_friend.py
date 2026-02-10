@@ -96,6 +96,20 @@ def _summarize_for_console(summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _llm_description_from_summary(summary: Dict[str, Any]) -> str:
+    dist_raw = summary.get("hitter_distance")
+    dist_val: Optional[float] = None
+    dist_valid = False
+    if isinstance(dist_raw, (int, float)):
+        d = float(dist_raw)
+        # In current pipeline, 0.0 appears frequently as missing/invalid signal.
+        if np.isfinite(d) and d > 1.0:
+            dist_val = d
+            dist_valid = True
+
+    landing_region = summary.get("landing_region")
+    landing_predicted = bool(summary.get("landing_predicted"))
+    landing_is_out = str(landing_region).lower() == "out"
+
     def _fmt(key: str) -> str:
         v = summary.get(key)
         return f"{key}: {v}"
@@ -105,12 +119,14 @@ def _llm_description_from_summary(summary: Dict[str, Any]) -> str:
         _fmt("event_type"),
         _fmt("hitter_role"),
         _fmt("hitter_track_id"),
-        _fmt("hitter_distance"),
+        f"hitter_distance_px: {dist_val if dist_valid else 'unknown'}",
+        f"hitter_distance_valid: {str(dist_valid).lower()}",
         _fmt("landing_region"),
         _fmt("contact_region"),
         _fmt("contact_frame"),
         _fmt("landing_frame"),
-        _fmt("landing_predicted"),
+        f"landing_predicted: {str(landing_predicted).lower()}",
+        f"landing_is_out: {str(landing_is_out).lower()}",
     ]
     pose_features = summary.get("pose_features")
     if pose_features:
@@ -151,6 +167,65 @@ def _extract_json_dict(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
         except Exception:
             return None, t
     return None, t
+
+
+def _to_score_value(v: Any) -> Optional[float]:
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if not np.isfinite(x):
+        return None
+    return float(max(0.0, min(100.0, x)))
+
+
+def _extract_declared_score(parsed: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(parsed, dict):
+        return None
+    for k in ("score", "final_score", "overall_score"):
+        if k in parsed:
+            sv = _to_score_value(parsed.get(k))
+            if sv is not None:
+                return sv
+    return None
+
+
+def _extract_dim_scores(parsed: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    if not isinstance(parsed, dict):
+        return {}
+
+    score_keys = ("technique", "footwork", "timing", "decision", "outcome")
+    node = parsed.get("scores")
+    src: Dict[str, Any] = node if isinstance(node, dict) else parsed
+
+    out: Dict[str, float] = {}
+    for k in score_keys:
+        sv = _to_score_value(src.get(k))
+        if sv is not None:
+            out[k] = sv
+    return out
+
+
+def _compute_rubric_score(parsed: Optional[Dict[str, Any]]) -> Optional[float]:
+    dim_scores = _extract_dim_scores(parsed)
+    if len(dim_scores) < 3:
+        return None
+
+    weights = {
+        "technique": 0.30,
+        "footwork": 0.20,
+        "timing": 0.20,
+        "decision": 0.15,
+        "outcome": 0.15,
+    }
+    used = [k for k in weights.keys() if k in dim_scores]
+    if not used:
+        return None
+    w_sum = float(sum(weights[k] for k in used))
+    if w_sum <= 0.0:
+        return None
+    score = sum(dim_scores[k] * weights[k] for k in used) / w_sum
+    return float(max(0.0, min(100.0, round(score, 1))))
 
 
 def _read_video_frame_bgr(video_path: Path, frame_idx: int = 0) -> Optional[Any]:
@@ -306,7 +381,12 @@ def _llm_compare(
             "student_4b_lora_pose",
         ]
 
-    strokes = summaries[: max(0, int(max_strokes))]
+    max_strokes_i = int(max_strokes)
+    # 0 or negative means: score all strokes.
+    if max_strokes_i <= 0:
+        strokes = list(summaries)
+    else:
+        strokes = summaries[:max_strokes_i]
     llm_inputs = [{"stroke_index": i, "summary": s, "description": _llm_description_from_summary(s)} for i, s in enumerate(strokes)]
 
     def _variant_engine(v: str) -> Tuple[str, Optional[ActionFeedback]]:
@@ -383,15 +463,14 @@ def _llm_compare(
                 raw_out = engine.score_motion(inp["description"])
                 text_out = _to_text(raw_out)
                 parsed, raw_text = _extract_json_dict(text_out)
-                score = None
-                if isinstance(parsed, dict) and "score" in parsed:
-                    try:
-                        score = float(parsed["score"])
-                    except Exception:
-                        score = parsed.get("score")
+                declared_score = _extract_declared_score(parsed)
+                rubric_score = _compute_rubric_score(parsed)
+                score = rubric_score if rubric_score is not None else declared_score
                 results["strokes"][i]["outputs"][variant_name] = {
                     "raw": raw_text,
                     "parsed": parsed,
+                    "declared_score": declared_score,
+                    "rubric_score": rubric_score,
                     "score": score,
                 }
                 if score is not None:
@@ -417,6 +496,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="src/config/v3_realtime.yaml", help="YAML config path.")
     p.add_argument("--match-name", type=str, default="demo_friend", help="Report file prefix.")
     p.add_argument("--out-dir", type=str, default="reports/demo_friend", help="Output directory.")
+    p.add_argument(
+        "--court-detect-once",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help='Override single-shot court detection mode. "auto" uses config/default behavior.',
+    )
+    p.add_argument(
+        "--court-detect-frame-idx",
+        type=int,
+        default=None,
+        help="Frame index used for single-shot court detection lock.",
+    )
 
     p.add_argument("--no-heatmap", action="store_true", help="Disable heatmap image.")
     p.add_argument("--no-timeline", action="store_true", help="Disable timeline image.")
@@ -460,7 +551,12 @@ def parse_args() -> argparse.Namespace:
             "Built-ins: teacher_30b, student_4b_base, student_4b_lora_early, student_4b_lora_highcap, student_4b_lora_pose."
         ),
     )
-    p.add_argument("--llm-max-strokes", type=int, default=1, help="Limit number of strokes sent to LLM (speed).")
+    p.add_argument(
+        "--llm-max-strokes",
+        type=int,
+        default=0,
+        help="Limit number of strokes sent to LLM (speed). Use 0 to score all strokes.",
+    )
     p.add_argument(
         "--teacher-model-path",
         type=str,
@@ -531,6 +627,13 @@ def main() -> None:
     cfg["pose"] = pose_cfg
 
     vision_cfg = cfg.get("vision", {}) if isinstance(cfg.get("vision", {}), dict) else {}
+    if args.court_detect_once == "on":
+        vision_cfg["court_detect_once"] = True
+    elif args.court_detect_once == "off":
+        vision_cfg["court_detect_once"] = False
+    if args.court_detect_frame_idx is not None:
+        vision_cfg["court_detect_frame_idx"] = int(max(0, args.court_detect_frame_idx))
+    cfg["vision"] = vision_cfg
     player_model = vision_cfg.get("yolo_model", "yolov8n.pt")
     ball_model = vision_cfg.get("ball_model", "yolov8n.pt")
     player_model_path = _resolve_existing_path(str(player_model))
@@ -597,11 +700,23 @@ def main() -> None:
             confidence = None
             reason = None
             last_metrics = None
+            frame_idx = None
+            detect_mode = None
+            lock_enabled = None
+            sample_frame_indices = None
+            sample_frame_count = None
+            fallback_used = None
             if isinstance(det, dict):
                 source = det.get("source")
                 confidence = det.get("confidence")
                 reason = det.get("reason")
                 last_metrics = det.get("metrics")
+                frame_idx = det.get("frame_idx")
+                detect_mode = det.get("detect_mode")
+                lock_enabled = det.get("lock_enabled")
+                sample_frame_indices = det.get("sample_frame_indices")
+                sample_frame_count = det.get("sample_frame_count")
+                fallback_used = det.get("fallback_used")
             if source not in ("manual", "auto", "auto_failed"):
                 source = "auto" if corners is not None else "auto_failed"
             report_data["court_detection"] = {
@@ -609,6 +724,12 @@ def main() -> None:
                 "corners": corners,
                 "confidence": confidence,
                 "reason": reason,
+                "frame_idx": frame_idx,
+                "detect_mode": detect_mode,
+                "lock_enabled": lock_enabled,
+                "sample_frame_indices": sample_frame_indices,
+                "sample_frame_count": sample_frame_count,
+                "fallback_used": fallback_used,
                 "last_metrics": last_metrics,
             }
             report_path.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -677,7 +798,8 @@ def main() -> None:
 
     print(f"- Processed: {frames} frames in {t1 - t0:.2f}s -> FPS={fps:.2f}")
     if summary_dicts:
-        print("- Stroke Summary:")
+        print(f"- Stroke Summaries: {len(summary_dicts)}")
+        print("- First Stroke Summary:")
         print(json.dumps(_summarize_for_console(summary_dicts[0]), indent=2, ensure_ascii=False))
     else:
         print("- Stroke Summary: (none)")
