@@ -39,7 +39,12 @@ except Exception as _e:
 DEFAULT_DEMO_VIDEO = REPO_ROOT / "archive" / "demo.mp4"
 
 from src.pipeline.analyse_video import AnalyseResult, analyse_video
-from src.pipeline.extract_strokes import summarise_strokes_from_analysis, stroke_summaries_to_dicts
+from src.pipeline.extract_strokes import (
+    infer_segment_frame_ranges_from_analysis,
+    summarise_strokes_from_analysis,
+    stroke_summaries_to_dicts,
+)
+from src.pipeline.label_space import build_label_space_metadata
 from src.pipeline.report_generator import generate_match_report
 
 
@@ -348,6 +353,7 @@ def _llm_compare(
 ) -> Dict[str, Any]:
     try:
         from src.ai_score.action_feedback import ActionFeedback
+        from src.ai_score.scoring_engine import normalize_llm_score_output
     except Exception as exc:
         raise RuntimeError(
             "LLM dependencies not available. Install MLX stack (mlx-vlm/mlx) to enable --llm.\n"
@@ -462,17 +468,9 @@ def _llm_compare(
             for i, inp in enumerate(llm_inputs):
                 raw_out = engine.score_motion(inp["description"])
                 text_out = _to_text(raw_out)
-                parsed, raw_text = _extract_json_dict(text_out)
-                declared_score = _extract_declared_score(parsed)
-                rubric_score = _compute_rubric_score(parsed)
-                score = rubric_score if rubric_score is not None else declared_score
-                results["strokes"][i]["outputs"][variant_name] = {
-                    "raw": raw_text,
-                    "parsed": parsed,
-                    "declared_score": declared_score,
-                    "rubric_score": rubric_score,
-                    "score": score,
-                }
+                normalized = normalize_llm_score_output(text_out, inp["summary"])
+                score = normalized.get("score")
+                results["strokes"][i]["outputs"][variant_name] = normalized
                 if score is not None:
                     print(f"- stroke[{inp['stroke_index']}] score={score}")
         finally:
@@ -507,6 +505,48 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Frame index used for single-shot court detection lock.",
+    )
+    p.add_argument(
+        "--stroke-classifier",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help='Stroke classifier mode: "on" force enable, "off" disable, "auto" enable when checkpoint exists.',
+    )
+    p.add_argument(
+        "--stroke-classifier-checkpoint",
+        type=str,
+        default=os.environ.get("BADMINTON_STROKE_CKPT", "runs/v2_highcap_stable/best_model.pt"),
+        help="Path to stroke classifier checkpoint (best_model.pt).",
+    )
+    p.add_argument(
+        "--stroke-classifier-device",
+        type=str,
+        default=os.environ.get("BADMINTON_STROKE_DEVICE", "auto"),
+        help='Stroke classifier device: "auto" | "mps" | "cuda" | "cpu".',
+    )
+    p.add_argument(
+        "--stroke-classifier-topk",
+        type=int,
+        default=3,
+        help="Top-K class predictions stored into each stroke summary.",
+    )
+    p.add_argument(
+        "--stroke-classifier-frame-size",
+        type=int,
+        default=None,
+        help="Optional override for classifier input size.",
+    )
+    p.add_argument(
+        "--stroke-classifier-num-frames",
+        type=int,
+        default=None,
+        help="Optional override for classifier clip length.",
+    )
+    p.add_argument(
+        "--stroke-classifier-min-confidence",
+        type=float,
+        default=None,
+        help="If set, reject classifier labels below this confidence and fallback to spatial logic.",
     )
 
     p.add_argument("--no-heatmap", action="store_true", help="Disable heatmap image.")
@@ -588,6 +628,9 @@ def _maybe_open(path: Optional[str]) -> None:
 
 def main() -> None:
     args = parse_args()
+    out_dir = Path(args.out_dir)
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
 
     if args.video:
         video_path = _resolve_existing_path(args.video)
@@ -614,6 +657,7 @@ def main() -> None:
     if not cfg_path.exists():
         raise SystemExit(f"[ERROR] config not found: {args.config}")
     cfg = _load_yaml(str(cfg_path))
+    cfg["__config_dir__"] = str(cfg_path.parent)
 
     pose_cfg = cfg.get("pose", {}) if isinstance(cfg.get("pose", {}), dict) else {}
     if args.pose == "off":
@@ -633,7 +677,27 @@ def main() -> None:
         vision_cfg["court_detect_once"] = False
     if args.court_detect_frame_idx is not None:
         vision_cfg["court_detect_frame_idx"] = int(max(0, args.court_detect_frame_idx))
+    # Keep all court debug artifacts in this run's output folder to avoid cross-run overwrite.
+    vision_cfg["model_fit_debug_dir"] = str(out_dir)
+    vision_cfg.pop("model_fit_debug_path", None)
     cfg["vision"] = vision_cfg
+    classifier_cfg = cfg.get("classifier", {}) if isinstance(cfg.get("classifier", {}), dict) else {}
+    if args.stroke_classifier_min_confidence is not None:
+        classifier_min_confidence = float(max(0.0, args.stroke_classifier_min_confidence))
+    else:
+        classifier_min_confidence = float(classifier_cfg.get("min_confidence", 0.0) or 0.0)
+    expected_num_classes = classifier_cfg.get("expected_num_classes")
+    try:
+        expected_num_classes_i = int(expected_num_classes) if expected_num_classes is not None else None
+    except Exception:
+        expected_num_classes_i = None
+    expected_class_names = classifier_cfg.get("class_names")
+    label_space_meta = build_label_space_metadata(
+        None,
+        version_hint=classifier_cfg.get("label_space_version"),
+        expected_num_classes=expected_num_classes_i,
+        expected_class_names=expected_class_names,
+    )
     player_model = vision_cfg.get("yolo_model", "yolov8n.pt")
     ball_model = vision_cfg.get("ball_model", "yolov8n.pt")
     player_model_path = _resolve_existing_path(str(player_model))
@@ -657,9 +721,58 @@ def main() -> None:
     t1 = time.time()
 
     spatial_cfg = cfg.get("spatial_logic", {}) if isinstance(cfg.get("spatial_logic", {}), dict) else {}
+    classifier_labels = None
+    classifier_outputs = None
+    classifier_enabled = False
+    classifier_ckpt = _resolve_existing_path(args.stroke_classifier_checkpoint) if args.stroke_classifier_checkpoint else None
+    want_classifier = args.stroke_classifier == "on" or (
+        args.stroke_classifier == "auto" and classifier_ckpt is not None and classifier_ckpt.exists()
+    )
+    if args.stroke_classifier == "on" and (classifier_ckpt is None or not classifier_ckpt.exists()):
+        print(f"[WARN] stroke classifier forced on but checkpoint not found: {classifier_ckpt}")
+    if want_classifier and classifier_ckpt is not None and classifier_ckpt.exists():
+        try:
+            from src.pipeline.stroke_classifier_runtime import StrokeClassifierRuntime
+
+            classifier_runtime = StrokeClassifierRuntime.from_checkpoint(
+                checkpoint_path=classifier_ckpt,
+                device=args.stroke_classifier_device,
+                frame_size=args.stroke_classifier_frame_size,
+                num_frames=args.stroke_classifier_num_frames,
+                topk=max(1, int(args.stroke_classifier_topk)),
+            )
+            segment_ranges = infer_segment_frame_ranges_from_analysis(analysis)
+            classifier_outputs = classifier_runtime.predict_labels_for_segments_from_video(video_path, segment_ranges)
+            classifier_labels = [
+                str(item.get("label")) if isinstance(item, dict) and item.get("label") is not None else None
+                for item in classifier_outputs
+            ]
+            label_space_meta = build_label_space_metadata(
+                classifier_runtime.classes,
+                version_hint=classifier_cfg.get("label_space_version"),
+                expected_num_classes=expected_num_classes_i,
+                expected_class_names=expected_class_names,
+            )
+            if label_space_meta.get("mismatch"):
+                print(
+                    "[WARN] classifier label-space mismatch:",
+                    ",".join(label_space_meta.get("mismatch_reasons", [])),
+                )
+            classifier_enabled = True
+            print(
+                f"[CLS] enabled checkpoint={classifier_ckpt} segments={len(segment_ranges)} "
+                f"predictions={sum(1 for x in classifier_labels if x)}"
+            )
+        except Exception as exc:
+            print(f"[WARN] stroke classifier runtime failed, fallback to spatial-only labels: {exc}")
+            classifier_labels = None
+            classifier_outputs = None
+
     summaries = summarise_strokes_from_analysis(
         analysis,
-        classifier_labels=None,
+        classifier_labels=classifier_labels,
+        classifier_outputs=classifier_outputs,
+        classifier_min_confidence=float(max(0.0, classifier_min_confidence)),
         enable_hitter_inference=spatial_cfg.get("enable_hitter_inference", True),
         hitter_distance_max=float(spatial_cfg.get("hitter_distance_max", 200.0)),
         pose_window=int(pose_cfg.get("window", 3)) if isinstance(pose_cfg.get("window", 3), int) else 3,
@@ -667,9 +780,6 @@ def main() -> None:
     summary_dicts = stroke_summaries_to_dicts(summaries)
 
     viz_cfg = cfg.get("visualization", {}) if isinstance(cfg.get("visualization", {}), dict) else {}
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = REPO_ROOT / out_dir
     out = generate_match_report(
         args.match_name,
         summary_dicts,
@@ -732,6 +842,18 @@ def main() -> None:
                 "fallback_used": fallback_used,
                 "last_metrics": last_metrics,
             }
+            report_data["stroke_classifier"] = {
+                "enabled": bool(classifier_enabled),
+                "checkpoint": str(classifier_ckpt) if classifier_ckpt is not None else None,
+                "mode": args.stroke_classifier,
+                "device": args.stroke_classifier_device,
+                "topk": int(max(1, args.stroke_classifier_topk)),
+                "min_confidence": float(max(0.0, classifier_min_confidence)),
+                "label_space": label_space_meta,
+            }
+            report_data["label_space_version"] = label_space_meta.get("version")
+            if isinstance(getattr(analysis, "court_env", None), dict):
+                report_data["court_env"] = analysis.court_env
             report_path.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             print(f"[WARN] Failed to write court_detection into report JSON: {exc}")
@@ -797,6 +919,11 @@ def main() -> None:
     fps = frames / max(t1 - t0, 1e-6)
 
     print(f"- Processed: {frames} frames in {t1 - t0:.2f}s -> FPS={fps:.2f}")
+    if isinstance(getattr(analysis, "court_env", None), dict):
+        ce = analysis.court_env
+        print(
+            f"- Court Env: profile={ce.get('profile_path')} num_vars={ce.get('num_vars')}"
+        )
     if summary_dicts:
         print(f"- Stroke Summaries: {len(summary_dicts)}")
         print("- First Stroke Summary:")

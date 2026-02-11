@@ -15,6 +15,7 @@ from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.court_fit_homography import fit_court_homography
+from src.vision.court_env_profile import resolve_and_apply_court_env_overrides
 from src.vision.detectors import PlayerDetector
 from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
 
@@ -37,6 +38,7 @@ class AnalyseResult:
     court_detection: Optional[Dict[str, Any]] = None
     player_tracks: Optional[List[PlayerState]] = None
     pose_results: Optional[Dict[int, Dict]] = None
+    court_env: Optional[Dict[str, Any]] = None
 
 
 def analyse_video(
@@ -51,6 +53,11 @@ def analyse_video(
     tracking_cfg = cfg.get("tracking", {})
     realtime_cfg = cfg.get("realtime", {})
     pose_cfg = cfg.get("pose", {})
+
+    # Optional reproducible env profile for court-fitting knobs (BADC_*).
+    cfg_base_raw = cfg.get("__config_dir__")
+    cfg_base_dir = Path(str(cfg_base_raw)).expanduser() if isinstance(cfg_base_raw, str) and cfg_base_raw else None
+    court_env = resolve_and_apply_court_env_overrides(vision_cfg, base_dir=cfg_base_dir)
 
     detect_stride = tracking_cfg.get("detect_stride", 1)
     batch_size = realtime_cfg.get("batch_size", 1)
@@ -181,6 +188,12 @@ def analyse_video(
             detect_fallback_min_score = float(vision_cfg.get("court_detect_fallback_min_score", 120.0))
             detect_fallback_samples = max(2, detect_fallback_samples)
             detect_fallback_stride = max(1, detect_fallback_stride)
+            detect_temporal_refine = bool(vision_cfg.get("court_detect_temporal_refine", True))
+            detect_temporal_refine_topk = max(2, int(vision_cfg.get("court_detect_temporal_refine_topk", 5)))
+            detect_temporal_refine_drift_ref_px = float(
+                vision_cfg.get("court_detect_temporal_refine_drift_ref_px", 18.0)
+            )
+            detect_temporal_refine_weight = float(vision_cfg.get("court_detect_temporal_refine_weight", 30.0))
             sample_frame_indices = (
                 [max(0, int(court_detect_frame_idx))]
                 if court_detect_once
@@ -247,6 +260,7 @@ def analyse_video(
             best_fail = None  # (score, confidence, meta, fit)
             checked_indices: List[int] = []
             fallback_used = False
+            candidate_by_frame: Dict[int, Dict[str, Any]] = {}
 
             def _maybe_update_best(
                 score_i: float,
@@ -264,6 +278,29 @@ def analyse_video(
                     return
                 if best is None or score_i > float(best[0]) or (score_i == float(best[0]) and conf_i > float(best[1])):
                     best = (score_i, conf_i, corners_i, meta_i, fit_i)
+                fi = int(meta_i.get("frame_idx", -1))
+                if fi >= 0:
+                    prev = candidate_by_frame.get(fi)
+                    if prev is None or score_i > float(prev.get("score", -1e9)):
+                        candidate_by_frame[fi] = {
+                            "frame_idx": fi,
+                            "score": float(score_i),
+                            "confidence": float(conf_i),
+                            "corners": corners_i,
+                            "meta": dict(meta_i),
+                            "fit": fit_i,
+                        }
+
+            def _mean_corner_dist(c0: Any, c1: Any) -> Optional[float]:
+                try:
+                    a = np.asarray(c0, dtype=np.float32).reshape(4, 2)
+                    b = np.asarray(c1, dtype=np.float32).reshape(4, 2)
+                    d = np.linalg.norm(a - b, axis=1)
+                    if d.size == 0:
+                        return None
+                    return float(np.mean(d))
+                except Exception:
+                    return None
 
             def _eval_candidates(indices: List[int]) -> None:
                 for fi in indices:
@@ -367,6 +404,59 @@ def analyse_video(
                         detect_mode = "single_frame_with_fallback"
                         _eval_candidates(fallback_indices)
 
+            if best is not None and detect_temporal_refine and len(candidate_by_frame) > 1:
+                candidates = list(candidate_by_frame.values())
+                candidates = [c for c in candidates if c.get("corners") is not None]
+                if len(candidates) > 1:
+                    candidates.sort(
+                        key=lambda c: (float(c.get("score", -1e9)), float(c.get("confidence", 0.0))),
+                        reverse=True,
+                    )
+                    top = candidates[: int(max(2, detect_temporal_refine_topk))]
+                    best_refined = None
+                    for cand in top:
+                        dists: List[float] = []
+                        for peer in top:
+                            if int(peer.get("frame_idx", -1)) == int(cand.get("frame_idx", -2)):
+                                continue
+                            md = _mean_corner_dist(cand.get("corners"), peer.get("corners"))
+                            if md is not None:
+                                dists.append(float(md))
+                        mean_dist = float(np.mean(dists)) if dists else None
+                        consensus = (
+                            float(1.0 / (1.0 + mean_dist / max(1.0, detect_temporal_refine_drift_ref_px)))
+                            if mean_dist is not None
+                            else 0.0
+                        )
+                        refined_score = float(cand.get("score", -1e9)) + float(detect_temporal_refine_weight) * float(
+                            consensus
+                        )
+                        meta_c = dict(cand.get("meta", {}))
+                        meta_c["temporal_refine_enabled"] = True
+                        meta_c["temporal_refine_topk"] = int(len(top))
+                        meta_c["temporal_refine_consensus"] = float(consensus)
+                        meta_c["temporal_refine_mean_corner_dist_px"] = mean_dist
+                        meta_c["temporal_refine_refined_score"] = float(refined_score)
+                        cand["meta"] = meta_c
+                        cand["refined_score"] = refined_score
+                        if best_refined is None:
+                            best_refined = cand
+                        else:
+                            if refined_score > float(best_refined.get("refined_score", -1e9)):
+                                best_refined = cand
+                            elif refined_score == float(best_refined.get("refined_score", -1e9)) and float(
+                                cand.get("confidence", 0.0)
+                            ) > float(best_refined.get("confidence", 0.0)):
+                                best_refined = cand
+                    if best_refined is not None:
+                        best = (
+                            float(best_refined.get("score", -1e9)),
+                            float(best_refined.get("confidence", 0.0)),
+                            best_refined.get("corners"),
+                            dict(best_refined.get("meta", {})),
+                            best_refined.get("fit"),
+                        )
+
             if best is not None:
                 _score, conf, corners_i, meta_i, fit = best
                 meta_i = dict(meta_i)
@@ -375,6 +465,7 @@ def analyse_video(
                 meta_i["sample_frame_indices"] = [int(v) for v in checked_indices]
                 meta_i["sample_frame_count"] = int(len(checked_indices))
                 meta_i["fallback_used"] = bool(fallback_used)
+                meta_i.setdefault("temporal_refine_enabled", bool(detect_temporal_refine))
                 if use_model_fit:
                     debug_dir = vision_cfg.get("model_fit_debug_dir", None)
                     debug_path = vision_cfg.get("model_fit_debug_path", None)
@@ -993,4 +1084,5 @@ def analyse_video(
         court_detection=court_detection,
         player_tracks=None,
         pose_results=pose_results if enable_pose else None,
+        court_env=court_env,
     )

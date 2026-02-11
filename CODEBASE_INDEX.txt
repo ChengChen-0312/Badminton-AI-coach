@@ -1337,3 +1337,128 @@ Key classes / functions: (list)
 Called by: `src/pipeline/analyse_video.analyse_video`; `scripts/debug_court_candidates.py`
 Calls: `src.vision.court_detector.CourtDetector` (mask helper); `src.vision.court_detector.CourtLines`; `src.geometry.homography` (court dimensions); `cv2`, `numpy`
 Notes: Produces multiple quad candidates from 2 horizontal + 2 vertical line combinations; uses quick reject (convex/area/aspect), edge support thresholding, and template F1 (`tpl_f1`) to rank; selects nearest court via `near_score` (larger quad + lower near-baseline y + higher support + higher tpl). Exposes `last_confidence/last_reason/last_method/last_edge_support/last_metrics`; `last_metrics` includes `tpl_f1`, `model_error`, `near_score`, `near_baseline_y`, `num_candidates`, `chosen_idx`, `candidate_lines`, and `candidates_topk` (for optional debug overlays). Failure reasons include: `invalid_frame`, `frame_too_small`, `not_enough_line_pixels`, `not_enough_lines`, `no_valid_candidate`, `low_confidence`.
+
+CHECKPOINT P3 (2026-02-10) SYNC: dual-mode launcher + live camera lock + court-fit robustness
+
+[File: scripts/app_launcher.py]
+Role: Desktop GUI launcher for two workflows: offline video evaluation and live camera realtime mode.
+Category: CLI / entry point (desktop GUI)
+Key classes / functions: (list)
+- `ProcessController`
+- `App`
+- `run_video_mode`
+- `run_camera_mode`
+- `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input (Video tab): video path, config path, output dir, match name, pose mode, one-shot court detect mode/frame index, LLM toggle.
+- Input (Camera tab): camera index, config path, output dir, optional reused court report JSON, lock attempts/step/seconds, lock-only flag.
+- Output: launches subprocesses for `scripts/demo_friend.py` / `scripts/demo_live_camera.py` and streams runtime logs in GUI.
+Called by: user (desktop app / shell)
+Calls: `scripts/demo_friend.py`, `scripts/demo_live_camera.py`, `tkinter`, `subprocess`
+Notes: UI labels switched to English; status/logging + stop/kill workflow included.
+
+[File: scripts/demo_live_camera.py]
+Role: Live camera pipeline: lock court once, then keep court fixed while running realtime player/ball tracking and stroke extraction.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `_load_corners_from_report`
+- `_try_lock_court_once`
+- `_compute_court_roi`
+- `_roles_for_tracks`
+- `parse_args`
+- `main`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: camera stream + YAML config; optional `--court-corners-report` for direct corner reuse.
+- Output: live overlay window + JSON report `*_live_report.json` with `court_detection`, stroke list, and latest stroke.
+Called by: user (shell), `scripts/app_launcher.py`
+Calls: `src/vision/court_fit_homography.fit_court_homography`, `src/vision/court_detector.CourtDetector`, `src/tracking/*`, `src/pipeline/extract_strokes.summarise_strokes_from_analysis`
+Notes: Supports `--lock-only` mode to only lock court and write report; supports `r` key for relock in-session; optional ROI crop derived from locked corners.
+
+[File: scripts/demo_friend.py]
+Role: Main video demo runner for report generation + optional LLM scoring comparison.
+Category: CLI / entry point
+Key classes / functions: (list)
+- `parse_args`
+- `main`
+- `_llm_compare`
+- `_draw_court_debug`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: video/config/match/out-dir; optional `--court-detect-once`, `--court-detect-frame-idx`, `--pose`, `--no-llm`.
+- Output: report files (MD/JSON/CSV + heatmap/timeline) and court debug image.
+Called by: user (shell), `scripts/app_launcher.py`
+Calls: `src/pipeline/analyse_video.analyse_video`, `src/pipeline/extract_strokes`, `src/pipeline/report_generator`, `src/ai_score/action_feedback`
+Notes: Writes `court_detection` metadata into report JSON (`source/corners/confidence/reason/frame_idx/detect_mode/lock_enabled/sample_frame_indices/sample_frame_count/fallback_used/last_metrics`); LLM scoring supports all-strokes mode (`--llm-max-strokes 0`) and weighted rubric fallback.
+
+[File: src/pipeline/analyse_video.py]
+Role: End-to-end video analysis orchestration with configurable court-lock behavior.
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `FrameResult`, `AnalyseResult`, `analyse_video`
+- `_filter_player_detections_to_court`
+- `_roles_for_tracks`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: video frames + config sections (`vision/tracking/realtime/pose/device`).
+- Output: `AnalyseResult` with `frame_results`, `court_corners`, `court_detection`, optional `pose_results`.
+Called by: `scripts/demo_friend.py`, `scripts/demo_live_camera.py` (imports `FrameResult`), distill/report scripts.
+Calls: `src/vision/court_fit_homography.fit_court_homography`, `src/vision/court_detector.CourtDetector`, detectors/trackers/pose modules.
+Notes: Supports one-shot court detection (`vision.court_detect_once`, `vision.court_detect_frame_idx`) and fallback scan (`vision.court_detect_fallback_on_fail`, `*_samples`, `*_stride`, `*_min_conf`, `*_min_score`); emits richer court metadata fields used by downstream debug/report logic.
+
+[File: src/pipeline/extract_strokes.py]
+Role: Stroke summarization from frame-level tracking with multi-stroke segmentation.
+Category: orchestration / pipeline
+Key classes / functions: (list)
+- `StrokeSummary`
+- `summarise_strokes_from_analysis`
+- `_cluster_contact_candidates`
+- `_find_nearest_pose`
+- `stroke_summaries_to_dicts`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: `AnalyseResult` + optional classifier labels.
+- Output: list of `StrokeSummary` (now can output multiple strokes, not only one fallback summary).
+Called by: `scripts/demo_friend.py`, `scripts/demo_live_camera.py`, distill pipelines.
+Calls: `src/spatial_logic/landing_detector`, `src/spatial_logic/events`, `src/spatial_logic/hitter_detector`, `src/spatial_logic/stroke_reasoner`, `src/spatial_logic/pose_features`.
+Notes: Multi-stroke path is based on clustered contact candidates and segment slicing (`contact_distance_px`, `min_contact_separation_frames`, `min_segment_frames`, `min_segment_points`); preserves legacy single-stroke fallback if segmentation yields none.
+
+[File: src/ai_score/rubric.py]
+Role: Unified English rubric prompt for LLM motion scoring.
+Category: utility / helper
+Key classes / functions: (list)
+- `build_prompt`
+Inputs/Outputs: (what data structs flow in/out)
+- Input: structured motion description text.
+- Output: strict JSON-only scoring prompt with 5 dimensions + weighted final score rule.
+Called by: `src/ai_score/action_feedback.py`
+Calls: (none internal)
+Notes: Dimensions and weights are explicit (`technique/footwork/timing/decision/outcome` = `0.30/0.20/0.20/0.15/0.15`); includes data-quality guardrails for missing hitter distance and predicted landing.
+
+[File: src/vision/court_fit_homography.py]
+Role: Main court fitting core (line extraction, A/B orientation split, candidate quad scoring, homography output).
+Category: core logic
+Key classes / functions: (list)
+- `fit_court_homography`
+- `_filter_segments_minlen_with_boundary_rescue`
+- right-strip rescue + structure-ratio verification helper path (internal)
+Inputs/Outputs: (what data structs flow in/out)
+- Input: frame BGR + many env-tuned thresholds.
+- Output: fitted corners + confidence/reason + extensive debug metrics/images.
+Called by: `src/pipeline/analyse_video.py`, `scripts/demo_live_camera.py`
+Calls: OpenCV + numpy + internal geometry utilities.
+Notes: Recent robustness updates include: right-strip rescue path (`BADC_RANSAC_RIGHT_RESCUE*`), stronger orientation-family assignment fallback (`BADC_ORI_FORCE_NEAREST_MAX_ADD`, `BADC_ORI_FORCE_NEAREST_MINLEN_FRAC`), and optional post-fit structural ratio verification/refinement (`BADC_COURT_RATIO_VERIFY*`).
+
+[File: README_PATCH_NOTES.txt]
+Role: Human-readable patch/change log for recent debugging and behavior adjustments.
+Category: documentation
+Key classes / functions: N/A
+Called by: user (manual reference)
+Calls: N/A
+Notes: Companion notes for recent court-fit and pipeline behavior changes.
+
+[File: src/vision/历史court_fit_homography_副本2.zip]
+Role: Historical backup archive of court-fit implementation snapshots.
+Category: backup / artifact
+Key classes / functions: N/A
+Called by: N/A
+Calls: N/A
+Notes: Versioned safety backup, not part of runtime imports.
+
+CHECKPOINT P3 DONE: synced dual-mode launcher + live camera + court-fit/report metadata updates.

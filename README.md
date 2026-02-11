@@ -9,10 +9,14 @@ End-to-end badminton analytics and coaching system. Includes stroke classificati
 - `src/geometry` **(finished)**: homography, coordinate mapping, region definitions, metrics.
 - `src/spatial_logic` **(finished)**: relations, events (velocity-drop hit detector), temporal smoothing/segment slicing, stroke_reasoner (zone→stroke heuristic).
 - `src/pipeline` **(finished)**: unified analysis (ball traj + reasoning), stroke extraction, overlay rendering (players/ball), report generator (JSON).
+- `src/server`: local HTTP API for iOS/web integration (`/v1/analysis/jobs`).
 - `scripts` **(finished)**: training/eval plus `analyse_match.py`, `export_court_map.py`, `test_realtime_fps.py` (FPS benchmark for realtime pipeline).
+- `ios/BadmintonAICoach`: SwiftUI iOS MVP project scaffold (`.swift` + `.xcodeproj`).
 - `archive/`: dataset (folder-per-class videos, untouched).
 
 ## Stroke Classification (V2 / V2.1)
+- Production label space in this repo is currently **6 classes** (`stroke_6class_v1`), not 18.
+- 18-class support remains a future milestone and requires additional labeled data.
 - Dataset auto-discovers classes; supports sampling modes (uniform/rand_uniform/strided) and court-focus cropping (`full`/`far`/`near`).
 - Augmentations: mild/strong; channel-last for MPS; ImageNet normalization.
 - Models: resnet18/50 (2D + temporal pool), mc3_18, r3d_18, r3d_34, optional x3d_s/m (requires newer torchvision; falls back to r3d_34), slowfast fallback handled.
@@ -72,6 +76,12 @@ python scripts/debug_court_candidates.py \
   --topk 5
 ```
 
+Optional reproducible court-fit tuning (instead of manual `export BADC_*` each run):
+```yaml
+vision:
+  court_env_file: "src/config/court_env_profiles/hough_orient_stable.env"
+```
+
 ### v3.3 – Landing detection + spatial logic
 - `src/spatial_logic/landing_detector.py`: landing estimation from smoothed ball tracks with optional homography + region classification.
 - `src/geometry/homography.py`, `src/geometry/region_definitions.py`: map image coords to court meters and classify front/mid/back.
@@ -96,6 +106,34 @@ python scripts/train_strokes_v2.py --config src/config/default.yaml
 python scripts/train_strokes_v2.py --config src/config/v2_highcap.yaml
 # evaluate
 python -m src.training.eval --config src/config/default.yaml --checkpoint runs/stroke_baseline/best_model.pt
+```
+
+## iOS + API MVP
+```bash
+# start local API server (desktop testing)
+python scripts/run_analysis_api.py --host 127.0.0.1 --port 8765
+```
+
+- iOS project path: `ios/BadmintonAICoach/BadmintonAICoach.xcodeproj`
+- API endpoints:
+1. `POST /v1/analysis/jobs`
+2. `GET /v1/analysis/jobs/{job_id}`
+3. `GET /v1/analysis/jobs/{job_id}/report`
+- Local file input supported by API request:
+1. `video_path: "/absolute/or/relative/path.mp4"`
+2. `video_url: "file:///absolute/path.mp4"`
+
+## Engineering Gates
+- Playbook: `docs/engineering_playbook.md`
+- Local gate:
+```bash
+python scripts/run_regression_suite.py --report tests/assets/sample_report.json
+
+# optional court benchmark with fixed env profile
+python scripts/benchmark_court_lock.py \
+  --batch-gt archive/gt_corners_batch.json \
+  --method hough_orient \
+  --env-file src/config/court_env_profiles/hough_orient_stable.env
 ```
 
 ## MLX Teacher/Student Distillation (Cleaned)

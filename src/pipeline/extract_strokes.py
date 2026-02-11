@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from src.geometry.homography import CourtHomography
 from src.geometry.region_definitions import DEFAULT_GRID9
 from src.spatial_logic.events import infer_event_from_trajectory
@@ -31,6 +33,9 @@ class StrokeSummary:
     landing_predicted: bool = False
     contact_region: Optional[str] = None
     classifier_label: Optional[str] = None
+    classifier_confidence: Optional[float] = None
+    classifier_topk: Optional[List[Dict[str, float]]] = None
+    classifier_rejected_low_conf: bool = False
     event_type: Optional[str] = None
     hitter_track_id: Optional[int] = None
     hitter_distance: Optional[float] = None
@@ -119,9 +124,147 @@ def _find_nearest_pose(pose_results: Dict[int, Dict], contact_frame: int, window
     return best
 
 
+def _build_segment_bounds(
+    track: List[BallState],
+    players_by_frame: Dict[int, List[PlayerState]],
+    contact_distance_px: float,
+    min_contact_separation_frames: int,
+    min_segment_frames: int,
+    min_segment_points: int,
+) -> List[Tuple[int, int, bool]]:
+    # Build contact candidates where shuttle is close to a player.
+    contact_candidates: List[Tuple[int, float, float, float]] = []
+    for b in track:
+        fi = int(b.frame_idx)
+        players = players_by_frame.get(fi, [])
+        if not players:
+            continue
+        d = _nearest_player_distance(players, float(b.x), float(b.y))
+        if d is None or d > float(contact_distance_px):
+            continue
+        contact_candidates.append((fi, float(d), float(b.x), float(b.y)))
+    contacts = _cluster_contact_candidates(contact_candidates, int(min_contact_separation_frames))
+
+    last_track_frame = int(track[-1].frame_idx)
+    segment_bounds: List[Tuple[int, int, bool]] = []
+    if len(contacts) >= 2:
+        for i in range(len(contacts) - 1):
+            sf = int(contacts[i][0])
+            ef = int(contacts[i + 1][0])
+            if ef - sf >= int(min_segment_frames):
+                # Intermediate segments end at next contact; not a true physical landing.
+                segment_bounds.append((sf, ef, True))
+        # Tail segment: last contact to last tracked frame.
+        tail_s = int(contacts[-1][0])
+        if last_track_frame - tail_s >= int(min_segment_frames):
+            segment_bounds.append((tail_s, last_track_frame, False))
+    elif len(contacts) == 1:
+        sf = int(contacts[0][0])
+        if last_track_frame - sf >= int(min_segment_frames):
+            segment_bounds.append((sf, last_track_frame, False))
+
+    # Ensure each segment has enough observed points.
+    out: List[Tuple[int, int, bool]] = []
+    for start_f, end_f, forced_predicted in segment_bounds:
+        seg_points = [b for b in track if start_f <= int(b.frame_idx) <= end_f]
+        if len(seg_points) < int(min_segment_points):
+            continue
+        out.append((start_f, end_f, forced_predicted))
+    return out
+
+
+def _parse_classifier_output(
+    classifier_outputs: Optional[Sequence[Dict[str, Any]]],
+    seg_idx: int,
+) -> Tuple[Optional[str], Optional[float], Optional[List[Dict[str, float]]]]:
+    if not classifier_outputs or seg_idx < 0 or seg_idx >= len(classifier_outputs):
+        return None, None, None
+    item = classifier_outputs[seg_idx]
+    if not isinstance(item, dict):
+        return None, None, None
+
+    label_raw = item.get("label")
+    label = str(label_raw).strip() if isinstance(label_raw, str) and str(label_raw).strip() else None
+
+    conf = None
+    conf_raw = item.get("confidence")
+    try:
+        if conf_raw is not None:
+            c = float(conf_raw)
+            if np.isfinite(c):
+                conf = float(max(0.0, min(1.0, c)))
+    except Exception:
+        conf = None
+
+    topk: Optional[List[Dict[str, float]]] = None
+    topk_raw = item.get("topk")
+    if isinstance(topk_raw, list):
+        norm: List[Dict[str, float]] = []
+        for tk in topk_raw:
+            if not isinstance(tk, dict):
+                continue
+            tk_label = tk.get("label")
+            tk_conf = tk.get("confidence")
+            if not isinstance(tk_label, str):
+                continue
+            try:
+                c = float(tk_conf)
+            except Exception:
+                continue
+            if not np.isfinite(c):
+                continue
+            norm.append({"label": str(tk_label), "confidence": float(max(0.0, min(1.0, c)))})
+        if norm:
+            topk = norm
+            if label is None:
+                label = norm[0]["label"]
+            if conf is None:
+                conf = norm[0]["confidence"]
+    return label, conf, topk
+
+
+def infer_segment_frame_ranges_from_analysis(
+    analysis_result: Any,
+    contact_distance_px: float = 110.0,
+    min_contact_separation_frames: int = 12,
+    min_segment_frames: int = 6,
+    min_segment_points: int = 3,
+) -> List[Tuple[int, int]]:
+    """Expose segment frame ranges so classifier inference can align with stroke summaries."""
+    frame_results = getattr(analysis_result, "frame_results", None)
+    if frame_results is None and isinstance(analysis_result, dict):
+        frame_results = analysis_result.get("frame_results")
+    if not frame_results:
+        return []
+
+    raw_track: List[BallState] = extract_ball_track(frame_results)
+    track: List[BallState] = sorted(raw_track, key=lambda b: int(b.frame_idx))
+    if not track:
+        return []
+
+    players_by_frame: Dict[int, List[PlayerState]] = {}
+    for fr in frame_results:
+        fi = _frame_idx_of(fr)
+        if fi is None:
+            continue
+        players_by_frame[int(fi)] = _player_states_of(fr)
+
+    bounds = _build_segment_bounds(
+        track=track,
+        players_by_frame=players_by_frame,
+        contact_distance_px=contact_distance_px,
+        min_contact_separation_frames=min_contact_separation_frames,
+        min_segment_frames=min_segment_frames,
+        min_segment_points=min_segment_points,
+    )
+    return [(int(s), int(e)) for s, e, _ in bounds]
+
+
 def summarise_strokes_from_analysis(
     analysis_result: Any,
     classifier_labels: Optional[Sequence[str]] = None,
+    classifier_outputs: Optional[Sequence[Dict[str, Any]]] = None,
+    classifier_min_confidence: float = 0.0,
     hitter_distance_max: float = 200.0,
     enable_hitter_inference: bool = True,
     pose_window: int = 3,
@@ -167,45 +310,19 @@ def summarise_strokes_from_analysis(
     elif isinstance(analysis_result, dict):
         pose_results = analysis_result.get("pose_results")
 
-    # Build contact candidates where shuttle is close to a player.
-    contact_candidates: List[Tuple[int, float, float, float]] = []
-    for b in track:
-        fi = int(b.frame_idx)
-        players = players_by_frame.get(fi, [])
-        if not players:
-            continue
-        d = _nearest_player_distance(players, float(b.x), float(b.y))
-        if d is None or d > float(contact_distance_px):
-            continue
-        contact_candidates.append((fi, float(d), float(b.x), float(b.y)))
-    contacts = _cluster_contact_candidates(contact_candidates, int(min_contact_separation_frames))
-
     ball_by_frame = {int(b.frame_idx): b for b in track}
     summaries: List[StrokeSummary] = []
-    last_track_frame = int(track[-1].frame_idx)
-
-    # Build segment boundaries from consecutive contacts.
-    segment_bounds: List[Tuple[int, int, bool]] = []
-    if len(contacts) >= 2:
-        for i in range(len(contacts) - 1):
-            sf = int(contacts[i][0])
-            ef = int(contacts[i + 1][0])
-            if ef - sf >= int(min_segment_frames):
-                # Intermediate segments end at next contact; not a true physical landing.
-                segment_bounds.append((sf, ef, True))
-        # Tail segment: last contact to last tracked frame.
-        tail_s = int(contacts[-1][0])
-        if last_track_frame - tail_s >= int(min_segment_frames):
-            segment_bounds.append((tail_s, last_track_frame, False))
-    elif len(contacts) == 1:
-        sf = int(contacts[0][0])
-        if last_track_frame - sf >= int(min_segment_frames):
-            segment_bounds.append((sf, last_track_frame, False))
+    segment_bounds = _build_segment_bounds(
+        track=track,
+        players_by_frame=players_by_frame,
+        contact_distance_px=contact_distance_px,
+        min_contact_separation_frames=min_contact_separation_frames,
+        min_segment_frames=min_segment_frames,
+        min_segment_points=min_segment_points,
+    )
 
     for seg_idx, (start_f, end_f, forced_predicted) in enumerate(segment_bounds):
         seg_track = [b for b in track if start_f <= int(b.frame_idx) <= end_f]
-        if len(seg_track) < int(min_segment_points):
-            continue
 
         contact_state = ball_by_frame.get(start_f, seg_track[0])
         landing_state = seg_track[-1]
@@ -260,8 +377,16 @@ def summarise_strokes_from_analysis(
         hitter_role_seed = hitter_info.hitter_role if hitter_info is not None else "far"
         event = infer_event_from_trajectory(seg_track, landing, hitter_role=hitter_role_seed)
 
-        clf_label = None
-        if classifier_labels:
+        clf_label, clf_confidence, clf_topk = _parse_classifier_output(classifier_outputs, seg_idx)
+        low_conf_rejected = False
+        if (
+            clf_label is not None
+            and clf_confidence is not None
+            and float(clf_confidence) < float(max(0.0, classifier_min_confidence))
+        ):
+            low_conf_rejected = True
+            clf_label = None
+        if clf_label is None and (not low_conf_rejected) and classifier_labels:
             if len(classifier_labels) == 1:
                 clf_label = classifier_labels[0]
             elif seg_idx < len(classifier_labels):
@@ -299,6 +424,9 @@ def summarise_strokes_from_analysis(
                 landing_predicted=bool(landing.predicted),
                 contact_region=landing.contact_region,
                 classifier_label=final.classifier_label,
+                classifier_confidence=clf_confidence,
+                classifier_topk=clf_topk,
+                classifier_rejected_low_conf=bool(low_conf_rejected),
                 event_type=final.event_type,
                 hitter_track_id=hitter_info.hitter_track_id if hitter_info else None,
                 hitter_distance=hitter_info.distance if hitter_info else None,
@@ -315,7 +443,17 @@ def summarise_strokes_from_analysis(
     if landing is None:
         return []
     event = infer_event_from_trajectory(track, landing, hitter_role="far")
-    clf_label = classifier_labels[0] if classifier_labels else None
+    clf_label, clf_confidence, clf_topk = _parse_classifier_output(classifier_outputs, 0)
+    low_conf_rejected = False
+    if (
+        clf_label is not None
+        and clf_confidence is not None
+        and float(clf_confidence) < float(max(0.0, classifier_min_confidence))
+    ):
+        low_conf_rejected = True
+        clf_label = None
+    if clf_label is None and (not low_conf_rejected) and classifier_labels:
+        clf_label = classifier_labels[0]
     final = combine_classifier_and_event(clf_label, event)
     return [
         StrokeSummary(
@@ -333,6 +471,9 @@ def summarise_strokes_from_analysis(
             landing_predicted=landing.predicted,
             contact_region=landing.contact_region,
             classifier_label=final.classifier_label,
+            classifier_confidence=clf_confidence,
+            classifier_topk=clf_topk,
+            classifier_rejected_low_conf=bool(low_conf_rejected),
             event_type=final.event_type,
         )
     ]

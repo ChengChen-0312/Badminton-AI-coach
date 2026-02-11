@@ -117,14 +117,51 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _apply_legacy_env_aliases() -> None:
+    """
+    Backward-compatible env aliases for historical tuning scripts.
+    If the new key is already provided, keep it as the source of truth.
+    """
+    alias_pairs = {
+        "BADC_ADV_POSTBLOB": "BADC_FORCE_LINEPIX_POSTBLOB",
+        "BADC_RANSAC_MAX_LINES": "BADC_RAW_FLOOR_RANSAC_MAX_LINES",
+        "BADC_RANSAC_MIN_INLIERS": "BADC_RAW_FLOOR_RANSAC_MIN_INLIERS",
+        "BADC_RANSAC_MIN_LENGTH_RATIO": "BADC_RAW_FLOOR_RANSAC_MINLEN_RT",
+        "BADC_RANSAC_DISABLE_FLOOR_GATE": "BADC_DISABLE_FLOOR_GATE",
+        "BADC_ORI_USE_PEAK_CENTERS": "BADC_RAW_FLOOR_ANGLE_RESPLIT",
+        "BADC_ORI_PEAK_RESPLIT": "BADC_RAW_FLOOR_ANGLE_RESPLIT",
+        "BADC_RANSAC_RIGHT_MAX_LINES": "BADC_RANSAC_RIGHT_RESCUE_MAX_LINES",
+        "BADC_RANSAC_RIGHT_MIN_LENGTH_RATIO": "BADC_RANSAC_RIGHT_RESCUE_MIN_LENGTH_RATIO",
+        # Legacy right-rescue controls mapped to closest modern debug-rescue knobs.
+        "BADC_RANSAC_RIGHT_RESCUE_MARGIN_PX": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_PAD_PX",
+        "BADC_RANSAC_RIGHT_ITERS": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SCAN_SAMPLES",
+        "BADC_RANSAC_RIGHT_INLIER_THR": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_THR",
+        "BADC_RANSAC_RIGHT_MIN_INLIERS": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_MIN_RUN",
+        "BADC_RANSAC_RIGHT_RESCUE_INLIER_THR": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_SUPPORT_THR",
+        "BADC_RANSAC_RIGHT_RESCUE_MIN_INLIERS": "BADC_RANSAC_DEBUG_RIGHT_RESCUE_BASELINE_MIN_RUN",
+        "BADC_ORI_EXTREME_MAX_ANGLE_DEG": "BADC_ORI_BOUNDARY_FALLBACK_MAX_ANGLE_DEG",
+    }
+    for legacy_key, new_key in alias_pairs.items():
+        if new_key in os.environ:
+            continue
+        legacy_val = os.environ.get(legacy_key)
+        if legacy_val is None:
+            continue
+        os.environ[new_key] = legacy_val
+
+
+_apply_legacy_env_aliases()
+
+
 def _model_role_weight_params() -> Dict[str, float]:
     return {
-        "baseline": float(_env_float("BADC_MODEL_W_BASELINE", 1.0)),
-        "sideline_d": float(_env_float("BADC_MODEL_W_SIDELINE_D", 1.0)),
-        "service_short": float(_env_float("BADC_MODEL_W_SERVICE_SHORT", 1.0)),
-        "service_long": float(_env_float("BADC_MODEL_W_SERVICE_LONG", 1.0)),
-        "sideline_s": float(_env_float("BADC_MODEL_W_SIDELINE_S", 1.0)),
-        "center": float(_env_float("BADC_MODEL_W_CENTER", 1.0)),
+        # Defaults prefer outer-frame semantics (baseline/doubles sidelines) for robustness.
+        "baseline": float(_env_float("BADC_MODEL_W_BASELINE", 1.30)),
+        "sideline_d": float(_env_float("BADC_MODEL_W_SIDELINE_D", 1.25)),
+        "service_short": float(_env_float("BADC_MODEL_W_SERVICE_SHORT", 0.70)),
+        "service_long": float(_env_float("BADC_MODEL_W_SERVICE_LONG", 0.80)),
+        "sideline_s": float(_env_float("BADC_MODEL_W_SIDELINE_S", 0.75)),
+        "center": float(_env_float("BADC_MODEL_W_CENTER", 0.55)),
     }
 
 
@@ -386,6 +423,586 @@ def _quad_span_ok(
     return ok, {"quad_bbox_w": bbox_w, "quad_bbox_h": bbox_h, "quad_min_edge": min_edge}
 
 
+def _bottom_span_floor_ratio(
+    pts_xy: np.ndarray,
+    floor_bbox: Sequence[int],
+) -> float:
+    pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
+    lb = pts[0]
+    rb = pts[1]
+    span = float(np.linalg.norm(rb - lb))
+    floor_w = float(max(1.0, float(floor_bbox[2]) - float(floor_bbox[0])))
+    return float(span / floor_w)
+
+
+def _top_edge_floor_ratio(
+    pts_xy: np.ndarray,
+    floor_bbox: Sequence[int],
+) -> float:
+    pts = np.array(pts_xy, dtype=np.float32).reshape(4, 2)
+    lt = pts[3]
+    rt = pts[2]
+    y_top = float(0.5 * (lt[1] + rt[1]))
+    floor_y0 = float(floor_bbox[1])
+    floor_h = float(max(1.0, float(floor_bbox[3]) - float(floor_bbox[1])))
+    return float((y_top - floor_y0) / floor_h)
+
+
+def _find_peaks_1d(
+    values: np.ndarray,
+    *,
+    min_sep: int,
+    min_value: float,
+    topk: int,
+) -> list[int]:
+    vals = np.asarray(values, dtype=np.float32).reshape(-1)
+    if vals.size == 0:
+        return []
+    order = np.argsort(vals)[::-1]
+    peaks: list[int] = []
+    for idx in order:
+        i = int(idx)
+        v = float(vals[i])
+        if v < float(min_value):
+            break
+        if all(abs(i - j) >= int(min_sep) for j in peaks):
+            peaks.append(i)
+            if len(peaks) >= int(topk):
+                break
+    return peaks
+
+
+def _semantic_line_support_in_warp(
+    warp_mask: np.ndarray,
+    ppm: float,
+) -> Dict[str, Any]:
+    if warp_mask is None or warp_mask.size == 0:
+        return {
+            "valid": False,
+            "score": -1e9,
+            "near_pair_found": False,
+            "near_pair_gap_m": None,
+            "near_pair_gap_err_m": None,
+            "near_pair_soft_fallback": False,
+            "far_pair_found": False,
+            "far_pair_gap_m": None,
+            "far_pair_gap_err_m": None,
+            "near_observable": False,
+            "near_peak": 0.0,
+            "far_observable": False,
+            "far_peak": 0.0,
+            "near_lower_stronger": False,
+            "near_lower_stronger_margin": 0.0,
+            "support_near_baseline": 0.0,
+            "support_near_dls": 0.0,
+            "support_far_baseline": 0.0,
+            "support_far_dls": 0.0,
+        }
+    mask = (np.asarray(warp_mask) > 0).astype(np.uint8)
+    hh, ww = mask.shape[:2]
+    if hh < 8 or ww < 8:
+        return {
+            "valid": False,
+            "score": -1e9,
+            "near_pair_found": False,
+            "near_pair_gap_m": None,
+            "near_pair_gap_err_m": None,
+            "near_pair_soft_fallback": False,
+            "far_pair_found": False,
+            "far_pair_gap_m": None,
+            "far_pair_gap_err_m": None,
+            "near_observable": False,
+            "near_peak": 0.0,
+            "far_observable": False,
+            "far_peak": 0.0,
+            "near_lower_stronger": False,
+            "near_lower_stronger_margin": 0.0,
+            "support_near_baseline": 0.0,
+            "support_near_dls": 0.0,
+            "support_far_baseline": 0.0,
+            "support_far_dls": 0.0,
+        }
+
+    x0 = int(max(0, min(ww - 1, round(0.08 * ww))))
+    x1 = int(max(x0 + 1, min(ww, round(0.92 * ww))))
+    region = mask[:, x0:x1]
+    row_cov = np.mean(region, axis=1).astype(np.float32)
+    if row_cov.size >= 5:
+        row_cov = cv2.GaussianBlur(row_cov.reshape(-1, 1), (1, 9), 0).reshape(-1)
+
+    court_h_m = 13.40
+    near_baseline_m = 13.40
+    near_dls_m = 12.64
+    far_baseline_m = 0.0
+    far_dls_m = 0.76
+    y_near = int(np.clip(round(near_baseline_m * ppm), 0, hh - 1))
+    y_near_dls = int(np.clip(round(near_dls_m * ppm), 0, hh - 1))
+    y_far = int(np.clip(round(far_baseline_m * ppm), 0, hh - 1))
+    y_far_dls = int(np.clip(round(far_dls_m * ppm), 0, hh - 1))
+    band = int(max(2, round(0.06 * ppm)))
+
+    def _band_support(yc: int) -> float:
+        y0 = int(max(0, yc - band))
+        y1 = int(min(hh - 1, yc + band))
+        if y1 < y0:
+            return 0.0
+        return float(np.mean(region[y0 : y1 + 1]))
+
+    support_near_baseline = _band_support(y_near)
+    support_near_dls = _band_support(y_near_dls)
+    support_far_baseline = _band_support(y_far)
+    support_far_dls = _band_support(y_far_dls)
+
+    y_min = int(max(0, round((court_h_m - 2.6) * ppm)))
+    y_max = int(hh - 1)
+    near_rows = row_cov[y_min : y_max + 1]
+    near_peak = float(np.max(near_rows)) if near_rows.size > 0 else 0.0
+    near_observe_thr = float(max(0.015, min(0.25, _env_float("BADC_SEMANTIC_NEAR_OBSERVE_THR", 0.03))))
+    near_observable = bool(near_peak >= near_observe_thr)
+    near_pair_found = False
+    near_pair_soft_fallback = False
+    near_gap_m = None
+    near_gap_err = None
+    near_pair_y0 = None
+    near_pair_y1 = None
+    near_pair_base_sup = 0.0
+    near_pair_dls_sup = 0.0
+    near_pair_base_row: Optional[int] = None
+    target_gap_px = float(0.76 * ppm)
+    if near_rows.size > 0:
+        near_max = float(np.max(near_rows))
+        min_keep = float(max(0.02, 0.20 * near_max))
+        peaks_local = _find_peaks_1d(
+            near_rows,
+            min_sep=int(max(4, round(0.14 * ppm))),
+            min_value=min_keep,
+            topk=12,
+        )
+        peaks = [int(y_min + p) for p in peaks_local]
+        if peaks:
+            peaks_sorted = sorted(peaks)
+            pair_best = None
+            min_gap_px = float(0.40 * ppm)
+            max_gap_px = float(1.30 * ppm)
+            near_span = float(max(1, y_max - y_min))
+            for i in range(len(peaks_sorted)):
+                for j in range(i + 1, len(peaks_sorted)):
+                    p1 = int(peaks_sorted[i])
+                    p0 = int(peaks_sorted[j])  # lower line (larger y)
+                    gap_px = float(p0 - p1)
+                    if gap_px < min_gap_px or gap_px > max_gap_px:
+                        continue
+                    e0 = float(row_cov[p0])
+                    e1 = float(row_cov[p1])
+                    baseline_rank = float(p0 - y_min) / near_span
+                    score = float(
+                        2.0 * e0
+                        + 1.5 * e1
+                        - abs(gap_px - target_gap_px) / max(1.0, 0.30 * ppm)
+                        + 0.45 * baseline_rank
+                    )
+                    if pair_best is None or score > pair_best[0]:
+                        pair_best = (score, p0, p1, gap_px, e0, e1)
+            if pair_best is not None:
+                near_pair_found = True
+                near_pair_y0 = float(pair_best[1] / max(1e-6, ppm))
+                near_pair_y1 = float(pair_best[2] / max(1e-6, ppm))
+                near_gap_m = float(pair_best[3] / max(1e-6, ppm))
+                near_gap_err = float(abs(near_gap_m - 0.76))
+                near_pair_base_sup = float(pair_best[4])
+                near_pair_dls_sup = float(pair_best[5])
+                near_pair_base_row = int(pair_best[1])
+        # Soft fallback: if DLS is weak/broken, keep semantic pair using strongest low baseline + expected 0.76m.
+        if (not near_pair_found) and near_rows.size > 0:
+            soft_rank = near_rows.astype(np.float32).copy()
+            if soft_rank.size > 0:
+                soft_rank += np.linspace(0.0, 0.06 * max(near_peak, 0.05), soft_rank.size, dtype=np.float32)
+            p0_soft = int(y_min + int(np.argmax(soft_rank)))
+            p1_soft = int(round(float(p0_soft) - target_gap_px))
+            if 0 <= p1_soft < hh and p1_soft < p0_soft:
+                e0_soft = float(row_cov[p0_soft])
+                e1_soft = float(_band_support(p1_soft))
+                min_e0_soft = float(max(0.03, 0.28 * near_peak))
+                min_e1_soft = float(max(0.003, 0.05 * near_peak))
+                if e0_soft >= min_e0_soft and e1_soft >= min_e1_soft:
+                    near_pair_found = True
+                    near_pair_soft_fallback = True
+                    near_pair_base_row = int(p0_soft)
+                    near_pair_base_sup = float(e0_soft)
+                    near_pair_dls_sup = float(e1_soft)
+                    near_gap_m = float((p0_soft - p1_soft) / max(1e-6, ppm))
+                    near_gap_err = float(abs(near_gap_m - 0.76))
+                    near_pair_y0 = float(p0_soft / max(1e-6, ppm))
+                    near_pair_y1 = float(p1_soft / max(1e-6, ppm))
+
+    support_near_baseline = float(max(float(support_near_baseline), float(near_pair_base_sup)))
+    support_near_dls = float(max(float(support_near_dls), float(near_pair_dls_sup)))
+
+    near_lower_stronger = False
+    near_lower_stronger_margin = 0.0
+    if near_pair_found and near_pair_base_row is not None:
+        lower_sep_px = int(max(2, round(0.08 * ppm)))
+        y_low0 = int(min(hh - 1, int(near_pair_base_row) + lower_sep_px))
+        if y_low0 < hh:
+            lower_peak = float(np.max(row_cov[y_low0:]))
+            lower_ratio = float(max(1.0, _env_float("BADC_SEMANTIC_NEAR_LOWER_STRONG_RATIO", 1.10)))
+            lower_margin_abs = float(max(0.0, _env_float("BADC_SEMANTIC_NEAR_LOWER_STRONG_MARGIN", 0.006)))
+            threshold = max(lower_ratio * float(near_pair_base_sup), float(near_pair_base_sup) + lower_margin_abs)
+            if lower_peak > threshold:
+                near_lower_stronger = True
+                near_lower_stronger_margin = float(lower_peak - float(near_pair_base_sup))
+
+    near_gap_score = 0.0
+    if near_pair_found and near_gap_m is not None:
+        sigma = 0.22
+        near_gap_score = float(math.exp(-((near_gap_m - 0.76) ** 2) / max(1e-6, 2.0 * sigma * sigma)))
+
+    y_far_max = int(min(hh - 1, max(y_far_dls + int(round(2.2 * ppm)), int(round(3.0 * ppm)))))
+    far_rows = row_cov[0 : y_far_max + 1]
+    far_peak = float(np.max(far_rows)) if far_rows.size > 0 else 0.0
+    far_observe_thr = float(max(0.015, min(0.20, _env_float("BADC_SEMANTIC_FAR_OBSERVE_THR", 0.03))))
+    far_observable = bool(far_peak >= far_observe_thr)
+    far_pair_found = False
+    far_gap_m = None
+    far_gap_err = None
+    far_pair_y0 = None
+    far_pair_y1 = None
+    if far_rows.size > 0:
+        far_max = float(np.max(far_rows))
+        min_keep_far = float(max(0.015, 0.18 * far_max))
+        peaks_local_far = _find_peaks_1d(
+            far_rows,
+            min_sep=int(max(4, round(0.14 * ppm))),
+            min_value=min_keep_far,
+            topk=10,
+        )
+        peaks_far = [int(p) for p in peaks_local_far]
+        if peaks_far:
+            peaks_far_sorted = sorted(peaks_far)
+            pair_best_far = None
+            target_gap_px_far = float(0.76 * ppm)
+            min_gap_px_far = float(0.35 * ppm)
+            max_gap_px_far = float(1.35 * ppm)
+            for i in range(len(peaks_far_sorted)):
+                for j in range(i + 1, len(peaks_far_sorted)):
+                    p0 = int(peaks_far_sorted[i])  # upper line (smaller y): far baseline
+                    p1 = int(peaks_far_sorted[j])  # lower line (larger y): far DLS
+                    gap_px = float(p1 - p0)
+                    if gap_px < min_gap_px_far or gap_px > max_gap_px_far:
+                        continue
+                    e0 = float(row_cov[p0])
+                    e1 = float(row_cov[p1])
+                    score = float(2.2 * e0 + 1.4 * e1 - abs(gap_px - target_gap_px_far) / max(1.0, 0.32 * ppm))
+                    if pair_best_far is None or score > pair_best_far[0]:
+                        pair_best_far = (score, p0, p1, gap_px, e0, e1)
+            if pair_best_far is not None:
+                far_pair_found = True
+                far_pair_y0 = float(pair_best_far[1] / max(1e-6, ppm))
+                far_pair_y1 = float(pair_best_far[2] / max(1e-6, ppm))
+                far_gap_m = float(pair_best_far[3] / max(1e-6, ppm))
+                far_gap_err = float(abs(far_gap_m - 0.76))
+
+    far_gap_score = 0.0
+    if far_pair_found and far_gap_m is not None:
+        sigma_far = 0.22
+        far_gap_score = float(math.exp(-((far_gap_m - 0.76) ** 2) / max(1e-6, 2.0 * sigma_far * sigma_far)))
+
+    semantic_score = float(
+        3.0 * support_near_baseline
+        + 2.2 * support_near_dls
+        + 1.3 * support_far_baseline
+        + 0.8 * support_far_dls
+        + 1.8 * near_gap_score
+        + 1.3 * far_gap_score
+        + (0.6 if near_pair_found else -0.8)
+        + (0.35 if far_pair_found else (-0.20 if far_observable else 0.0))
+        - (0.9 if near_lower_stronger else 0.0)
+    )
+    return {
+        "valid": True,
+        "score": float(semantic_score),
+        "near_pair_found": bool(near_pair_found),
+        "near_pair_soft_fallback": bool(near_pair_soft_fallback),
+        "near_pair_gap_m": float(near_gap_m) if near_gap_m is not None else None,
+        "near_pair_gap_err_m": float(near_gap_err) if near_gap_err is not None else None,
+        "near_pair_baseline_y_m": float(near_pair_y0) if near_pair_y0 is not None else None,
+        "near_pair_dls_y_m": float(near_pair_y1) if near_pair_y1 is not None else None,
+        "near_observable": bool(near_observable),
+        "near_peak": float(near_peak),
+        "far_pair_found": bool(far_pair_found),
+        "far_pair_gap_m": float(far_gap_m) if far_gap_m is not None else None,
+        "far_pair_gap_err_m": float(far_gap_err) if far_gap_err is not None else None,
+        "far_pair_baseline_y_m": float(far_pair_y0) if far_pair_y0 is not None else None,
+        "far_pair_dls_y_m": float(far_pair_y1) if far_pair_y1 is not None else None,
+        "far_observable": bool(far_observable),
+        "far_peak": float(far_peak),
+        "near_lower_stronger": bool(near_lower_stronger),
+        "near_lower_stronger_margin": float(near_lower_stronger_margin),
+        "support_near_baseline": float(support_near_baseline),
+        "support_near_dls": float(support_near_dls),
+        "support_far_baseline": float(support_far_baseline),
+        "support_far_dls": float(support_far_dls),
+        "warp_shape": [int(hh), int(ww)],
+        "warp_crop_x": [int(x0), int(x1)],
+    }
+
+
+def _semantic_refine_homography(
+    H_world_to_img: np.ndarray,
+    line_mask_u8: Optional[np.ndarray],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    H0 = np.asarray(H_world_to_img, dtype=np.float64).reshape(3, 3)
+    meta: Dict[str, Any] = {
+        "enabled": False,
+        "applied": False,
+    }
+    if line_mask_u8 is None or not isinstance(line_mask_u8, np.ndarray) or int(np.count_nonzero(line_mask_u8)) == 0:
+        meta["skip_reason"] = "no_line_mask"
+        return H0, meta
+    if not np.all(np.isfinite(H0)):
+        meta["skip_reason"] = "invalid_H"
+        return H0, meta
+
+    enable = bool(_env_flag("BADC_SEMANTIC_REFINE_ENABLE", True))
+    meta["enabled"] = bool(enable)
+    if not enable:
+        meta["skip_reason"] = "disabled"
+        return H0, meta
+
+    ppm = float(max(60.0, _env_float("BADC_SEMANTIC_WARP_PPM", 120.0)))
+    court_w_m = 6.10
+    court_h_m = 13.40
+    out_w = int(max(32, round(court_w_m * ppm)))
+    out_h = int(max(64, round(court_h_m * ppm)))
+    A = np.array([[ppm, 0.0, 0.0], [0.0, ppm, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    mask_u8 = (np.asarray(line_mask_u8) > 0).astype(np.uint8) * 255
+
+    def _eval(Hm: np.ndarray) -> Dict[str, Any]:
+        if not np.all(np.isfinite(Hm)):
+            return {"valid": False, "score": -1e9}
+        try:
+            invH = np.linalg.inv(Hm)
+        except Exception:
+            return {"valid": False, "score": -1e9}
+        M = A @ invH
+        if not np.all(np.isfinite(M)):
+            return {"valid": False, "score": -1e9}
+        warped = cv2.warpPerspective(
+            mask_u8,
+            M.astype(np.float32),
+            (out_w, out_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        info = _semantic_line_support_in_warp(warped, ppm)
+        info["valid"] = bool(info.get("valid", False))
+        return info
+
+    base_info = _eval(H0)
+    best_H = H0
+    best_info = dict(base_info)
+    best_score = float(best_info.get("score", -1e9))
+    best_a = 1.0
+    best_b = 0.0
+
+    a_grid = _parse_float_csv(_env_str("BADC_SEMANTIC_YSNAP_A_GRID", "0.96,0.98,1.00,1.02,1.04"), [0.96, 0.98, 1.0, 1.02, 1.04])
+    b_grid = _parse_float_csv(
+        _env_str("BADC_SEMANTIC_YSNAP_B_GRID", "-0.45,-0.35,-0.25,-0.15,-0.05,0.00,0.05,0.15,0.25,0.35,0.45"),
+        [-0.45, -0.35, -0.25, -0.15, -0.05, 0.0, 0.05, 0.15, 0.25, 0.35, 0.45],
+    )
+    min_gain = float(_env_float("BADC_SEMANTIC_YSNAP_MIN_GAIN", 0.04))
+
+    hard_enable = bool(_env_flag("BADC_SEMANTIC_HARD_ENABLE", True))
+    hard_require_pair = bool(_env_flag("BADC_SEMANTIC_REQUIRE_PAIR", True))
+    hard_require_pair_conditional = bool(_env_flag("BADC_SEMANTIC_REQUIRE_PAIR_CONDITIONAL", True))
+    hard_require_dls_support = bool(_env_flag("BADC_SEMANTIC_REQUIRE_DLS_SUPPORT", False))
+    hard_reject_near_lower_stronger = bool(_env_flag("BADC_SEMANTIC_REJECT_NEAR_LOWER_STRONGER", True))
+    hard_require_far_pair = bool(_env_flag("BADC_SEMANTIC_REQUIRE_FAR_PAIR", False))
+    hard_require_far_baseline_support = bool(_env_flag("BADC_SEMANTIC_REQUIRE_FAR_BASELINE_SUPPORT", True))
+    hard_require_far_baseline_anchor = bool(_env_flag("BADC_SEMANTIC_REQUIRE_FAR_BASELINE_ANCHOR", True))
+    hard_require_far_conditional = bool(_env_flag("BADC_SEMANTIC_REQUIRE_FAR_CONDITIONAL", True))
+    min_sup_base = float(_env_float("BADC_SEMANTIC_MIN_BASELINE_SUPPORT", 0.025))
+    min_sup_dls = float(_env_float("BADC_SEMANTIC_MIN_DLS_SUPPORT", 0.012))
+    min_sup_far_base = float(_env_float("BADC_SEMANTIC_MIN_FAR_BASELINE_SUPPORT", 0.010))
+    min_pair_dls_sup = float(_env_float("BADC_SEMANTIC_REQUIRE_PAIR_MIN_DLS_SUPPORT", 0.015))
+    min_far_gap_dls_sup = float(_env_float("BADC_SEMANTIC_MIN_FAR_DLS_SUPPORT_FOR_GAP", 0.015))
+    max_gap_err = float(_env_float("BADC_SEMANTIC_MAX_GAP_ERR_M", 0.40))
+    max_far_gap_err = float(_env_float("BADC_SEMANTIC_MAX_FAR_GAP_ERR_M", 0.40))
+    min_far_baseline_margin = float(_env_float("BADC_SEMANTIC_MIN_FAR_BASELINE_MARGIN", 0.002))
+    max_far_baseline_y_m = float(_env_float("BADC_SEMANTIC_MAX_FAR_BASELINE_Y_M", 0.55))
+    max_far_dls_y_m = float(_env_float("BADC_SEMANTIC_MAX_FAR_DLS_Y_M", 1.45))
+
+    def _semantic_hard_check(info: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        hard_pass_i = True
+        hard_reason_i = None
+        if not hard_enable:
+            return True, None
+        near_observable_i = bool(info.get("near_observable", False))
+        near_dls_sup_i = float(info.get("support_near_dls", 0.0))
+        should_require_pair_i = bool(
+            hard_require_pair
+            and (
+                not hard_require_pair_conditional
+                or (near_observable_i and near_dls_sup_i >= min_pair_dls_sup)
+            )
+        )
+        if should_require_pair_i and not bool(info.get("near_pair_found", False)):
+            hard_pass_i = False
+            hard_reason_i = "R_semantic_pair_missing"
+        elif info.get("near_pair_gap_err_m") is not None and float(info.get("near_pair_gap_err_m")) > max_gap_err:
+            hard_pass_i = False
+            hard_reason_i = "R_semantic_gap"
+        elif hard_reject_near_lower_stronger and bool(info.get("near_lower_stronger", False)):
+            hard_pass_i = False
+            hard_reason_i = "R_semantic_baseline_not_lowest"
+        elif float(info.get("support_near_baseline", 0.0)) < min_sup_base:
+            hard_pass_i = False
+            hard_reason_i = "R_semantic_baseline_support"
+        elif hard_require_dls_support and should_require_pair_i and float(info.get("support_near_dls", 0.0)) < min_sup_dls:
+            hard_pass_i = False
+            hard_reason_i = "R_semantic_dls_support"
+        if hard_pass_i:
+            far_observable_i = bool(info.get("far_observable", False))
+            should_check_far_i = bool(hard_require_far_pair or hard_require_far_baseline_support)
+            if should_check_far_i and (not hard_require_far_conditional or far_observable_i):
+                if hard_require_far_pair and not bool(info.get("far_pair_found", False)):
+                    hard_pass_i = False
+                    hard_reason_i = "R_semantic_far_pair_missing"
+                if hard_pass_i:
+                    far_gap_err_i = info.get("far_pair_gap_err_m")
+                    far_dls_sup_i = float(info.get("support_far_dls", 0.0))
+                    if (
+                        far_gap_err_i is not None
+                        and far_dls_sup_i >= min_far_gap_dls_sup
+                        and float(far_gap_err_i) > max_far_gap_err
+                    ):
+                        hard_pass_i = False
+                        hard_reason_i = "R_semantic_far_gap"
+                if hard_pass_i and hard_require_far_baseline_support and float(info.get("support_far_baseline", 0.0)) < min_sup_far_base:
+                    hard_pass_i = False
+                    hard_reason_i = "R_semantic_far_baseline_support"
+                if hard_pass_i and hard_require_far_baseline_support and bool(info.get("far_pair_found", False)):
+                    far_base_sup_i = float(info.get("support_far_baseline", 0.0))
+                    far_dls_sup_i = float(info.get("support_far_dls", 0.0))
+                    if far_base_sup_i + min_far_baseline_margin < far_dls_sup_i:
+                        hard_pass_i = False
+                        hard_reason_i = "R_semantic_far_baseline_vs_dls"
+                if hard_pass_i and hard_require_far_baseline_anchor and bool(info.get("far_pair_found", False)):
+                    far_base_y_i = info.get("far_pair_baseline_y_m")
+                    far_dls_y_i = info.get("far_pair_dls_y_m")
+                    if far_base_y_i is not None and float(far_base_y_i) > max_far_baseline_y_m:
+                        hard_pass_i = False
+                        hard_reason_i = "R_semantic_far_baseline_anchor"
+                    elif far_dls_y_i is not None and float(far_dls_y_i) > max_far_dls_y_m:
+                        hard_pass_i = False
+                        hard_reason_i = "R_semantic_far_dls_anchor"
+        return bool(hard_pass_i), hard_reason_i
+
+    eval_bank: list[Tuple[np.ndarray, Dict[str, Any], float, float]] = [(H0, dict(base_info), 1.0, 0.0)]
+
+    for a in a_grid:
+        aa = float(max(0.90, min(1.10, float(a))))
+        for b in b_grid:
+            bb = float(max(-0.60, min(0.60, float(b))))
+            if abs(aa - 1.0) < 1e-6 and abs(bb) < 1e-6:
+                continue
+            S = np.array([[1.0, 0.0, 0.0], [0.0, aa, bb], [0.0, 0.0, 1.0]], dtype=np.float64)
+            Hc = H0 @ S
+            info = _eval(Hc)
+            eval_bank.append((Hc, dict(info), aa, bb))
+            sc = float(info.get("score", -1e9))
+            if sc > best_score + min_gain:
+                best_score = sc
+                best_H = Hc
+                best_info = dict(info)
+                best_a = aa
+                best_b = bb
+
+    hard_pass, hard_reason = _semantic_hard_check(best_info)
+    hard_rescue_used = False
+    hard_rescue_reason = None
+    if hard_enable and not hard_pass:
+        best_hard_item = None
+        best_hard_score = float("-inf")
+        for Hc_i, info_i, aa_i, bb_i in eval_bank:
+            hp_i, hr_i = _semantic_hard_check(info_i)
+            if not hp_i:
+                continue
+            sc_i = float(info_i.get("score", -1e9))
+            if sc_i > best_hard_score:
+                best_hard_score = sc_i
+                best_hard_item = (Hc_i, info_i, aa_i, bb_i, hr_i)
+        if best_hard_item is not None:
+            Hc_i, info_i, aa_i, bb_i, _ = best_hard_item
+            best_H = np.asarray(Hc_i, dtype=np.float64)
+            best_info = dict(info_i)
+            best_score = float(best_info.get("score", -1e9))
+            best_a = float(aa_i)
+            best_b = float(bb_i)
+            hard_pass, hard_reason = _semantic_hard_check(best_info)
+            hard_rescue_used = True
+            hard_rescue_reason = "picked_hard_pass_candidate"
+
+    meta.update(
+        {
+            "enabled": True,
+            "warp_ppm": float(ppm),
+            "initial_score": float(base_info.get("score", -1e9)),
+            "final_score": float(best_score),
+            "improved": bool(best_score > float(base_info.get("score", -1e9)) + min_gain),
+            "ysnap_a": float(best_a),
+            "ysnap_b_m": float(best_b),
+            "min_gain": float(min_gain),
+            "hard_enable": bool(hard_enable),
+            "hard_require_pair": bool(hard_require_pair),
+            "hard_require_pair_conditional": bool(hard_require_pair_conditional),
+            "hard_require_dls_support": bool(hard_require_dls_support),
+            "hard_reject_near_lower_stronger": bool(hard_reject_near_lower_stronger),
+            "hard_require_far_pair": bool(hard_require_far_pair),
+            "hard_require_far_baseline_support": bool(hard_require_far_baseline_support),
+            "hard_require_far_baseline_anchor": bool(hard_require_far_baseline_anchor),
+            "hard_require_far_conditional": bool(hard_require_far_conditional),
+            "hard_pass": bool(hard_pass),
+            "hard_reason": hard_reason,
+            "hard_rescue_used": bool(hard_rescue_used),
+            "hard_rescue_reason": hard_rescue_reason,
+            "hard_min_baseline_support": float(min_sup_base),
+            "hard_min_dls_support": float(min_sup_dls),
+            "hard_min_far_baseline_support": float(min_sup_far_base),
+            "hard_pair_min_dls_support": float(min_pair_dls_sup),
+            "hard_far_gap_min_dls_support": float(min_far_gap_dls_sup),
+            "hard_max_gap_err_m": float(max_gap_err),
+            "hard_max_far_gap_err_m": float(max_far_gap_err),
+            "hard_max_far_baseline_y_m": float(max_far_baseline_y_m),
+            "hard_max_far_dls_y_m": float(max_far_dls_y_m),
+            "support_near_baseline": float(best_info.get("support_near_baseline", 0.0)),
+            "support_near_dls": float(best_info.get("support_near_dls", 0.0)),
+            "near_observable": bool(best_info.get("near_observable", False)),
+            "near_peak": float(best_info.get("near_peak", 0.0)),
+            "support_far_baseline": float(best_info.get("support_far_baseline", 0.0)),
+            "support_far_dls": float(best_info.get("support_far_dls", 0.0)),
+            "near_pair_found": bool(best_info.get("near_pair_found", False)),
+            "near_pair_soft_fallback": bool(best_info.get("near_pair_soft_fallback", False)),
+            "near_pair_gap_m": best_info.get("near_pair_gap_m"),
+            "near_pair_gap_err_m": best_info.get("near_pair_gap_err_m"),
+            "near_pair_baseline_y_m": best_info.get("near_pair_baseline_y_m"),
+            "near_pair_dls_y_m": best_info.get("near_pair_dls_y_m"),
+            "near_lower_stronger": bool(best_info.get("near_lower_stronger", False)),
+            "near_lower_stronger_margin": float(best_info.get("near_lower_stronger_margin", 0.0)),
+            "far_pair_found": bool(best_info.get("far_pair_found", False)),
+            "far_pair_gap_m": best_info.get("far_pair_gap_m"),
+            "far_pair_gap_err_m": best_info.get("far_pair_gap_err_m"),
+            "far_pair_baseline_y_m": best_info.get("far_pair_baseline_y_m"),
+            "far_pair_dls_y_m": best_info.get("far_pair_dls_y_m"),
+            "far_observable": bool(best_info.get("far_observable", False)),
+            "far_peak": float(best_info.get("far_peak", 0.0)),
+        }
+    )
+    meta["applied"] = bool(meta.get("improved", False))
+    return best_H, meta
+
+
 def _quad_area(pts_xy: np.ndarray) -> float:
     pts = np.array(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
     return float(abs(cv2.contourArea(pts)))
@@ -513,7 +1130,12 @@ def _mixer_score_candidate(
 ) -> Tuple[float, Dict[str, float]]:
     w = weights or MIXER_WEIGHTS
     dt_mean = float(loss_info.get("sample_dist_mean") or 0.0)
-    dt_p90 = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 0.0)
+    dt_p90 = float(
+        loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or loss_info.get("sample_dist_p90")
+        or 0.0
+    )
     dt_score = float(dt_mean + 0.5 * dt_p90)
     cover_ratio = float(loss_info.get("cover_ratio", loss_info.get("inlier_ratio", 0.0)))
     aspect_pen = _aspect_penalty(ordered_xy)
@@ -892,6 +1514,10 @@ def _filter_lines_for_completion(
     margin_x_px: Optional[float] = None,
     margin_top_px: Optional[float] = None,
     margin_bottom_px: Optional[float] = None,
+    expand_span_axis: Optional[str] = None,
+    min_span_ratio: float = 0.55,
+    min_span_px: float = 220.0,
+    extreme_keep: int = 2,
 ) -> Tuple[list[Tuple[float, float, float, float]], list[Optional[int]]]:
     if quad_xy is None or quad_xy.size == 0 or not lines:
         return lines, line_ids
@@ -908,16 +1534,82 @@ def _filter_lines_for_completion(
     bbox = (x0, y0, x1, y1)
     filtered_lines: list[Tuple[float, float, float, float]] = []
     filtered_ids: list[Optional[int]] = []
-    for seg, lid in zip(lines, line_ids):
+    for i, seg in enumerate(lines):
+        lid = line_ids[i] if i < len(line_ids) else None
         x1s, y1s, x2s, y2s = seg
-        mx = 0.5 * (float(x1s) + float(x2s))
-        my = 0.5 * (float(y1s) + float(y2s))
-        if mx < bbox[0] or mx > bbox[2] or my < bbox[1] or my > bbox[3]:
+        seg_x0 = min(float(x1s), float(x2s))
+        seg_x1 = max(float(x1s), float(x2s))
+        seg_y0 = min(float(y1s), float(y2s))
+        seg_y1 = max(float(y1s), float(y2s))
+        # Use segment AABB overlap instead of midpoint-only gating so long boundary lines
+        # crossing the completion ROI are preserved even when their midpoint is outside.
+        if seg_x1 < bbox[0] or seg_x0 > bbox[2] or seg_y1 < bbox[1] or seg_y0 > bbox[3]:
             continue
         filtered_lines.append(seg)
         filtered_ids.append(lid)
     if not filtered_lines:
         return lines, line_ids
+
+    if expand_span_axis in ("x", "y") and len(lines) >= 3 and len(filtered_lines) >= 2:
+        axis = 0 if expand_span_axis == "x" else 1
+        centers_src = [
+            (0.5 * (float(seg[0]) + float(seg[2])), 0.5 * (float(seg[1]) + float(seg[3])))
+            for seg in lines
+        ]
+        centers_keep = [
+            (0.5 * (float(seg[0]) + float(seg[2])), 0.5 * (float(seg[1]) + float(seg[3])))
+            for seg in filtered_lines
+        ]
+        vals_src = [float(c[axis]) for c in centers_src]
+        vals_keep = [float(c[axis]) for c in centers_keep]
+        src_span = float(max(vals_src) - min(vals_src)) if vals_src else 0.0
+        keep_span = float(max(vals_keep) - min(vals_keep)) if vals_keep else 0.0
+        need_span = float(max(float(min_span_px), float(min_span_ratio) * src_span))
+        if src_span > 1.0 and keep_span < need_span:
+            k = int(max(1, int(extreme_keep)))
+            order = sorted(range(len(lines)), key=lambda idx: float(centers_src[idx][axis]))
+            add_idx = order[: min(k, len(order))] + order[max(0, len(order) - k) :]
+            seen: set[Tuple[int, int, int, int]] = set()
+            merged_lines: list[Tuple[float, float, float, float]] = []
+            merged_ids: list[Optional[int]] = []
+            for seg, lid in zip(filtered_lines, filtered_ids):
+                x1s, y1s, x2s, y2s = [float(v) for v in seg]
+                p1 = (x1s, y1s)
+                p2 = (x2s, y2s)
+                if (p2[0], p2[1]) < (p1[0], p1[1]):
+                    p1, p2 = p2, p1
+                key = (
+                    int(round(p1[0] / 2.0)),
+                    int(round(p1[1] / 2.0)),
+                    int(round(p2[0] / 2.0)),
+                    int(round(p2[1] / 2.0)),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_lines.append((x1s, y1s, x2s, y2s))
+                merged_ids.append(lid)
+            for idx in add_idx:
+                seg = lines[idx]
+                lid = line_ids[idx] if idx < len(line_ids) else None
+                x1s, y1s, x2s, y2s = [float(v) for v in seg]
+                p1 = (x1s, y1s)
+                p2 = (x2s, y2s)
+                if (p2[0], p2[1]) < (p1[0], p1[1]):
+                    p1, p2 = p2, p1
+                key = (
+                    int(round(p1[0] / 2.0)),
+                    int(round(p1[1] / 2.0)),
+                    int(round(p2[0] / 2.0)),
+                    int(round(p2[1] / 2.0)),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_lines.append((x1s, y1s, x2s, y2s))
+                merged_ids.append(lid)
+            filtered_lines = merged_lines
+            filtered_ids = merged_ids
     return filtered_lines, filtered_ids
 
 
@@ -1569,10 +2261,230 @@ def get_floor_roi_mask_debug(
     closing_iterations: int = 4,
     court_corners: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    seed_ratio = float(np.clip(_env_float("BADC_FLOOR_ROI_SEED_RATIO", seed_ratio), 0.10, 0.90))
     h, w = frame_bgr.shape[:2]
     b, g, r = cv2.split(frame_bgr)
     green_score = g.astype(np.float32) - np.maximum(r, b).astype(np.float32)
     white_support = build_white_mask_raw(frame_bgr)
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    hue_ch, sat_ch, val_ch = cv2.split(hsv)
+    rgb_sum = r.astype(np.float32) + g.astype(np.float32) + b.astype(np.float32)
+    green_ratio_map = g.astype(np.float32) / np.maximum(rgb_sum, 1.0)
+    floor_roi_top_guard_cfg = {
+        "min_bbox_h_frac": float(np.clip(_env_float("BADC_FLOOR_ROI_MIN_BBOX_H_FRAC", 0.40), 0.05, 1.0)),
+        "max_y1_frac": float(np.clip(_env_float("BADC_FLOOR_ROI_MAX_Y1_FRAC", 0.35), 0.05, 0.95)),
+        "max_y1_hard_frac": float(np.clip(_env_float("BADC_FLOOR_ROI_MAX_Y1_HARD_FRAC", 0.50), 0.05, 0.98)),
+        "y1_wide_min_w_frac": float(np.clip(_env_float("BADC_FLOOR_ROI_Y1_WIDE_MIN_W_FRAC", 0.90), 0.10, 1.00)),
+        "fallback_top_frac": float(np.clip(_env_float("BADC_FLOOR_ROI_FALLBACK_TOP_FRAC", 0.23), 0.05, 0.95)),
+    }
+
+    def _build_adaptive_green_mask(
+        seed_mask_u8: np.ndarray,
+        top_boost: bool = False,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        roi = seed_mask_u8 > 0
+        if not np.any(roi):
+            return np.zeros((h, w), dtype=np.uint8), {"green_adapt_reason": "empty_seed"}
+        base_apply_top_frac = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_APPLY_TOP_FRAC", seed_ratio), 0.0, 0.95))
+        boost_apply_top_frac = float(
+            np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_APPLY_TOP_FRAC", 0.22), 0.0, 0.95)
+        )
+        apply_top_frac = float(boost_apply_top_frac if top_boost else base_apply_top_frac)
+        apply_y0 = int(max(0, min(h - 1, round(apply_top_frac * float(h)))))
+        apply_roi = np.zeros((h, w), dtype=bool)
+        apply_roi[apply_y0:h, :] = True
+        if _env_flag("BADC_FLOOR_ROI_GREEN_APPLY_INTERSECT_SEED", False):
+            apply_roi = apply_roi & roi
+        if not np.any(apply_roi):
+            apply_roi = roi.copy()
+        score_vals = green_score[roi]
+        ratio_vals = green_ratio_map[roi]
+        sat_vals = sat_ch[roi]
+        val_vals = val_ch[roi]
+        p_hi = float(np.clip(float(green_threshold_percentile), 30.0, 90.0))
+        delta_pct = float(_env_float("BADC_FLOOR_ROI_GREEN_ADAPT_DELTA_PCT", 16.0))
+        p_lo = float(max(18.0, p_hi - max(6.0, delta_pct)))
+        thr_hi = float(np.percentile(score_vals, p_hi))
+        thr_lo = float(np.percentile(score_vals, p_lo))
+        ratio_thr = float(np.percentile(ratio_vals, 35.0))
+        sat_thr = float(np.clip(np.percentile(sat_vals, 18.0), 18.0, 140.0))
+        val_thr = float(np.clip(np.percentile(val_vals, 10.0), 12.0, 170.0))
+
+        rough = roi & ((green_score >= thr_lo) | (green_ratio_map >= ratio_thr))
+        hue_lo, hue_hi = 28, 98
+        if int(np.count_nonzero(rough)) > 256:
+            hue_vals = hue_ch[rough]
+            hue_lo = int(np.clip(float(np.percentile(hue_vals, 3.0)) - 6.0, 18.0, 100.0))
+            hue_hi = int(np.clip(float(np.percentile(hue_vals, 97.0)) + 6.0, max(hue_lo + 6, 30), 125))
+        hue_ok = (hue_ch >= hue_lo) & (hue_ch <= hue_hi)
+
+        strict = (
+            ((green_score >= thr_hi) | ((green_score >= thr_lo) & (green_ratio_map >= ratio_thr)))
+            & hue_ok
+            & (sat_ch >= sat_thr)
+            & (val_ch >= val_thr)
+        )
+        green_mask_local = (strict & apply_roi).astype(np.uint8) * 255
+        k = max(3, int(morphology_kernel_size))
+        if k % 2 == 0:
+            k += 1
+        kernel = np.ones((k, k), np.uint8)
+        green_mask_local = cv2.morphologyEx(
+            green_mask_local,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=max(1, int(closing_iterations)),
+        )
+        green_mask_local = cv2.morphologyEx(green_mask_local, cv2.MORPH_OPEN, kernel)
+
+        top_relax_used = False
+        if top_boost:
+            boost_band_frac = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_BAND_FRAC", 0.62), 0.10, 0.95))
+            top_y1 = int(max(apply_y0, min(h - 1, round(apply_y0 + boost_band_frac * float(max(1, h - apply_y0 - 1))))))
+            top_band = np.zeros((h, w), dtype=bool)
+            top_band[apply_y0 : top_y1 + 1, :] = True
+            top_val_relax = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_VAL_RELAX", 26.0), 0.0, 90.0))
+            top_sat_relax = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_SAT_RELAX", 14.0), 0.0, 70.0))
+            top_score_relax = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_SCORE_RELAX", 5.0), 0.0, 24.0))
+            top_ratio_mul = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_TOP_BOOST_RATIO_MUL", 0.94), 0.70, 1.20))
+            boost_relaxed = (
+                top_band
+                & apply_roi
+                & hue_ok
+                & (
+                    (green_score >= (thr_lo - top_score_relax))
+                    | (green_ratio_map >= max(0.14, ratio_thr * top_ratio_mul))
+                )
+                & (val_ch >= max(6.0, val_thr - top_val_relax))
+                & (sat_ch >= max(8.0, sat_thr - top_sat_relax))
+            )
+            boost_mask = (boost_relaxed & apply_roi).astype(np.uint8) * 255
+            top_close_w = int(max(0, _env_int("BADC_FLOOR_ROI_GREEN_TOP_BOOST_CLOSE_W", 41)))
+            top_close_h = int(max(0, _env_int("BADC_FLOOR_ROI_GREEN_TOP_BOOST_CLOSE_H", 9)))
+            if top_close_w > 0 and top_close_h > 0:
+                if top_close_w % 2 == 0:
+                    top_close_w += 1
+                if top_close_h % 2 == 0:
+                    top_close_h += 1
+                boost_mask = cv2.morphologyEx(
+                    boost_mask,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (top_close_w, top_close_h)),
+                    iterations=1,
+                )
+            boost_mask[top_y1 + 1 :, :] = 0
+            if int(np.count_nonzero(boost_mask)) > 0:
+                green_mask_local = cv2.bitwise_or(green_mask_local, boost_mask)
+                top_relax_used = True
+
+        cover_ratio = float(np.mean(green_mask_local[apply_roi] > 0)) if np.any(apply_roi) else 0.0
+        min_cover = float(_env_float("BADC_FLOOR_ROI_GREEN_MIN_COVER", 0.22))
+        relaxed_used = False
+        if cover_ratio < min_cover:
+            relaxed = (
+                ((green_score >= thr_lo) | (green_ratio_map >= max(0.18, ratio_thr * 0.96)))
+                & hue_ok
+                & (val_ch >= max(8.0, val_thr - 20.0))
+            )
+            green_mask_local = (relaxed & apply_roi).astype(np.uint8) * 255
+            k_rel = max(3, int(round(0.85 * float(k))))
+            if k_rel % 2 == 0:
+                k_rel += 1
+            kernel_rel = np.ones((k_rel, k_rel), np.uint8)
+            green_mask_local = cv2.morphologyEx(green_mask_local, cv2.MORPH_CLOSE, kernel_rel, iterations=1)
+            green_mask_local = cv2.morphologyEx(
+                green_mask_local, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1
+            )
+            cover_ratio = float(np.mean(green_mask_local[apply_roi] > 0)) if np.any(apply_roi) else 0.0
+            relaxed_used = True
+        return green_mask_local, {
+            "green_adapt_thr_hi": float(thr_hi),
+            "green_adapt_thr_lo": float(thr_lo),
+            "green_adapt_ratio_thr": float(ratio_thr),
+            "green_adapt_sat_thr": float(sat_thr),
+            "green_adapt_val_thr": float(val_thr),
+            "green_adapt_hue_lo": int(hue_lo),
+            "green_adapt_hue_hi": int(hue_hi),
+            "green_adapt_cover_ratio": float(cover_ratio),
+            "green_adapt_min_cover": float(min_cover),
+            "green_adapt_relaxed_used": bool(relaxed_used),
+            "green_adapt_top_boost": bool(top_boost),
+            "green_adapt_apply_y0": int(apply_y0),
+            "green_adapt_apply_top_frac": float(apply_top_frac),
+            "green_adapt_top_relax_used": bool(top_relax_used),
+        }
+
+    def _guard_floor_roi_top(
+        floor_mask_u8: np.ndarray,
+        y_cut: Optional[int],
+        source: str,
+    ) -> Tuple[np.ndarray, Optional[int], Dict[str, Any]]:
+        meta: Dict[str, Any] = {
+            "source": str(source),
+            "applied": False,
+            "reason": None,
+            "y1_raw": int(y_cut) if y_cut is not None else None,
+            "y1_final": int(y_cut) if y_cut is not None else None,
+            "y2": None,
+            "bbox_w": None,
+            "bbox_w_frac": None,
+            "bbox_h": None,
+            "bbox_h_frac": None,
+            "cfg": dict(floor_roi_top_guard_cfg),
+        }
+        if y_cut is None:
+            meta["reason"] = "missing_y_cut"
+            return floor_mask_u8, y_cut, meta
+
+        ys, xs = np.where(floor_mask_u8 > 0)
+        if xs.size == 0:
+            meta["reason"] = "empty_floor_mask"
+            return floor_mask_u8, int(y_cut), meta
+
+        y1_raw = int(max(0, min(h - 1, int(y_cut))))
+        y2 = int(ys.max())
+        if y2 < y1_raw:
+            y2 = y1_raw
+        x1 = int(xs.min())
+        x2 = int(xs.max())
+        bbox_w = int(max(1, x2 - x1 + 1))
+        bbox_h = int(max(1, y2 - y1_raw + 1))
+        min_bbox_h = int(round(float(floor_roi_top_guard_cfg["min_bbox_h_frac"]) * float(h)))
+        max_y1 = int(round(float(floor_roi_top_guard_cfg["max_y1_frac"]) * float(h)))
+        max_y1_hard = int(round(float(floor_roi_top_guard_cfg["max_y1_hard_frac"]) * float(h)))
+        y1_wide_min_w = float(floor_roi_top_guard_cfg["y1_wide_min_w_frac"])
+        fallback_top_y = int(round(float(floor_roi_top_guard_cfg["fallback_top_frac"]) * float(h)))
+        fallback_top_y = int(max(0, min(h - 1, fallback_top_y)))
+        bbox_w_frac = float(bbox_w) / float(max(w, 1))
+
+        reasons: list[str] = []
+        if bbox_h < max(1, min_bbox_h):
+            reasons.append("bbox_h_small")
+        if y1_raw > max_y1 and bbox_w_frac >= y1_wide_min_w:
+            reasons.append("y1_too_low_wide_bbox")
+        if y1_raw > max_y1_hard:
+            reasons.append("y1_too_low_hard")
+
+        y1_final = y1_raw
+        floor_mask_out = floor_mask_u8
+        if reasons:
+            y1_final = int(max(0, min(y1_raw, fallback_top_y)))
+            if y1_final < y1_raw:
+                floor_mask_out = floor_mask_u8.copy()
+                floor_mask_out[y1_final:y1_raw, x1 : x2 + 1] = 255
+                meta["applied"] = True
+            meta["reason"] = "+".join(reasons)
+        else:
+            meta["reason"] = "pass"
+
+        meta["y1_raw"] = int(y1_raw)
+        meta["y1_final"] = int(y1_final)
+        meta["y2"] = int(y2)
+        meta["bbox_w"] = int(bbox_w)
+        meta["bbox_w_frac"] = float(bbox_w_frac)
+        meta["bbox_h"] = int(bbox_h)
+        meta["bbox_h_frac"] = float(bbox_h) / float(max(h, 1))
+        return floor_mask_out, int(y1_final), meta
     prepass_corners = None
     prepass_area_ratio = None
     prepass_ymax_ratio = None
@@ -1668,7 +2580,10 @@ def get_floor_roi_mask_debug(
     fallback_floor_roi = False
     fallback_mode = "cc"
     floor_y_cut = None
+    floor_top_guard_meta: Optional[Dict[str, Any]] = None
     largest_cc_mask = np.zeros((h, w), dtype=np.uint8)
+    # Default to direct green-mask ROI to avoid largest-CC truncation on far court.
+    use_green_mask_direct = _env_flag("BADC_FLOOR_ROI_USE_GREEN_MASK_DIRECT", True)
     lab_mask, lab_bbox, lab_debug = _floor_mask_from_seed_lab(
         frame_bgr,
         seed_ratio=seed_ratio,
@@ -1676,7 +2591,7 @@ def get_floor_roi_mask_debug(
         delta_lab=18.0,
         min_area_ratio=0.06,
     )
-    if lab_mask is not None and lab_bbox is not None:
+    if (not use_green_mask_direct) and lab_mask is not None and lab_bbox is not None:
         cc_scores = []
         union_mask, union_bbox, cc_scores = _select_top_components(
             (lab_mask > 0).astype(np.uint8) * 255,
@@ -1698,20 +2613,18 @@ def get_floor_roi_mask_debug(
             ys_cc, xs_cc = np.where(floor_mask > 0)
             if xs_cc.size > 0:
                 floor_y_cut = int(ys_cc.min())
+        floor_mask, floor_y_cut, floor_top_guard_meta = _guard_floor_roi_top(
+            floor_mask,
+            floor_y_cut,
+            source="lab_seed",
+        )
         fallback_mode = "lab_seed"
         if bottom_scores.size > 0:
-            thr = float(np.percentile(bottom_scores, float(green_threshold_percentile)))
-            green_mask = (green_score > thr).astype(np.uint8) * 255
-            kernel = np.ones((int(morphology_kernel_size), int(morphology_kernel_size)), np.uint8)
-            green_mask = cv2.morphologyEx(
-                green_mask,
-                cv2.MORPH_CLOSE,
-                kernel,
-                iterations=int(closing_iterations),
-            )
-            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+            use_top_boost = bool((floor_top_guard_meta or {}).get("applied", False))
+            green_mask, green_adapt_meta = _build_adaptive_green_mask(seed, top_boost=use_top_boost)
         else:
             green_mask = np.zeros((h, w), dtype=np.uint8)
+            green_adapt_meta = {"green_adapt_reason": "empty_bottom_scores"}
         floor_mask, tighten_info = _tighten_floor_roi_xrange(
             green_mask,
             floor_mask,
@@ -1727,12 +2640,15 @@ def get_floor_roi_mask_debug(
             "largest_cc_mask": lab_mask,
             "fallback_floor_roi": False,
             "fallback_mode": fallback_mode,
-            "floor_y_cut": int(floor_y_cut),
+            "floor_y_cut": int(floor_y_cut) if floor_y_cut is not None else None,
+            "floor_roi_top_guard": floor_top_guard_meta,
+            "floor_roi_top_guard_cfg": dict(floor_roi_top_guard_cfg),
             "exg_row_plot": None,
             "floor_cc_scores": cc_scores,
             "prepass_area_ratio": prepass_area_ratio,
             "prepass_ymax_ratio": prepass_ymax_ratio,
             "prepass_gate_passed": prepass_gate_passed,
+            "green_adapt_meta": green_adapt_meta,
             **lab_debug,
             **tighten_info,
         }
@@ -1758,22 +2674,186 @@ def get_floor_roi_mask_debug(
             "fallback_floor_roi": fallback_floor_roi,
             "fallback_mode": fallback_mode,
             "floor_y_cut": int(floor_y_cut),
+            "floor_roi_top_guard": floor_top_guard_meta,
+            "floor_roi_top_guard_cfg": dict(floor_roi_top_guard_cfg),
             "exg_row_plot": None,
             "prepass_area_ratio": prepass_area_ratio,
             "prepass_ymax_ratio": prepass_ymax_ratio,
             "prepass_gate_passed": prepass_gate_passed,
             **tighten_info,
         }
-    thr = float(np.percentile(bottom_scores, float(green_threshold_percentile)))
-    green_mask = (green_score > thr).astype(np.uint8) * 255
-    kernel = np.ones((int(morphology_kernel_size), int(morphology_kernel_size)), np.uint8)
-    green_mask = cv2.morphologyEx(
-        green_mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=int(closing_iterations),
-    )
-    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+    green_mask, green_adapt_meta = _build_adaptive_green_mask(seed, top_boost=False)
+    if use_green_mask_direct:
+        green_bin = ((green_mask > 0).astype(np.uint8) * 255)
+        seed_y_frac = float(os.getenv("BADC_FLOOR_ROI_SEED_Y_FRAC", "0.93") or 0.93)
+        seed_y = int(round(seed_y_frac * float(max(h - 1, 0))))
+        seed_xs_str = os.getenv("BADC_FLOOR_ROI_SEED_XS", "0.20,0.40,0.60,0.80")
+        seed_x_fracs: list[float] = []
+        for s in seed_xs_str.split(","):
+            s = s.strip()
+            if not s:
+                continue
+            try:
+                seed_x_fracs.append(float(s))
+            except Exception:
+                pass
+        if not seed_x_fracs:
+            seed_x_fracs = [0.2, 0.4, 0.6, 0.8]
+        radius = int(os.getenv("BADC_FLOOR_ROI_SEED_RADIUS", "60") or 60)
+        radius = max(5, radius)
+        picked = np.zeros_like(green_bin)
+
+        def _find_nearest_green_direct(xc: int, yc: int, r: int):
+            x0p = max(0, xc - r)
+            x1p = min(w - 1, xc + r)
+            y0p = max(0, yc - r)
+            y1p = min(h - 1, yc + r)
+            win = green_bin[y0p : y1p + 1, x0p : x1p + 1]
+            ys, xs = np.where(win > 0)
+            if len(xs) == 0:
+                return None
+            ix = int(np.median(xs)) + x0p
+            iy = int(np.median(ys)) + y0p
+            return (ix, iy)
+
+        for fx in seed_x_fracs:
+            sx = int(round(fx * float(max(w - 1, 0))))
+            pt = _find_nearest_green_direct(sx, seed_y, radius)
+            if pt is None:
+                continue
+            ff_img = green_bin.copy()
+            ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+            cv2.floodFill(ff_img, ff_mask, seedPoint=pt, newVal=255)
+            comp = (ff_mask[1:-1, 1:-1] > 0).astype(np.uint8) * 255
+            picked = cv2.bitwise_or(picked, comp)
+
+        picked_area = int(np.count_nonzero(picked))
+        min_area_frac = float(os.getenv("BADC_FLOOR_ROI_PICK_MIN_AREA_FRAC", "0.01") or 0.01)
+        if picked_area < int(min_area_frac * h * w):
+            floor_mask = green_bin
+            floor_direct_source = "green_direct_full"
+        else:
+            floor_mask = picked
+            floor_direct_source = "green_direct_flood"
+
+        ys_g, xs_g = np.where(floor_mask > 0)
+        if xs_g.size == 0:
+            fallback_floor_roi = True
+            fallback_mode = "bottom_band"
+            floor_y_cut = int(round(float(h) * float(fallback_y_ratio)))
+            floor_mask = np.zeros((h, w), dtype=np.uint8)
+            floor_mask[floor_y_cut:h, :] = 255
+        else:
+            floor_y_cut = int(ys_g.min())
+            floor_x1_raw = int(xs_g.min())
+            floor_x2_raw = int(xs_g.max())
+            floor_mask, floor_y_cut, floor_top_guard_meta = _guard_floor_roi_top(
+                floor_mask,
+                floor_y_cut,
+                source=floor_direct_source,
+            )
+            if bool((floor_top_guard_meta or {}).get("applied", False)):
+                y_guard = int((floor_top_guard_meta or {}).get("y1_final", floor_y_cut if floor_y_cut is not None else 0))
+                x_pad_frac = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_DIRECT_X_PAD_FRAC", 0.02), 0.0, 0.30))
+                x_pad = int(round(x_pad_frac * float(max(w, 1))))
+                x1_keep = int(max(0, floor_x1_raw - x_pad))
+                x2_keep = int(min(w - 1, floor_x2_raw + x_pad))
+                keep_strip = np.zeros((h, w), dtype=np.uint8)
+                keep_strip[:, x1_keep : x2_keep + 1] = 255
+                rebuilt = cv2.bitwise_and(green_bin, keep_strip)
+                rebuilt[:y_guard, :] = 0
+                if int(np.count_nonzero(rebuilt)) > 0:
+                    floor_mask = rebuilt
+                    if isinstance(floor_top_guard_meta, dict):
+                        floor_top_guard_meta["green_direct_rebuild_from_green"] = True
+                        floor_top_guard_meta["green_direct_rebuild_x_range"] = [int(x1_keep), int(x2_keep)]
+            if bool((floor_top_guard_meta or {}).get("applied", False)):
+                green_mask_boost, green_adapt_meta_boost = _build_adaptive_green_mask(seed, top_boost=True)
+                if int(np.count_nonzero(green_mask_boost)) > 0:
+                    green_mask = green_mask_boost
+                    green_bin = ((green_mask > 0).astype(np.uint8) * 255)
+                    green_adapt_meta = green_adapt_meta_boost
+                    floor_mask = green_bin
+                    ys_gb, xs_gb = np.where(floor_mask > 0)
+                    if xs_gb.size > 0:
+                        floor_y_cut = int(ys_gb.min())
+                        floor_x1_raw = int(xs_gb.min())
+                        floor_x2_raw = int(xs_gb.max())
+                        floor_mask, floor_y_cut, floor_top_guard_meta = _guard_floor_roi_top(
+                            floor_mask,
+                            floor_y_cut,
+                            source="green_direct_boost",
+                        )
+                        if bool((floor_top_guard_meta or {}).get("applied", False)):
+                            y_guard = int(
+                                (floor_top_guard_meta or {}).get("y1_final", floor_y_cut if floor_y_cut is not None else 0)
+                            )
+                            x_pad_frac = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_DIRECT_X_PAD_FRAC", 0.02), 0.0, 0.30))
+                            x_pad = int(round(x_pad_frac * float(max(w, 1))))
+                            x1_keep = int(max(0, floor_x1_raw - x_pad))
+                            x2_keep = int(min(w - 1, floor_x2_raw + x_pad))
+                            keep_strip = np.zeros((h, w), dtype=np.uint8)
+                            keep_strip[:, x1_keep : x2_keep + 1] = 255
+                            rebuilt = cv2.bitwise_and(green_bin, keep_strip)
+                            rebuilt[:y_guard, :] = 0
+                            if int(np.count_nonzero(rebuilt)) > 0:
+                                floor_mask = rebuilt
+                                if isinstance(floor_top_guard_meta, dict):
+                                    floor_top_guard_meta["green_direct_rebuild_from_green"] = True
+                                    floor_top_guard_meta["green_direct_rebuild_x_range"] = [int(x1_keep), int(x2_keep)]
+            min_top_frac = float(np.clip(_env_float("BADC_FLOOR_ROI_GREEN_DIRECT_MIN_TOP_FRAC", 0.23), 0.05, 0.95))
+            min_top_y = int(max(0, min(h - 1, round(min_top_frac * float(h)))))
+            if floor_y_cut is not None and floor_y_cut < min_top_y:
+                floor_y_cut = int(min_top_y)
+                floor_mask[: int(floor_y_cut), :] = 0
+                if isinstance(floor_top_guard_meta, dict):
+                    floor_top_guard_meta["green_direct_min_top_applied"] = True
+                    floor_top_guard_meta["green_direct_min_top_y"] = int(min_top_y)
+            fallback_mode = "green_direct"
+
+        skip_x_tighten = _env_flag("BADC_FLOOR_ROI_GREEN_DIRECT_SKIP_X_TIGHTEN", True)
+        if skip_x_tighten:
+            ys_t, xs_t = np.where(floor_mask > 0)
+            if xs_t.size > 0:
+                x0_t = int(xs_t.min())
+                x1_t = int(xs_t.max())
+            else:
+                x0_t, x1_t = 0, w - 1
+            tighten_info = {
+                "floor_x_tightened": False,
+                "floor_x_range": [int(x0_t), int(x1_t)],
+                "floor_x_reject_reason": "green_direct_skip_tighten",
+            }
+        else:
+            floor_mask, tighten_info = _tighten_floor_roi_xrange(
+                green_mask,
+                floor_mask,
+                support_mask=white_support,
+                court_corners=prepass_corners if prepass_gate_passed else court_corners,
+                min_density=0.09,
+                min_keep_ratio=0.45,
+                margin_ratio=0.075,
+            )
+        return floor_mask, {
+            "green_mask": green_mask,
+            "seed_bottom_mask": seed,
+            "largest_cc_mask": green_mask.copy(),
+            "fallback_floor_roi": fallback_floor_roi,
+            "fallback_mode": fallback_mode,
+            "floor_y_cut": int(floor_y_cut) if floor_y_cut is not None else None,
+            "floor_roi_top_guard": floor_top_guard_meta,
+            "floor_roi_top_guard_cfg": dict(floor_roi_top_guard_cfg),
+            "floor_roi_use_green_mask_direct": True,
+            "floor_roi_green_direct_skip_x_tighten": bool(skip_x_tighten),
+            "exg_row_plot": None,
+            "floor_cc_scores": [],
+            "prepass_area_ratio": prepass_area_ratio,
+            "prepass_ymax_ratio": prepass_ymax_ratio,
+            "prepass_gate_passed": prepass_gate_passed,
+            "green_adapt_meta": green_adapt_meta,
+            **tighten_info,
+        }
+
     union_mask, union_bbox, cc_scores = _select_top_components(green_mask, white_support, top_k=2)
     if union_mask is None or union_bbox is None:
         fallback_floor_roi = True
@@ -1797,11 +2877,14 @@ def get_floor_roi_mask_debug(
             "fallback_floor_roi": fallback_floor_roi,
             "fallback_mode": fallback_mode,
             "floor_y_cut": int(floor_y_cut),
+            "floor_roi_top_guard": floor_top_guard_meta,
+            "floor_roi_top_guard_cfg": dict(floor_roi_top_guard_cfg),
             "exg_row_plot": None,
             "floor_cc_scores": cc_scores,
             "prepass_area_ratio": prepass_area_ratio,
             "prepass_ymax_ratio": prepass_ymax_ratio,
             "prepass_gate_passed": prepass_gate_passed,
+            "green_adapt_meta": green_adapt_meta,
             **tighten_info,
         }
     largest_cc_mask = union_mask
@@ -1830,6 +2913,14 @@ def get_floor_roi_mask_debug(
             floor_y_cut = int(y1)
         else:
             floor_mask = largest_cc_mask
+    if not fallback_floor_roi and fallback_mode == "cc":
+        floor_mask, floor_y_cut, floor_top_guard_meta = _guard_floor_roi_top(
+            floor_mask,
+            floor_y_cut,
+            source="cc",
+        )
+        if bool((floor_top_guard_meta or {}).get("applied", False)):
+            green_mask, green_adapt_meta = _build_adaptive_green_mask(seed, top_boost=True)
     floor_mask, tighten_info = _tighten_floor_roi_xrange(
         green_mask,
         floor_mask,
@@ -1846,11 +2937,14 @@ def get_floor_roi_mask_debug(
         "fallback_floor_roi": fallback_floor_roi,
         "fallback_mode": fallback_mode,
         "floor_y_cut": int(floor_y_cut) if floor_y_cut is not None else None,
+        "floor_roi_top_guard": floor_top_guard_meta,
+        "floor_roi_top_guard_cfg": dict(floor_roi_top_guard_cfg),
         "exg_row_plot": None,
         "floor_cc_scores": cc_scores,
         "prepass_area_ratio": prepass_area_ratio,
         "prepass_ymax_ratio": prepass_ymax_ratio,
         "prepass_gate_passed": prepass_gate_passed,
+        "green_adapt_meta": green_adapt_meta,
         **tighten_info,
     }
 
@@ -3069,6 +4163,7 @@ def _pick_rep_line(
     max_angle_deg: float = 15.0,
     min_len: float = 0.0,
     line_mask: Optional[np.ndarray] = None,
+    min_support: float = 0.0,
     top_k: int = 8,
     line_ids: Optional[Sequence[Optional[int]]] = None,
 ) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any]]:
@@ -3090,6 +4185,8 @@ def _pick_rep_line(
         support = None
         if line_mask is not None:
             support = _line_support((x1, y1, x2, y2), line_mask)
+            if support is not None and float(support) < float(min_support):
+                continue
         score = float(length * (0.5 + 0.5 * (support if support is not None else 0.0)))
         lid = None
         if line_ids is not None and idx < len(line_ids):
@@ -3155,13 +4252,96 @@ def _complete_corners_from_lines(
     x_ref = float(0.5 * (x0 + x1))
     sideline_angle_raw = _median_angle_segments(lines_left) or _mean_angle_segments(lines_left)
     sideline_angle = sideline_angle_raw
-    baseline_angle = _median_angle_segments(lines_bottom) or _mean_angle_segments(lines_bottom)
+    baseline_angle_lines = _median_angle_segments(lines_bottom) or _mean_angle_segments(lines_bottom)
+    baseline_angle_quad: Optional[float] = None
+    baseline_vec = np.asarray(ordered[1] - ordered[0], dtype=np.float32)
+    if float(np.linalg.norm(baseline_vec)) >= 1.0:
+        baseline_angle_quad = float(
+            np.mod(math.atan2(float(baseline_vec[1]), float(baseline_vec[0])), math.pi)
+        )
+    baseline_ref_disagree_deg = float(_env_float("BADC_COMPLETION_BASELINE_REF_DISAGREE_DEG", 14.0))
+    baseline_angle = baseline_angle_lines
+    baseline_angle_source = "lines"
+    if baseline_angle_quad is not None:
+        if baseline_angle is None:
+            baseline_angle = baseline_angle_quad
+            baseline_angle_source = "quad"
+        else:
+            ref_diff_deg = float(
+                math.degrees(abs(_angle_distance(float(baseline_angle), float(baseline_angle_quad))))
+            )
+            if ref_diff_deg > baseline_ref_disagree_deg:
+                baseline_angle = baseline_angle_quad
+                baseline_angle_source = "quad_override"
     sideline_perp_tol_deg = _env_float("BADC_COMPLETION_SIDELINE_PERP_TOL_DEG", 30.0)
-    sideline_perp_filter = _env_flag("BADC_COMPLETION_SIDELINE_PERP_FILTER", False)
-    sideline_perp_repick = _env_flag("BADC_COMPLETION_SIDELINE_PERP_REPICK", False)
+    sideline_perp_filter = _env_flag("BADC_COMPLETION_SIDELINE_PERP_FILTER", True)
+    sideline_perp_repick = _env_flag("BADC_COMPLETION_SIDELINE_PERP_REPICK", True)
+    sideline_snap_tol_deg = _env_float("BADC_COMPLETION_SIDELINE_PERP_SNAP_TOL_DEG", sideline_perp_tol_deg)
+    sideline_perp_min_keep = int(max(2, _env_int("BADC_COMPLETION_SIDELINE_PERP_MIN_KEEP", 6)))
+    sideline_rep_top_k = int(max(4, _env_int("BADC_COMPLETION_SIDELINE_TOP_K", 16)))
+    sideline_bad_perp_deg = float(_env_float("BADC_COMPLETION_SIDELINE_BAD_PERP_DEG", 24.0))
+    sideline_lr_parallel_tol_deg = float(
+        _env_float("BADC_COMPLETION_SIDELINE_LR_PARALLEL_TOL_DEG", 12.0)
+    )
+    sideline_repick_perp_tol_deg = float(
+        _env_float(
+            "BADC_COMPLETION_SIDELINE_REPICK_PERP_TOL_DEG",
+            max(10.0, min(36.0, sideline_perp_tol_deg + 4.0)),
+        )
+    )
+    sideline_right_strict_perp_deg = float(
+        _env_float("BADC_COMPLETION_RIGHT_STRICT_PERP_TOL_DEG", max(14.0, min(30.0, sideline_bad_perp_deg)))
+    )
+    sideline_right_strict_parallel_deg = float(
+        _env_float("BADC_COMPLETION_RIGHT_STRICT_PARALLEL_TOL_DEG", max(8.0, sideline_lr_parallel_tol_deg))
+    )
+    sideline_right_min_sep_px = float(_env_float("BADC_COMPLETION_RIGHT_MIN_SEP_PX", 60.0))
+    sideline_projective_parallel_tol_deg = float(
+        _env_float(
+            "BADC_COMPLETION_PROJECTIVE_PARALLEL_TOL_DEG",
+            max(8.0, sideline_lr_parallel_tol_deg),
+        )
+    )
+    sideline_projective_parallel_hard_deg = float(
+        _env_float("BADC_COMPLETION_PROJECTIVE_PARALLEL_HARD_DEG", 78.0)
+    )
+    sideline_projective_perp_tol_deg = float(
+        _env_float(
+            "BADC_COMPLETION_PROJECTIVE_PERP_TOL_DEG",
+            max(16.0, sideline_bad_perp_deg + 4.0),
+        )
+    )
+    sideline_projective_perp_hard_deg = float(
+        _env_float("BADC_COMPLETION_PROJECTIVE_PERP_HARD_DEG", 78.0)
+    )
+    sideline_projective_parallel_penalty_w = float(
+        _env_float("BADC_COMPLETION_PROJECTIVE_PARALLEL_PENALTY_W", 3.5)
+    )
+    sideline_projective_perp_penalty_w = float(
+        _env_float("BADC_COMPLETION_PROJECTIVE_PERP_PENALTY_W", 2.5)
+    )
+    sideline_projective_base_y_spread_frac = float(
+        max(
+            0.05,
+            min(0.95, _env_float("BADC_COMPLETION_PROJECTIVE_BASE_Y_SPREAD_FRAC", 0.32)),
+        )
+    )
+    sideline_min_support = float(
+        max(0.0, min(1.0, _env_float("BADC_COMPLETION_SIDELINE_MIN_SUPPORT", 0.08)))
+    )
+    baseline_min_support = float(
+        max(0.0, min(1.0, _env_float("BADC_COMPLETION_BASELINE_MIN_SUPPORT", 0.05)))
+    )
+    # Perspective-heavy views can make sidelines and baselines look far from orthogonal in image space.
+    # Prefer a projective pair-pick (based on baseline/top intersections + quad geometry) over angle-perp assumptions.
+    sideline_projective_pick = bool(_env_flag("BADC_COMPLETION_PROJECTIVE_SIDELINE_PICK", True))
+    sideline_angle_perp: Optional[float] = None
+    sideline_snapped_to_perp = False
+    if baseline_angle is not None:
+        sideline_angle_perp = float((float(baseline_angle) + 0.5 * math.pi) % math.pi)
     lines_left_use = list(lines_left)
     line_ids_left_use = list(line_ids_left) if line_ids_left is not None else [None] * len(lines_left_use)
-    if sideline_perp_filter and baseline_angle is not None and lines_left_use:
+    if sideline_perp_filter and (not sideline_projective_pick) and baseline_angle is not None and lines_left_use:
         tol = math.radians(float(max(5.0, sideline_perp_tol_deg)))
         scored_idx: list[Tuple[float, int]] = []
         keep_idx: list[int] = []
@@ -3176,12 +4356,39 @@ def _complete_corners_from_lines(
             line_ids_left_use = [line_ids_left_use[i] for i in keep_idx]
         elif len(scored_idx) >= 2:
             scored_idx.sort(key=lambda t: t[0])
-            pick = [scored_idx[0][1], scored_idx[1][1]]
+            pick = [idx for _, idx in scored_idx[: min(len(scored_idx), sideline_perp_min_keep)]]
             lines_left_use = [lines_left_use[i] for i in pick]
             line_ids_left_use = [line_ids_left_use[i] for i in pick]
     sideline_angle = _median_angle_segments(lines_left_use) or _mean_angle_segments(lines_left_use) or sideline_angle
+    if sideline_angle is None and sideline_angle_perp is not None:
+        sideline_angle = float(sideline_angle_perp)
+        sideline_snapped_to_perp = True
+    elif sideline_angle is not None and baseline_angle is not None and sideline_angle_perp is not None:
+        perp_err = abs(_angle_distance(float(sideline_angle), float(baseline_angle)) - 0.5 * math.pi)
+        if perp_err > math.radians(float(max(5.0, sideline_snap_tol_deg))):
+            sideline_angle = float(sideline_angle_perp)
+            sideline_snapped_to_perp = True
     sideline_max_angle_deg = _env_float("BADC_REP_MAX_ANGLE_SIDELINE_DEG", 30.0)
     baseline_max_angle_deg = _env_float("BADC_REP_MAX_ANGLE_BASELINE_DEG", 20.0)
+    baseline_pick_angle_deg = float(
+        max(
+            8.0,
+            min(
+                35.0,
+                _env_float(
+                    "BADC_COMPLETION_BASELINE_PICK_MAX_ANGLE_DEG",
+                    min(float(baseline_max_angle_deg), 16.0),
+                ),
+            ),
+        )
+    )
+    baseline_neighbor_gap_min_px = float(max(6.0, _env_float("BADC_COMPLETION_BASELINE_NEIGHBOR_GAP_MIN_PX", 14.0)))
+    baseline_neighbor_gap_max_px = float(
+        max(
+            baseline_neighbor_gap_min_px + 4.0,
+            _env_float("BADC_COMPLETION_BASELINE_NEIGHBOR_GAP_MAX_PX", 92.0),
+        )
+    )
     min_len = 0.06 * float(min(img_w, img_h))
     left_line, left_meta = _pick_rep_line(
         lines_left_use,
@@ -3192,6 +4399,8 @@ def _complete_corners_from_lines(
         max_angle_deg=sideline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
+        min_support=sideline_min_support,
+        top_k=sideline_rep_top_k,
         line_ids=line_ids_left_use,
     )
     right_line, right_meta = _pick_rep_line(
@@ -3203,8 +4412,13 @@ def _complete_corners_from_lines(
         max_angle_deg=sideline_max_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
+        min_support=sideline_min_support,
+        top_k=sideline_rep_top_k,
         line_ids=line_ids_left_use,
     )
+    left_line_initial = left_line
+    right_line_initial = right_line
+    right_meta_initial = dict(right_meta or {})
 
     def _line_angle_from_abc(line_abc: Optional[Tuple[float, float, float]]) -> Optional[float]:
         if line_abc is None:
@@ -3259,15 +4473,18 @@ def _complete_corners_from_lines(
 
         segs = [lines_left_use[i] for i in keep_idx]
         ids = [line_ids_left_use[i] for i in keep_idx]
+        repick_angle_ref = sideline_angle_perp if sideline_angle_perp is not None else sideline_angle
         alt_line, alt_meta = _pick_rep_line(
             segs,
             y_ref=y_ref,
             x_ref=x_ref,
             pick=pick_mode,
-            angle_ref=sideline_angle,
-            max_angle_deg=sideline_max_angle_deg,
+            angle_ref=repick_angle_ref,
+            max_angle_deg=max(sideline_max_angle_deg, sideline_perp_tol_deg + 8.0),
             min_len=min_len,
             line_mask=line_mask,
+            min_support=sideline_min_support,
+            top_k=sideline_rep_top_k,
             line_ids=ids,
         )
         if alt_line is None:
@@ -3282,22 +4499,141 @@ def _complete_corners_from_lines(
     left_line, left_meta = _repick_sideline_if_needed(left_line, left_meta, "min_x")
     right_line, right_meta = _repick_sideline_if_needed(right_line, right_meta, "max_x")
 
+    def _lines_too_close(
+        line_a: Optional[Tuple[float, float, float]],
+        line_b: Optional[Tuple[float, float, float]],
+    ) -> bool:
+        if line_a is None or line_b is None:
+            return False
+        ang_a = _line_angle_from_abc(line_a)
+        ang_b = _line_angle_from_abc(line_b)
+        if ang_a is None or ang_b is None:
+            return False
+        if _angle_distance(float(ang_a), float(ang_b)) > math.radians(5.0):
+            return False
+        xa = _x_at_y(line_a, y_ref)
+        xb = _x_at_y(line_b, y_ref)
+        if xa is not None and xb is not None and math.isfinite(float(xa)) and math.isfinite(float(xb)):
+            return abs(float(xa) - float(xb)) <= 14.0
+        aa, bb, cc = line_b
+        if abs(float(aa)) >= abs(float(bb)):
+            py = 0.0
+            px = -float(cc) / float(aa) if abs(float(aa)) > 1e-6 else 0.0
+        else:
+            px = 0.0
+            py = -float(cc) / float(bb) if abs(float(bb)) > 1e-6 else 0.0
+        return abs(_line_signed_distance(line_a, (float(px), float(py)))) <= 14.0
+
+    if _lines_too_close(left_line, right_line):
+        distinct_angle_ref = sideline_angle_perp if sideline_angle_perp is not None else sideline_angle
+        cand_right, cand_meta = _pick_rep_line(
+            lines_left_use,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="max_x",
+            angle_ref=distinct_angle_ref,
+            max_angle_deg=max(sideline_max_angle_deg, sideline_perp_tol_deg + 10.0),
+            min_len=min_len * 0.6,
+            line_mask=line_mask,
+            min_support=0.0,
+            line_ids=line_ids_left_use,
+            top_k=max(12, len(lines_left_use)),
+        )
+        if cand_right is not None and not _lines_too_close(left_line, cand_right):
+            right_line = cand_right
+            right_meta = dict(cand_meta or {})
+            right_meta["distinct_repick"] = True
+            right_meta["distinct_source"] = "lines_left_use"
+        elif right_line_initial is not None and not _lines_too_close(left_line, right_line_initial):
+            right_line = right_line_initial
+            right_meta = dict(right_meta_initial or {})
+            right_meta["distinct_repick"] = True
+            right_meta["distinct_source"] = "initial_pick"
+        elif right_line is not None:
+            right_meta = dict(right_meta or {})
+            right_meta["distinct_repick"] = False
+            right_meta["distinct_source"] = "same_as_left"
+
     if right_line is None and lines_left_use:
         right_line, right_meta = _pick_rep_line(
             lines_left_use,
             y_ref=y_ref,
             x_ref=x_ref,
             pick="max_x",
-            angle_ref=sideline_angle,
+            angle_ref=sideline_angle_perp if sideline_angle_perp is not None else sideline_angle,
             max_angle_deg=max(sideline_max_angle_deg, 45.0),
             min_len=min_len * 0.6,
             line_mask=line_mask,
+            min_support=0.0,
             line_ids=line_ids_left_use,
         )
+
+    def _pick_right_sideline_strict(
+        left_abc: Optional[Tuple[float, float, float]],
+        current_right_abc: Optional[Tuple[float, float, float]],
+    ) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any]]:
+        if not lines_left_use:
+            return current_right_abc, dict(right_meta or {})
+        left_ang = _line_angle_from_abc(left_abc)
+        strict_perp_tol = math.radians(float(max(6.0, sideline_right_strict_perp_deg)))
+        strict_parallel_tol = math.radians(float(max(3.0, sideline_right_strict_parallel_deg)))
+        x_left = _x_at_y(left_abc, y_ref) if left_abc is not None else None
+        x_right_curr = _x_at_y(current_right_abc, y_ref) if current_right_abc is not None else None
+        candidates: list[Tuple[float, Tuple[float, float, float], Dict[str, Any]]] = []
+        for i, seg in enumerate(lines_left_use):
+            x1s, y1s, x2s, y2s = seg
+            line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+            xi = _x_at_y(line_i, y_ref)
+            if xi is None or (not math.isfinite(float(xi))):
+                continue
+            ang_i = _line_angle_from_abc(line_i)
+            if ang_i is None:
+                continue
+            if baseline_angle is not None:
+                d_perp = abs(_angle_distance(float(ang_i), float(baseline_angle)) - 0.5 * math.pi)
+                if d_perp > strict_perp_tol:
+                    continue
+            if left_ang is not None and _angle_distance(float(ang_i), float(left_ang)) > strict_parallel_tol:
+                continue
+            if x_left is not None and float(xi) <= float(x_left) + float(sideline_right_min_sep_px):
+                continue
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            sup = _line_support((x1s, y1s, x2s, y2s), line_mask) if line_mask is not None else None
+            score = float(xi + 0.04 * seg_len + 20.0 * (float(sup) if sup is not None else 0.0))
+            lid = line_ids_left_use[i] if i < len(line_ids_left_use) else None
+            candidates.append(
+                (
+                    score,
+                    line_i,
+                    {
+                        "theta_deg": float(math.degrees(float(ang_i))),
+                        "length": float(seg_len),
+                        "support": float(sup) if sup is not None else None,
+                        "line_id": lid,
+                        "score": float(score),
+                        "strict_right_pick": True,
+                        "strict_right_x_at_y": float(xi),
+                    },
+                )
+            )
+        if not candidates:
+            out = dict(right_meta or {})
+            out["strict_right_pick"] = False
+            out["strict_right_candidates"] = 0
+            return current_right_abc, out
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_line, best_meta = candidates[0]
+        out = dict(best_meta or {})
+        out["strict_right_pick"] = True
+        out["strict_right_candidates"] = int(len(candidates))
+        out["strict_right_best_score"] = float(best_score)
+        if x_right_curr is not None and math.isfinite(float(x_right_curr)):
+            out["strict_right_prev_x_at_y"] = float(x_right_curr)
+        return best_line, out
     sideline_fallback_used = False
     if (left_line is None or right_line is None) and (len(lines_left_use) != len(lines_left)):
         sideline_fallback_used = True
-        sideline_angle = sideline_angle_raw
+        sideline_angle = sideline_angle_raw or sideline_angle
         left_line, left_meta = _pick_rep_line(
             lines_left,
             y_ref=y_ref,
@@ -3307,6 +4643,7 @@ def _complete_corners_from_lines(
             max_angle_deg=sideline_max_angle_deg,
             min_len=min_len,
             line_mask=line_mask,
+            min_support=0.0,
             line_ids=line_ids_left,
         )
         right_line, right_meta = _pick_rep_line(
@@ -3318,6 +4655,7 @@ def _complete_corners_from_lines(
             max_angle_deg=sideline_max_angle_deg,
             min_len=min_len,
             line_mask=line_mask,
+            min_support=0.0,
             line_ids=line_ids_left,
         )
         if right_line is None and lines_left:
@@ -3330,30 +4668,860 @@ def _complete_corners_from_lines(
                 max_angle_deg=max(sideline_max_angle_deg, 45.0),
                 min_len=min_len * 0.6,
                 line_mask=line_mask,
+                min_support=0.0,
                 line_ids=line_ids_left,
             )
-    bottom_line, bottom_meta = _pick_rep_line(
-        lines_bottom,
-        y_ref=y_ref,
-        x_ref=x_ref,
-        pick="max_y",
-        angle_ref=baseline_angle,
-        max_angle_deg=baseline_max_angle_deg,
-        min_len=min_len,
-        line_mask=line_mask,
-        line_ids=line_ids_bottom,
-    )
+    def _pick_bottom_line_disambiguated(
+        segs: Sequence[Tuple[float, float, float, float]],
+        seg_ids: Sequence[Optional[int]],
+    ) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any]]:
+        cands: list[Dict[str, Any]] = []
+        tol_rad = math.radians(float(max(5.0, baseline_pick_angle_deg)))
+        for idx, seg in enumerate(segs):
+            x1s, y1s, x2s, y2s = [float(v) for v in seg]
+            line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+            ang_i = float(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))
+            if baseline_angle is not None and _angle_distance(ang_i, float(baseline_angle)) > tol_rad:
+                continue
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            if seg_len < (0.55 * min_len):
+                continue
+            y_at_ref = _y_at_x(line_i, x_ref)
+            if y_at_ref is None or (not math.isfinite(float(y_at_ref))):
+                y_at_ref = float(0.5 * (y1s + y2s))
+            support = _line_support((x1s, y1s, x2s, y2s), line_mask) if line_mask is not None else None
+            if support is not None and float(support) < max(0.0, 0.55 * baseline_min_support):
+                continue
+            line_id_val: Optional[int] = None
+            if idx < len(seg_ids):
+                raw_id = seg_ids[idx]
+                line_id_val = int(raw_id) if raw_id is not None else None
+            cands.append(
+                {
+                    "line": line_i,
+                    "line_id": line_id_val,
+                    "theta_deg": float(math.degrees(ang_i)),
+                    "length": float(seg_len),
+                    "support": float(support) if support is not None else None,
+                    "y_at_ref": float(y_at_ref),
+                }
+            )
+        if not cands:
+            return None, {"reason": "no_filtered_candidates"}
+
+        cands.sort(key=lambda d: float(d["y_at_ref"]), reverse=True)
+        chosen = cands[0]
+        neighbor_found = False
+        for c in cands[1:]:
+            dy = float(chosen["y_at_ref"]) - float(c["y_at_ref"])
+            if dy < baseline_neighbor_gap_min_px or dy > baseline_neighbor_gap_max_px:
+                continue
+            if baseline_angle is not None:
+                if abs(float(c["theta_deg"]) - float(chosen["theta_deg"])) > max(6.0, baseline_pick_angle_deg):
+                    continue
+            neighbor_found = True
+            break
+        out_meta = {
+            "line_id": chosen.get("line_id"),
+            "theta_deg": float(chosen["theta_deg"]),
+            "length": float(chosen["length"]),
+            "support": float(chosen["support"]) if chosen.get("support") is not None else None,
+            "score": float(chosen["y_at_ref"]),
+            "picked_by_completion_baseline_rule": True,
+            "neighbor_parallel_found": bool(neighbor_found),
+            "num_candidates": int(len(cands)),
+        }
+        return chosen["line"], out_meta
+
+    line_ids_bottom_seq = list(line_ids_bottom) if line_ids_bottom is not None else [None] * len(lines_bottom)
+    bottom_line, bottom_meta = _pick_bottom_line_disambiguated(lines_bottom, line_ids_bottom_seq)
+    if bottom_line is None and lines_bottom:
+        bottom_line, bottom_meta = _pick_rep_line(
+            lines_bottom,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="max_y",
+            angle_ref=baseline_angle,
+            max_angle_deg=baseline_pick_angle_deg,
+            min_len=min_len * 0.65,
+            line_mask=line_mask,
+            min_support=max(0.0, 0.5 * baseline_min_support),
+            line_ids=line_ids_bottom,
+        )
+    if bottom_line is None and lines_bottom:
+        bottom_line, bottom_meta = _pick_rep_line(
+            lines_bottom,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="max_y",
+            angle_ref=baseline_angle,
+            max_angle_deg=max(baseline_max_angle_deg, 35.0),
+            min_len=min_len * 0.6,
+            line_mask=line_mask,
+            min_support=0.0,
+            line_ids=line_ids_bottom,
+        )
+
+    def _line_span_on_baseline(
+        left_abc: Optional[Tuple[float, float, float]],
+        right_abc: Optional[Tuple[float, float, float]],
+        baseline_abc: Optional[Tuple[float, float, float]],
+    ) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
+        if left_abc is None or right_abc is None or baseline_abc is None:
+            return None
+        p_l = _intersect_lines(left_abc, baseline_abc)
+        p_r = _intersect_lines(right_abc, baseline_abc)
+        if p_l is None or p_r is None:
+            return None
+        if (not np.all(np.isfinite(p_l))) or (not np.all(np.isfinite(p_r))):
+            return None
+        span = float(abs(float(p_r[0]) - float(p_l[0])))
+        return span, p_l, p_r
+
+    sideline_left_perp_err_deg: Optional[float] = None
+    sideline_right_perp_err_deg: Optional[float] = None
+    sideline_lr_nonparallel = False
+    sideline_need_repick = False
+    if bottom_line is not None and lines_left_use:
+        curr_span_info = _line_span_on_baseline(left_line, right_line, bottom_line)
+        curr_span = float(curr_span_info[0]) if curr_span_info is not None else 0.0
+        span_min_px = float(_env_float("BADC_COMPLETION_SIDELINE_MIN_SPAN_PX", 220.0))
+        span_margin_px = float(_env_float("BADC_COMPLETION_SIDELINE_SPAN_MARGIN_PX", 18.0))
+        err_l = _perp_error_to_baseline(left_line)
+        err_r = _perp_error_to_baseline(right_line)
+        sideline_left_perp_err_deg = float(math.degrees(err_l)) if err_l is not None else None
+        sideline_right_perp_err_deg = float(math.degrees(err_r)) if err_r is not None else None
+        left_bad_perp = (
+            sideline_left_perp_err_deg is not None and sideline_left_perp_err_deg > sideline_bad_perp_deg
+        )
+        right_bad_perp = (
+            sideline_right_perp_err_deg is not None and sideline_right_perp_err_deg > sideline_bad_perp_deg
+        )
+        ang_l = _line_angle_from_abc(left_line)
+        ang_r = _line_angle_from_abc(right_line)
+        if ang_l is not None and ang_r is not None:
+            lr_nonparallel = (
+                math.degrees(abs(_angle_distance(float(ang_l), float(ang_r))))
+                > sideline_lr_parallel_tol_deg
+            )
+        sideline_lr_nonparallel = bool(lr_nonparallel)
+        need_lr_repick = bool(curr_span < span_min_px or left_bad_perp or right_bad_perp or lr_nonparallel)
+        sideline_need_repick = bool(need_lr_repick)
+        if left_bad_perp or right_bad_perp or lr_nonparallel:
+            strict_right_line, strict_right_meta = _pick_right_sideline_strict(left_line, right_line)
+            if strict_right_line is not None:
+                right_line = strict_right_line
+                right_meta = dict(strict_right_meta or {})
+                err_r2 = _perp_error_to_baseline(right_line)
+                sideline_right_perp_err_deg = float(math.degrees(err_r2)) if err_r2 is not None else None
+                ang_l2 = _line_angle_from_abc(left_line)
+                ang_r2 = _line_angle_from_abc(right_line)
+                if ang_l2 is not None and ang_r2 is not None:
+                    sideline_lr_nonparallel = (
+                        math.degrees(abs(_angle_distance(float(ang_l2), float(ang_r2))))
+                        > sideline_lr_parallel_tol_deg
+                    )
+                sideline_need_repick = bool(
+                    curr_span < span_min_px
+                    or (sideline_right_perp_err_deg is not None and sideline_right_perp_err_deg > sideline_bad_perp_deg)
+                    or sideline_lr_nonparallel
+                )
+        # If current left/right are too close on baseline, repick from baseline intersections.
+        if sideline_need_repick:
+            side_perp_tol = math.radians(float(max(6.0, sideline_repick_perp_tol_deg)))
+            ext_x0 = float(x0) - 0.25 * float(max(1.0, x1 - x0))
+            ext_x1 = float(x1) + 0.25 * float(max(1.0, x1 - x0))
+            ext_y0 = float(y0) - 0.20 * float(max(1.0, y1 - y0))
+            ext_y1 = float(y1) + 0.45 * float(max(1.0, y1 - y0))
+            cand_lr: list[Tuple[float, Tuple[float, float, float], Dict[str, Any]]] = []
+            for i, seg in enumerate(lines_left_use):
+                x1s, y1s, x2s, y2s = seg
+                line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+                p_i = _intersect_lines(line_i, bottom_line)
+                if p_i is None or (not np.all(np.isfinite(p_i))):
+                    continue
+                px, py = float(p_i[0]), float(p_i[1])
+                if px < ext_x0 or px > ext_x1 or py < ext_y0 or py > ext_y1:
+                    continue
+                ang_i = float(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))
+                if baseline_angle is not None:
+                    d_perp = abs(_angle_distance(ang_i, float(baseline_angle)) - 0.5 * math.pi)
+                    if d_perp > side_perp_tol:
+                        continue
+                len_i = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+                sup_i = _line_support((x1s, y1s, x2s, y2s), line_mask) if line_mask is not None else None
+                score_i = float(len_i * (0.5 + 0.5 * (sup_i if sup_i is not None else 0.0)))
+                lid_i = line_ids_left_use[i] if i < len(line_ids_left_use) else None
+                cand_lr.append(
+                    (
+                        px,
+                        line_i,
+                        {
+                            "theta_deg": float(math.degrees(ang_i)),
+                            "length": float(len_i),
+                            "support": float(sup_i) if sup_i is not None else None,
+                            "line_id": lid_i,
+                            "score": float(score_i),
+                            "picked_by_baseline_span": True,
+                            "baseline_cross_x": float(px),
+                            "baseline_cross_y": float(py),
+                        },
+                    )
+                )
+            if len(cand_lr) >= 2:
+                cand_lr.sort(key=lambda t: t[0])
+                left_pool = cand_lr[: min(4, len(cand_lr))]
+                right_pool = cand_lr[max(0, len(cand_lr) - 4) :]
+                best_pair = None
+                best_pair_key = None
+                for xl, ll, ml in left_pool:
+                    for xr, lr, mr in right_pool:
+                        if xr <= xl:
+                            continue
+                        ang_l = _line_angle_from_abc(ll)
+                        ang_r = _line_angle_from_abc(lr)
+                        if ang_l is not None and ang_r is not None:
+                            if (
+                                math.degrees(abs(_angle_distance(float(ang_l), float(ang_r))))
+                                > sideline_lr_parallel_tol_deg
+                            ):
+                                continue
+                        if baseline_angle is not None:
+                            dpl = _perp_error_to_baseline(ll)
+                            dpr = _perp_error_to_baseline(lr)
+                            if dpl is not None and math.degrees(float(dpl)) > sideline_right_strict_perp_deg:
+                                continue
+                            if dpr is not None and math.degrees(float(dpr)) > sideline_right_strict_perp_deg:
+                                continue
+                        span = float(xr - xl)
+                        pair_key = float(span + 0.02 * (float(ml.get("score", 0.0)) + float(mr.get("score", 0.0))))
+                        if best_pair_key is None or pair_key > best_pair_key:
+                            best_pair_key = pair_key
+                            best_pair = (ll, ml, lr, mr, span)
+                if best_pair is not None:
+                    ll, ml, lr, mr, span = best_pair
+                    min_req_span = max(span_min_px, curr_span + span_margin_px) if curr_span < span_min_px else span_min_px
+                    if span >= min_req_span:
+                        left_line = ll
+                        left_meta = dict(ml)
+                        right_line = lr
+                        right_meta = dict(mr)
+                        left_meta["span_repicked"] = True
+                        right_meta["span_repicked"] = True
+                        left_meta["span_prev"] = float(curr_span)
+                        right_meta["span_prev"] = float(curr_span)
+                        left_meta["span_new"] = float(span)
+                        right_meta["span_new"] = float(span)
+                        curr_span = float(span)
     top_line, top_meta = _pick_rep_line(
         lines_bottom,
         y_ref=y_ref,
         x_ref=x_ref,
         pick="min_y",
         angle_ref=baseline_angle,
-        max_angle_deg=baseline_max_angle_deg,
+        max_angle_deg=baseline_pick_angle_deg,
         min_len=min_len,
         line_mask=line_mask,
+        min_support=baseline_min_support,
         line_ids=line_ids_bottom,
     )
+    if top_line is None and lines_bottom:
+        top_line, top_meta = _pick_rep_line(
+            lines_bottom,
+            y_ref=y_ref,
+            x_ref=x_ref,
+            pick="min_y",
+            angle_ref=baseline_angle,
+            max_angle_deg=max(baseline_max_angle_deg, 35.0),
+            min_len=min_len * 0.6,
+            line_mask=line_mask,
+            min_support=0.0,
+            line_ids=line_ids_bottom,
+        )
+
+    def _pick_sideline_pair_projective(
+        baseline_abc: Optional[Tuple[float, float, float]],
+        top_abc: Optional[Tuple[float, float, float]],
+    ) -> Tuple[
+        Optional[Tuple[float, float, float]],
+        Dict[str, Any],
+        Optional[Tuple[float, float, float]],
+        Dict[str, Any],
+        Dict[str, Any],
+    ]:
+        if baseline_abc is None or not lines_left_use:
+            return None, {}, None, {}, {"used": False, "reason": "no_baseline_or_lines"}
+
+        floor_w = float(max(1.0, x1 - x0))
+        floor_h = float(max(1.0, y1 - y0))
+        min_len_local = float(max(24.0, min_len * 0.55))
+        min_span_ratio = float(max(0.10, min(0.95, _env_float("BADC_COMPLETION_PROJECTIVE_MIN_BASE_SPAN_RATIO", 0.30))))
+        min_top_span_ratio = float(max(0.04, min(0.90, _env_float("BADC_COMPLETION_PROJECTIVE_MIN_TOP_SPAN_RATIO", 0.10))))
+        min_span_px = float(max(sideline_right_min_sep_px, _env_float("BADC_COMPLETION_PROJECTIVE_MIN_BASE_SPAN_PX", 0.0)))
+        min_base_span = float(max(min_span_px, min_span_ratio * floor_w))
+        min_top_span = float(max(18.0, min_top_span_ratio * floor_w))
+        min_base_y_frac = float(max(0.0, min(0.95, _env_float("BADC_COMPLETION_PROJECTIVE_MIN_BASE_Y_FRAC", 0.35))))
+        min_base_y_px = float(y0 + min_base_y_frac * floor_h)
+        pair_min_support = float(max(0.0, min(1.0, _env_float("BADC_COMPLETION_PROJECTIVE_PAIR_MIN_SUPPORT", 0.05))))
+        pair_min_support_hard = float(
+            max(
+                0.0,
+                min(
+                    pair_min_support,
+                    _env_float("BADC_COMPLETION_PROJECTIVE_PAIR_MIN_SUPPORT_HARD", 0.0),
+                ),
+            )
+        )
+        support_penalty_w = float(
+            max(0.0, _env_float("BADC_COMPLETION_PROJECTIVE_SUPPORT_PENALTY_W", 22.0))
+        )
+        ext_x0 = float(x0) - float(_env_float("BADC_COMPLETION_PROJECTIVE_X_PAD_FRAC", 0.30)) * floor_w
+        ext_x1 = float(x1) + float(_env_float("BADC_COMPLETION_PROJECTIVE_X_PAD_FRAC", 0.30)) * floor_w
+        ext_y0 = float(y0) - float(_env_float("BADC_COMPLETION_PROJECTIVE_TOP_PAD_FRAC", 0.22)) * floor_h
+        ext_y1 = float(y1) + float(_env_float("BADC_COMPLETION_PROJECTIVE_BOTTOM_PAD_FRAC", 0.50)) * floor_h
+        pair_top_k = int(max(4, _env_int("BADC_COMPLETION_PROJECTIVE_POOL_TOP_K", 7)))
+        min_edge_req = float(
+            max(
+                8.0,
+                _env_float("BADC_COMPLETION_PROJECTIVE_MIN_EDGE_FRAC", 0.018) * float(min(max(1, img_w), max(1, img_h))),
+            )
+        )
+
+        cand: list[Dict[str, Any]] = []
+        for i, seg in enumerate(lines_left_use):
+            x1s, y1s, x2s, y2s = seg
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            if seg_len < min_len_local:
+                continue
+            line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+            p_base = _intersect_lines(line_i, baseline_abc)
+            if p_base is None or (not np.all(np.isfinite(p_base))):
+                continue
+            xb = float(p_base[0])
+            yb = float(p_base[1])
+            # Baseline intersections can project outside visible y-range in strong perspective.
+            # Keep broad x-only gating to avoid discarding the true far-right sideline.
+            if xb < ext_x0 or xb > ext_x1:
+                continue
+            if yb < ext_y0 or yb > ext_y1:
+                continue
+
+            p_top = None
+            xt = None
+            yt = None
+            if top_abc is not None:
+                p_top = _intersect_lines(line_i, top_abc)
+                if p_top is None or (not np.all(np.isfinite(p_top))):
+                    continue
+                xt = float(p_top[0])
+                yt = float(p_top[1])
+                if xt < ext_x0 or xt > ext_x1:
+                    continue
+
+            sup = _line_support((x1s, y1s, x2s, y2s), line_mask) if line_mask is not None else None
+            lid = line_ids_left_use[i] if i < len(line_ids_left_use) else None
+            quality = float(seg_len * (0.4 + 0.6 * (float(sup) if sup is not None else 0.0)))
+            cand.append(
+                {
+                    "line": line_i,
+                    "x_base": float(xb),
+                    "y_base": float(yb),
+                    "x_top": float(xt) if xt is not None else None,
+                    "y_top": float(yt) if yt is not None else None,
+                    "length": float(seg_len),
+                    "support": float(sup) if sup is not None else None,
+                    "score": float(quality),
+                    "line_id": lid,
+                    "theta_deg": float(math.degrees(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))),
+                }
+            )
+
+        meta_local: Dict[str, Any] = {
+            "used": False,
+            "num_candidates": int(len(cand)),
+            "min_base_span_req": float(min_base_span),
+            "min_top_span_req": float(min_top_span),
+            "min_edge_req": float(min_edge_req),
+            "min_base_y_px": float(min_base_y_px),
+            "pair_min_support": float(pair_min_support),
+            "pair_min_support_hard": float(pair_min_support_hard),
+            "support_penalty_w": float(support_penalty_w),
+            "parallel_tol_deg": float(sideline_projective_parallel_tol_deg),
+            "parallel_hard_deg": float(sideline_projective_parallel_hard_deg),
+            "perp_tol_deg": float(sideline_projective_perp_tol_deg),
+            "perp_hard_deg": float(sideline_projective_perp_hard_deg),
+            "parallel_penalty_w": float(sideline_projective_parallel_penalty_w),
+            "perp_penalty_w": float(sideline_projective_perp_penalty_w),
+            "max_base_y_spread_px": float(sideline_projective_base_y_spread_frac * floor_h),
+        }
+        reject_stats = {
+            "base_span": 0,
+            "base_y": 0,
+            "support": 0,
+            "support_hard": 0,
+            "parallel": 0,
+            "perp": 0,
+            "base_y_spread": 0,
+            "top_span": 0,
+            "quad_convex": 0,
+            "quad_edge": 0,
+        }
+        cand_preview = sorted(cand, key=lambda d: float(d["x_base"]))
+        meta_local["candidates"] = [
+            {
+                "line_id": c.get("line_id"),
+                "x_base": float(c.get("x_base")),
+                "y_base": float(c.get("y_base")),
+                "x_top": float(c.get("x_top")) if c.get("x_top") is not None else None,
+                "y_top": float(c.get("y_top")) if c.get("y_top") is not None else None,
+                "support": float(c.get("support")) if c.get("support") is not None else None,
+                "length": float(c.get("length")),
+                "theta_deg": float(c.get("theta_deg")),
+            }
+            for c in cand_preview[: min(24, len(cand_preview))]
+        ]
+        if len(cand) < 2:
+            meta_local["reason"] = "insufficient_candidates"
+            return None, {}, None, {}, meta_local
+
+        cand.sort(key=lambda d: float(d["x_base"]))
+        left_pool = cand[: min(pair_top_k, len(cand))]
+        right_pool = cand[max(0, len(cand) - pair_top_k) :]
+
+        best_tuple = None
+        best_key = None
+        for cl in left_pool:
+            for cr in right_pool:
+                if float(cr["x_base"]) <= float(cl["x_base"]):
+                    continue
+                base_span = float(cr["x_base"] - cl["x_base"])
+                if base_span < min_base_span:
+                    reject_stats["base_span"] += 1
+                    continue
+                if max(float(cl["y_base"]), float(cr["y_base"])) < min_base_y_px:
+                    reject_stats["base_y"] += 1
+                    continue
+                sup_l = float(cl["support"]) if cl["support"] is not None else 0.0
+                sup_r = float(cr["support"]) if cr["support"] is not None else 0.0
+                min_pair_sup = min(sup_l, sup_r)
+                if min_pair_sup < pair_min_support_hard:
+                    reject_stats["support_hard"] += 1
+                    continue
+                ang_l = _line_angle_from_abc(cl["line"])
+                ang_r = _line_angle_from_abc(cr["line"])
+                if ang_l is None or ang_r is None:
+                    reject_stats["parallel"] += 1
+                    continue
+                parallel_err_deg = float(math.degrees(abs(_angle_distance(float(ang_l), float(ang_r)))))
+                if parallel_err_deg > float(sideline_projective_parallel_hard_deg):
+                    reject_stats["parallel"] += 1
+                    continue
+                parallel_penalty_deg = max(0.0, parallel_err_deg - float(sideline_projective_parallel_tol_deg))
+                if baseline_angle is not None:
+                    perp_l_deg = float(
+                        math.degrees(abs(_angle_distance(float(ang_l), float(baseline_angle)) - 0.5 * math.pi))
+                    )
+                    perp_r_deg = float(
+                        math.degrees(abs(_angle_distance(float(ang_r), float(baseline_angle)) - 0.5 * math.pi))
+                    )
+                    if max(perp_l_deg, perp_r_deg) > float(sideline_projective_perp_hard_deg):
+                        reject_stats["perp"] += 1
+                        continue
+                    perp_penalty_deg = max(
+                        0.0,
+                        max(perp_l_deg, perp_r_deg) - float(sideline_projective_perp_tol_deg),
+                    )
+                else:
+                    perp_l_deg = None
+                    perp_r_deg = None
+                    perp_penalty_deg = 0.0
+                base_y_spread = float(abs(float(cl["y_base"]) - float(cr["y_base"])))
+                if base_y_spread > float(sideline_projective_base_y_spread_frac * floor_h):
+                    reject_stats["base_y_spread"] += 1
+                    continue
+
+                lb = _intersect_lines(cl["line"], baseline_abc)
+                rb = _intersect_lines(cr["line"], baseline_abc)
+                if lb is None or rb is None or (not np.all(np.isfinite(lb))) or (not np.all(np.isfinite(rb))):
+                    continue
+
+                lt = None
+                rt = None
+                top_span = base_span
+                if top_abc is not None:
+                    lt = _intersect_lines(cl["line"], top_abc)
+                    rt = _intersect_lines(cr["line"], top_abc)
+                    if lt is None or rt is None or (not np.all(np.isfinite(lt))) or (not np.all(np.isfinite(rt))):
+                        continue
+                    top_span = float(rt[0] - lt[0])
+                    if top_span < min_top_span:
+                        reject_stats["top_span"] += 1
+                        continue
+
+                if lt is not None and rt is not None:
+                    quad = np.asarray([lb, rb, rt, lt], dtype=np.float32).reshape(4, 2)
+                    if not _is_convex_quad(quad):
+                        reject_stats["quad_convex"] += 1
+                        continue
+                    if float(np.min(_quad_edges(quad))) < min_edge_req:
+                        reject_stats["quad_edge"] += 1
+                        continue
+
+                sep_quality = float(base_span + 0.45 * top_span)
+                line_quality = float(0.03 * float(cl["score"]) + 0.03 * float(cr["score"]))
+                support_bonus = float(
+                    35.0
+                    * min(
+                        sup_l,
+                        sup_r,
+                    )
+                )
+                support_penalty = max(0.0, float(pair_min_support) - float(min_pair_sup))
+                pair_key = float(
+                    sep_quality
+                    + line_quality
+                    + support_bonus
+                    - float(support_penalty_w) * float(support_penalty)
+                    - float(sideline_projective_parallel_penalty_w) * float(parallel_penalty_deg)
+                    - float(sideline_projective_perp_penalty_w) * float(perp_penalty_deg)
+                )
+                if best_key is None or pair_key > best_key:
+                    best_key = pair_key
+                    best_tuple = (
+                        cl,
+                        cr,
+                        base_span,
+                        top_span,
+                        pair_key,
+                        parallel_err_deg,
+                        perp_l_deg,
+                        perp_r_deg,
+                        parallel_penalty_deg,
+                        perp_penalty_deg,
+                        base_y_spread,
+                    )
+
+        if best_tuple is None:
+            meta_local["reason"] = "no_valid_pair"
+            meta_local["reject_stats"] = reject_stats
+            return None, {}, None, {}, meta_local
+
+        (
+            cl,
+            cr,
+            base_span,
+            top_span,
+            pair_key,
+            parallel_err_deg,
+            perp_l_deg,
+            perp_r_deg,
+            parallel_penalty_deg,
+            perp_penalty_deg,
+            base_y_spread,
+        ) = best_tuple
+        left_out = dict(cl)
+        right_out = dict(cr)
+        left_out["projective_pair_pick"] = True
+        right_out["projective_pair_pick"] = True
+        left_out["projective_pair_base_span_px"] = float(base_span)
+        right_out["projective_pair_base_span_px"] = float(base_span)
+        left_out["projective_pair_top_span_px"] = float(top_span)
+        right_out["projective_pair_top_span_px"] = float(top_span)
+        left_out["projective_pair_score"] = float(pair_key)
+        right_out["projective_pair_score"] = float(pair_key)
+        left_out["projective_pair_parallel_err_deg"] = float(parallel_err_deg)
+        right_out["projective_pair_parallel_err_deg"] = float(parallel_err_deg)
+        left_out["projective_pair_parallel_penalty_deg"] = float(parallel_penalty_deg)
+        right_out["projective_pair_parallel_penalty_deg"] = float(parallel_penalty_deg)
+        left_out["projective_pair_base_y_spread_px"] = float(base_y_spread)
+        right_out["projective_pair_base_y_spread_px"] = float(base_y_spread)
+        if perp_l_deg is not None:
+            left_out["projective_pair_perp_err_deg"] = float(perp_l_deg)
+        if perp_r_deg is not None:
+            right_out["projective_pair_perp_err_deg"] = float(perp_r_deg)
+        left_out["projective_pair_perp_penalty_deg"] = float(perp_penalty_deg)
+        right_out["projective_pair_perp_penalty_deg"] = float(perp_penalty_deg)
+
+        meta_local.update(
+            {
+                "used": True,
+                "reason": "ok",
+                "pair_score": float(pair_key),
+                "pair_base_span_px": float(base_span),
+                "pair_top_span_px": float(top_span),
+                "left_line_id": cl.get("line_id"),
+                "right_line_id": cr.get("line_id"),
+                "pair_parallel_err_deg": float(parallel_err_deg),
+                "pair_parallel_penalty_deg": float(parallel_penalty_deg),
+                "pair_perp_left_err_deg": float(perp_l_deg) if perp_l_deg is not None else None,
+                "pair_perp_right_err_deg": float(perp_r_deg) if perp_r_deg is not None else None,
+                "pair_perp_penalty_deg": float(perp_penalty_deg),
+                "pair_base_y_spread_px": float(base_y_spread),
+                "reject_stats": reject_stats,
+            }
+        )
+        return cl["line"], left_out, cr["line"], right_out, meta_local
+
+    projective_pair_meta: Dict[str, Any] = {"used": False}
+    projective_pair_applied = False
+    projective_pair_rejected_reason = None
+    left_line_before_projective = left_line
+    right_line_before_projective = right_line
+    left_meta_before_projective = dict(left_meta or {})
+    right_meta_before_projective = dict(right_meta or {})
+    if sideline_projective_pick and bottom_line is not None:
+        p_left, p_left_meta, p_right, p_right_meta, p_meta = _pick_sideline_pair_projective(bottom_line, top_line)
+        projective_pair_meta = dict(p_meta or {})
+        if p_left is not None and p_right is not None:
+            ang_l = _line_angle_from_abc(p_left)
+            ang_r = _line_angle_from_abc(p_right)
+            if ang_l is None or ang_r is None:
+                projective_pair_rejected_reason = "pair_angle_invalid"
+            else:
+                pair_parallel_err = float(math.degrees(abs(_angle_distance(float(ang_l), float(ang_r)))))
+                if pair_parallel_err > float(sideline_projective_parallel_hard_deg):
+                    projective_pair_rejected_reason = "pair_not_parallel"
+                elif baseline_angle is not None:
+                    perp_l = float(
+                        math.degrees(abs(_angle_distance(float(ang_l), float(baseline_angle)) - 0.5 * math.pi))
+                    )
+                    perp_r = float(
+                        math.degrees(abs(_angle_distance(float(ang_r), float(baseline_angle)) - 0.5 * math.pi))
+                    )
+                    if max(perp_l, perp_r) > float(sideline_projective_perp_hard_deg):
+                        projective_pair_rejected_reason = "pair_not_perpendicular_to_baseline"
+            if projective_pair_rejected_reason is None:
+                left_line = p_left
+                right_line = p_right
+                left_meta = dict(p_left_meta or {})
+                right_meta = dict(p_right_meta or {})
+                projective_pair_applied = True
+            else:
+                left_line = left_line_before_projective
+                right_line = right_line_before_projective
+                left_meta = left_meta_before_projective
+                right_meta = right_meta_before_projective
+                projective_pair_meta["used"] = False
+                projective_pair_meta["reason"] = f"rejected_{projective_pair_rejected_reason}"
+
+    def _refine_bottom_line_with_sides(
+        baseline_abc: Optional[Tuple[float, float, float]],
+        left_abc: Optional[Tuple[float, float, float]],
+        right_abc: Optional[Tuple[float, float, float]],
+        baseline_meta_in: Dict[str, Any],
+    ) -> Tuple[Optional[Tuple[float, float, float]], Dict[str, Any], Dict[str, Any]]:
+        meta_refine: Dict[str, Any] = {"enabled": bool(_env_flag("BADC_COMPLETION_BASELINE_REFINE_WITH_SIDES", True))}
+        if not meta_refine["enabled"]:
+            meta_refine["reason"] = "disabled"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+        if baseline_abc is None or left_abc is None or right_abc is None:
+            meta_refine["reason"] = "missing_lines"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+        if not lines_bottom:
+            meta_refine["reason"] = "no_bottom_lines"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+
+        floor_w_local = float(max(1.0, x1 - x0))
+        floor_h_local = float(max(1.0, y1 - y0))
+        min_seg_len_local = float(max(20.0, min_len * 0.55))
+        min_span_local = float(
+            max(
+                120.0,
+                _env_float("BADC_COMPLETION_BASELINE_REFINE_MIN_SPAN_PX", 0.18 * floor_w_local),
+            )
+        )
+        min_cross_deg = float(max(4.0, _env_float("BADC_COMPLETION_BASELINE_REFINE_MIN_CROSS_DEG", 8.0)))
+        min_improve_px_local = float(_env_float("BADC_COMPLETION_BASELINE_REFINE_MIN_IMPROVE_PX", 16.0))
+        max_bottom_out_frac = float(max(0.6, _env_float("BADC_COMPLETION_BASELINE_REFINE_MAX_BOTTOM_OUT_FRAC", 2.4)))
+        max_bottom_y = float(y1 + max_bottom_out_frac * floor_h_local)
+        min_bottom_y = float(y0 - 0.25 * floor_h_local)
+        support_floor = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    _env_float(
+                        "BADC_COMPLETION_BASELINE_REFINE_MIN_SUPPORT",
+                        max(0.0, 0.45 * baseline_min_support),
+                    ),
+                ),
+            )
+        )
+        cand_preview_limit = int(max(4, _env_int("BADC_COMPLETION_BASELINE_REFINE_PREVIEW", 12)))
+
+        line_ids_bottom_seq = list(line_ids_bottom) if line_ids_bottom is not None else [None] * len(lines_bottom)
+        left_ang = _line_angle_from_abc(left_abc)
+        right_ang = _line_angle_from_abc(right_abc)
+        current_lb = _intersect_lines(left_abc, baseline_abc)
+        current_rb = _intersect_lines(right_abc, baseline_abc)
+        current_y_ref = _y_at_x(baseline_abc, x_ref)
+        if current_y_ref is None and current_lb is not None and current_rb is not None:
+            current_y_ref = float(0.5 * (float(current_lb[1]) + float(current_rb[1])))
+        if current_y_ref is None:
+            current_y_ref = float(y_ref)
+        current_y_ref = float(current_y_ref)
+
+        cand: list[Dict[str, Any]] = []
+        for i, seg in enumerate(lines_bottom):
+            x1s, y1s, x2s, y2s = [float(v) for v in seg]
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            if seg_len < min_seg_len_local:
+                continue
+            line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+            p_lb = _intersect_lines(left_abc, line_i)
+            p_rb = _intersect_lines(right_abc, line_i)
+            if p_lb is None or p_rb is None or (not np.all(np.isfinite(p_lb))) or (not np.all(np.isfinite(p_rb))):
+                continue
+            if float(p_lb[0]) > float(p_rb[0]):
+                p_lb, p_rb = p_rb, p_lb
+            base_span = float(math.hypot(float(p_rb[0] - p_lb[0]), float(p_rb[1] - p_lb[1])))
+            if base_span < min_span_local:
+                continue
+            y_low = float(max(float(p_lb[1]), float(p_rb[1])))
+            y_high = float(min(float(p_lb[1]), float(p_rb[1])))
+            if y_low > max_bottom_y or y_high < min_bottom_y:
+                continue
+            ang_i = _line_angle_from_abc(line_i)
+            if ang_i is None:
+                continue
+            if left_ang is not None:
+                cross_left = float(math.degrees(abs(_angle_distance(float(ang_i), float(left_ang)))))
+                if cross_left < min_cross_deg:
+                    continue
+            else:
+                cross_left = None
+            if right_ang is not None:
+                cross_right = float(math.degrees(abs(_angle_distance(float(ang_i), float(right_ang)))))
+                if cross_right < min_cross_deg:
+                    continue
+            else:
+                cross_right = None
+            sup = _line_support((x1s, y1s, x2s, y2s), line_mask) if line_mask is not None else None
+            if sup is not None and float(sup) < support_floor:
+                continue
+            y_ref_i = _y_at_x(line_i, x_ref)
+            if y_ref_i is None or (not math.isfinite(float(y_ref_i))):
+                y_ref_i = float(0.5 * (float(p_lb[1]) + float(p_rb[1])))
+            y_ref_i = float(y_ref_i)
+            lid_val = None
+            if i < len(line_ids_bottom_seq):
+                raw_id = line_ids_bottom_seq[i]
+                lid_val = int(raw_id) if raw_id is not None else None
+            cand.append(
+                {
+                    "line": line_i,
+                    "line_id": lid_val,
+                    "theta_deg": float(math.degrees(float(ang_i))),
+                    "length": float(seg_len),
+                    "support": float(sup) if sup is not None else None,
+                    "lb": (float(p_lb[0]), float(p_lb[1])),
+                    "rb": (float(p_rb[0]), float(p_rb[1])),
+                    "span_px": float(base_span),
+                    "y_ref": float(y_ref_i),
+                    "y_low": float(y_low),
+                    "y_high": float(y_high),
+                    "cross_left_deg": float(cross_left) if cross_left is not None else None,
+                    "cross_right_deg": float(cross_right) if cross_right is not None else None,
+                }
+            )
+
+        if not cand:
+            meta_refine["reason"] = "no_valid_candidates"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+
+        gap_min_px = float(max(4.0, baseline_neighbor_gap_min_px))
+        gap_max_px = float(max(gap_min_px + 2.0, baseline_neighbor_gap_max_px))
+        neighbor_ang_tol_deg = float(max(8.0, _env_float("BADC_COMPLETION_BASELINE_REFINE_NEIGHBOR_ANG_TOL_DEG", 22.0)))
+        neighbor_bonus = float(max(0.0, _env_float("BADC_COMPLETION_BASELINE_REFINE_NEIGHBOR_BONUS", 55.0)))
+        best: Optional[Dict[str, Any]] = None
+        best_key = float("-inf")
+        for ci in cand:
+            neighbor_found = False
+            for cj in cand:
+                if ci is cj:
+                    continue
+                dy = float(ci["y_ref"]) - float(cj["y_ref"])
+                if dy < gap_min_px or dy > gap_max_px:
+                    continue
+                if abs(float(ci["theta_deg"]) - float(cj["theta_deg"])) > neighbor_ang_tol_deg:
+                    continue
+                neighbor_found = True
+                break
+            sup_i = float(ci["support"]) if ci.get("support") is not None else 0.0
+            key = float(
+                1.00 * float(ci["y_ref"])
+                + 0.30 * float(ci["span_px"])
+                + 45.0 * sup_i
+                + 0.02 * float(ci["length"])
+                + (neighbor_bonus if neighbor_found else 0.0)
+            )
+            ci["neighbor_parallel_found"] = bool(neighbor_found)
+            ci["score"] = float(key)
+            if key > best_key:
+                best_key = float(key)
+                best = ci
+
+        preview_sorted = sorted(cand, key=lambda d: float(d["score"]), reverse=True)
+        meta_refine["candidates"] = [
+            {
+                "line_id": c.get("line_id"),
+                "y_ref": float(c.get("y_ref")),
+                "span_px": float(c.get("span_px")),
+                "support": float(c.get("support")) if c.get("support") is not None else None,
+                "theta_deg": float(c.get("theta_deg")),
+                "score": float(c.get("score", 0.0)),
+                "neighbor_parallel_found": bool(c.get("neighbor_parallel_found")),
+            }
+            for c in preview_sorted[: min(cand_preview_limit, len(preview_sorted))]
+        ]
+        if best is None:
+            meta_refine["reason"] = "no_best"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+        improve = float(best["y_ref"]) - float(current_y_ref)
+        meta_refine["current_y_ref"] = float(current_y_ref)
+        meta_refine["best_y_ref"] = float(best["y_ref"])
+        meta_refine["improve_px"] = float(improve)
+        if improve < min_improve_px_local:
+            meta_refine["reason"] = "insufficient_improve"
+            return baseline_abc, dict(baseline_meta_in or {}), meta_refine
+
+        out_meta = {
+            "line_id": best.get("line_id"),
+            "theta_deg": float(best["theta_deg"]),
+            "length": float(best["length"]),
+            "support": float(best["support"]) if best.get("support") is not None else None,
+            "score": float(best["score"]),
+            "picked_by_completion_baseline_refine": True,
+            "neighbor_parallel_found": bool(best.get("neighbor_parallel_found")),
+            "baseline_refine_improve_px": float(improve),
+        }
+        meta_refine["reason"] = "refined"
+        meta_refine["used"] = True
+        meta_refine["line_id"] = best.get("line_id")
+        return best["line"], out_meta, meta_refine
+
+    baseline_refine_meta: Dict[str, Any] = {}
+    if bottom_line is not None:
+        bottom_line_refined, bottom_meta_refined, baseline_refine_meta = _refine_bottom_line_with_sides(
+            bottom_line,
+            left_line,
+            right_line,
+            bottom_meta,
+        )
+        if baseline_refine_meta.get("used"):
+            bottom_line = bottom_line_refined
+            bottom_meta = bottom_meta_refined
+            if sideline_projective_pick and bottom_line is not None:
+                p_left2, p_left_meta2, p_right2, p_right_meta2, p_meta2 = _pick_sideline_pair_projective(bottom_line, top_line)
+                if p_left2 is not None and p_right2 is not None:
+                    left_line = p_left2
+                    right_line = p_right2
+                    left_meta = dict(p_left_meta2 or {})
+                    right_meta = dict(p_right_meta2 or {})
+                    projective_pair_applied = True
+                    projective_pair_rejected_reason = None
+                    projective_pair_meta = dict(p_meta2 or {})
+                    projective_pair_meta["second_pass_after_baseline_refine"] = True
     meta: Dict[str, Any] = {
         "baseline_line": bottom_line,
         "left_sideline": left_line,
@@ -3365,9 +5533,48 @@ def _complete_corners_from_lines(
         "top_line_meta": top_meta,
         "sideline_perp_tol_deg": float(sideline_perp_tol_deg),
         "sideline_perp_filter": bool(sideline_perp_filter),
+        "sideline_perp_repick": bool(sideline_perp_repick),
+        "sideline_snap_tol_deg": float(sideline_snap_tol_deg),
+        "sideline_projective_pick": bool(sideline_projective_pick),
+        "sideline_perp_min_keep": int(sideline_perp_min_keep),
+        "sideline_rep_top_k": int(sideline_rep_top_k),
+        "sideline_bad_perp_deg": float(sideline_bad_perp_deg),
+        "sideline_lr_parallel_tol_deg": float(sideline_lr_parallel_tol_deg),
+        "sideline_repick_perp_tol_deg": float(sideline_repick_perp_tol_deg),
+        "sideline_right_strict_perp_deg": float(sideline_right_strict_perp_deg),
+        "sideline_right_strict_parallel_deg": float(sideline_right_strict_parallel_deg),
+        "sideline_right_min_sep_px": float(sideline_right_min_sep_px),
+        "sideline_left_perp_err_deg": sideline_left_perp_err_deg,
+        "sideline_right_perp_err_deg": sideline_right_perp_err_deg,
+        "sideline_lr_nonparallel": bool(sideline_lr_nonparallel),
+        "sideline_need_repick": bool(sideline_need_repick),
+        "sideline_angle_raw_deg": float(math.degrees(sideline_angle_raw))
+        if sideline_angle_raw is not None
+        else None,
+        "baseline_angle_lines_deg": float(math.degrees(baseline_angle_lines))
+        if baseline_angle_lines is not None
+        else None,
+        "baseline_angle_quad_deg": float(math.degrees(baseline_angle_quad))
+        if baseline_angle_quad is not None
+        else None,
+        "baseline_angle_source": str(baseline_angle_source),
+        "baseline_ref_disagree_deg": float(baseline_ref_disagree_deg),
+        "baseline_pick_angle_deg": float(baseline_pick_angle_deg),
+        "sideline_angle_used_deg": float(math.degrees(sideline_angle)) if sideline_angle is not None else None,
+        "sideline_angle_perp_deg": float(math.degrees(sideline_angle_perp))
+        if sideline_angle_perp is not None
+        else None,
+        "sideline_snapped_to_perp": bool(sideline_snapped_to_perp),
+        "sideline_min_support": float(sideline_min_support),
+        "baseline_min_support": float(baseline_min_support),
         "sideline_candidates_before": int(len(lines_left)),
         "sideline_candidates_after": int(len(lines_left_use)),
         "sideline_fallback_used": bool(sideline_fallback_used),
+        "sideline_left_right_too_close": bool(_lines_too_close(left_line, right_line)),
+        "sideline_projective_pair_meta": projective_pair_meta if isinstance(projective_pair_meta, dict) else None,
+        "sideline_projective_pair_applied": bool(projective_pair_applied),
+        "sideline_projective_pair_rejected_reason": projective_pair_rejected_reason,
+        "baseline_refine_meta": baseline_refine_meta if isinstance(baseline_refine_meta, dict) else None,
     }
     if component_id is not None:
         meta["component_id"] = int(component_id)
@@ -3440,6 +5647,10 @@ def _refine_bottom_baseline_postfit(
     include_all = bool(_env_flag("BADC_POSTFIT_BASELINE_INCLUDE_ALL", True))
     img_angle_tol_deg = float(_env_float("BADC_POSTFIT_BASELINE_IMG_ANGLE_TOL_DEG", 14.0))
     img_pair_gap_tol_ratio = float(_env_float("BADC_POSTFIT_BASELINE_IMG_GAP_TOL_RATIO", 0.50))
+    img_min_span_frac = float(_env_float("BADC_POSTFIT_BASELINE_IMG_MIN_SPAN_FRAC", 0.12))
+    img_bottom_support_min = float(_env_float("BADC_POSTFIT_BASELINE_IMG_BOTTOM_SUPPORT_MIN", 0.15))
+    img_neighbor_gap_min_ratio = float(_env_float("BADC_POSTFIT_BASELINE_IMG_NEIGHBOR_GAP_MIN_RATIO", 0.20))
+    img_neighbor_gap_max_ratio = float(_env_float("BADC_POSTFIT_BASELINE_IMG_NEIGHBOR_GAP_MAX_RATIO", 1.60))
 
     model_corners = get_bwf_corners().astype(np.float32)
     try:
@@ -3470,6 +5681,8 @@ def _refine_bottom_baseline_postfit(
 
     tan_tol = math.tan(math.radians(max(1.0, angle_tol_deg)))
     cands: list[Dict[str, Any]] = []
+    floor_w = float(max(1.0, float(floor_bbox[2] - floor_bbox[0])))
+    x_ref = float(0.5 * (float(floor_bbox[0]) + float(floor_bbox[2])))
     for x1, y1, x2, y2 in src_lines:
         pts = np.array([[float(x1), float(y1)], [float(x2), float(y2)]], dtype=np.float32)
         pts_m = project_points(H_i2m, pts)
@@ -3492,6 +5705,8 @@ def _refine_bottom_baseline_postfit(
                 "y_m": float(0.5 * (pts_m[0, 1] + pts_m[1, 1])),
                 "x_span_m": float(abs(dx_m)),
                 "seg_len_m": float(seg_len_m),
+                "x_span_img": float(abs(x2 - x1)),
+                "seg_len_img": float(math.hypot(float(x2 - x1), float(y2 - y1))),
                 "mid_y_img": float(0.5 * (y1 + y2)),
                 "support": float(support),
                 "score": float(max(0.0, support) * min(1.0, abs(dx_m) / 6.10)),
@@ -3515,36 +5730,101 @@ def _refine_bottom_baseline_postfit(
     current_bottom_mid = float(0.5 * (ordered[0, 1] + ordered[1, 1]))
     cur = min(cands, key=lambda d: abs(float(d["y_m"])))
     current_ref_mid = float(cur["mid_y_img"])
+    cur_line = _line_from_points((float(ordered[0, 0]), float(ordered[0, 1])), (float(ordered[1, 0]), float(ordered[1, 1])))
+    cur_ang = float(np.mod(math.atan2(float(ordered[1, 1] - ordered[0, 1]), float(ordered[1, 0] - ordered[0, 0])), math.pi))
+
+    H_m2i = cv2.getPerspectiveTransform(model_corners, ordered.astype(np.float32))
+    model_w = float(np.max(model_corners[:, 0]) - np.min(model_corners[:, 0]))
+    p_gap = project_points(
+        H_m2i,
+        np.array([[0.5 * model_w, 0.0], [0.5 * model_w, float(target_gap_m)]], dtype=np.float32),
+    )
+    expected_gap_px = float(abs(float(p_gap[1, 1]) - float(p_gap[0, 1]))) if p_gap.shape == (2, 2) else 0.0
+    expected_gap_px = max(6.0, expected_gap_px)
+    # Clamp expected gap to avoid over-trusting a poor current homography.
+    max_reasonable_gap_px = float(max(24.0, 0.26 * float(max(1, floor_bbox[3] - floor_bbox[1]))))
+    expected_gap_px_eff = float(min(expected_gap_px, max_reasonable_gap_px))
+    gap_tol_px = max(6.0, img_pair_gap_tol_ratio * expected_gap_px_eff)
+    min_span_img_px = float(max(24.0, img_min_span_frac * floor_w))
 
     chosen: Optional[Dict[str, Any]] = None
     choose_reason = None
 
+    # Rule 1 (image-space hardening):
+    # choose the lowest strong/long baseline-like candidate; if a close parallel
+    # neighbor exists above it (service line distance range), force the lower line.
+    img_baseline_cands: list[Tuple[float, Dict[str, Any]]] = []
+    y_cur_ref = _y_at_x(cur_line, x_ref) if cur_line is not None else None
+    if y_cur_ref is None:
+        y_cur_ref = current_ref_mid
+    for c in cands:
+        x1, y1, x2, y2 = c["seg"]
+        ang = float(np.mod(math.atan2(float(y2 - y1), float(x2 - x1)), math.pi))
+        if _angle_distance(ang, cur_ang) > math.radians(max(6.0, img_angle_tol_deg)):
+            continue
+        if float(c["support"]) < img_bottom_support_min:
+            continue
+        if float(c["x_span_img"]) < min_span_img_px:
+            continue
+        y_ref = _y_at_x(c["line"], x_ref)
+        if y_ref is None:
+            y_ref = float(c["mid_y_img"])
+        if float(y_ref) < float(y_cur_ref) + min_improve_px:
+            continue
+        img_baseline_cands.append((float(y_ref), c))
+
+    if img_baseline_cands:
+        img_baseline_cands.sort(key=lambda t: t[0], reverse=True)
+        bottommost_ref_y, bottommost = img_baseline_cands[0]
+        neighbor_ok = False
+        gap_min_px = float(max(3.0, img_neighbor_gap_min_ratio * expected_gap_px_eff))
+        gap_max_px = float(max(gap_min_px + 3.0, img_neighbor_gap_max_ratio * expected_gap_px_eff))
+        for y_ref, c in img_baseline_cands[1:]:
+            dy_px = float(bottommost_ref_y - y_ref)
+            if dy_px < gap_min_px or dy_px > gap_max_px:
+                continue
+            # keep close parallel check around current baseline direction
+            x1, y1, x2, y2 = c["seg"]
+            ang = float(np.mod(math.atan2(float(y2 - y1), float(x2 - x1)), math.pi))
+            if _angle_distance(ang, cur_ang) <= math.radians(max(6.0, img_angle_tol_deg)):
+                neighbor_ok = True
+                break
+        if neighbor_ok:
+            chosen = bottommost
+            choose_reason = "img_bottommost_parallel_pair"
+        elif float(bottommost_ref_y) >= float(y_cur_ref) + max(min_improve_px, 0.35 * expected_gap_px_eff):
+            # Rule 3 extension: if a stable strong line sits clearly below current baseline,
+            # accept it even without a clear 0.76m pair.
+            chosen = bottommost
+            choose_reason = "img_bottommost_strong_below"
+
     # Rule 2: explicit 0.76m pair near current bottom neighborhood.
-    best_pair = None
-    best_pair_score = float("-inf")
-    for i in range(len(cands)):
-        ci = cands[i]
-        for j in range(i + 1, len(cands)):
-            cj = cands[j]
-            dy = abs(float(ci["y_m"]) - float(cj["y_m"]))
-            if abs(dy - target_gap_m) > gap_tol_m:
-                continue
-            if min(float(ci["support"]), float(cj["support"])) < min_support:
-                continue
-            if min(abs(float(ci["y_m"])), abs(float(cj["y_m"]))) > 0.55:
-                continue
-            # Baseline should be lower in image (larger y pixel) among the near-parallel pair.
-            baseline_cand = ci if float(ci["mid_y_img"]) >= float(cj["mid_y_img"]) else cj
-            pair_score = float(
-                min(float(ci["score"]), float(cj["score"]))
-                + 0.25 * math.exp(-abs(dy - target_gap_m) / max(1e-6, 0.18))
-            )
-            if pair_score > best_pair_score:
-                best_pair_score = pair_score
-                best_pair = baseline_cand
-    if best_pair is not None and float(best_pair["mid_y_img"]) >= current_ref_mid - 1.0:
-        chosen = best_pair
-        choose_reason = "pair_0.76m"
+    if chosen is None:
+        best_pair = None
+        best_pair_score = float("-inf")
+        for i in range(len(cands)):
+            ci = cands[i]
+            for j in range(i + 1, len(cands)):
+                cj = cands[j]
+                dy = abs(float(ci["y_m"]) - float(cj["y_m"]))
+                if abs(dy - target_gap_m) > gap_tol_m:
+                    continue
+                if min(float(ci["support"]), float(cj["support"])) < min_support:
+                    continue
+                if min(abs(float(ci["y_m"])), abs(float(cj["y_m"]))) > 0.55:
+                    continue
+                # Baseline should be lower in image (larger y pixel) among the near-parallel pair.
+                baseline_cand = ci if float(ci["mid_y_img"]) >= float(cj["mid_y_img"]) else cj
+                pair_score = float(
+                    min(float(ci["score"]), float(cj["score"]))
+                    + 0.25 * math.exp(-abs(dy - target_gap_m) / max(1e-6, 0.18))
+                )
+                if pair_score > best_pair_score:
+                    best_pair_score = pair_score
+                    best_pair = baseline_cand
+        if best_pair is not None and float(best_pair["mid_y_img"]) >= current_ref_mid - 1.0:
+            chosen = best_pair
+            choose_reason = "pair_0.76m"
 
     # Rule 3: a stable strong line exists below current baseline.
     if chosen is None:
@@ -3568,29 +5848,12 @@ def _refine_bottom_baseline_postfit(
 
     # Image-space fallback: parallel neighbor below current bottom with expected ~0.76m pixel gap.
     if chosen is None:
-        H_m2i = cv2.getPerspectiveTransform(model_corners, ordered.astype(np.float32))
-        model_w = float(np.max(model_corners[:, 0]) - np.min(model_corners[:, 0]))
-        p_gap = project_points(
-            H_m2i,
-            np.array([[0.5 * model_w, 0.0], [0.5 * model_w, float(target_gap_m)]], dtype=np.float32),
-        )
-        expected_gap_px = float(abs(float(p_gap[1, 1]) - float(p_gap[0, 1]))) if p_gap.shape == (2, 2) else 0.0
-        expected_gap_px = max(6.0, expected_gap_px)
-        gap_tol_px = max(6.0, img_pair_gap_tol_ratio * expected_gap_px)
-
-        cur_line = _line_from_points((float(ordered[0, 0]), float(ordered[0, 1])), (float(ordered[1, 0]), float(ordered[1, 1])))
-        cur_ang = float(np.mod(math.atan2(float(ordered[1, 1] - ordered[0, 1]), float(ordered[1, 0] - ordered[0, 0])), math.pi))
-        x_ref = float(0.5 * (float(floor_bbox[0]) + float(floor_bbox[2])))
-        y_cur_ref = _y_at_x(cur["line"], x_ref)
-        if y_cur_ref is None:
-            y_cur_ref = current_ref_mid
-
         best_img = None
         best_img_score = float("-inf")
         for c in cands:
             x1, y1, x2, y2 = c["seg"]
             ang = float(np.mod(math.atan2(float(y2 - y1), float(x2 - x1)), math.pi))
-            if _angle_distance(ang, cur_ang) > math.radians(max(3.0, img_angle_tol_deg)):
+            if _angle_distance(ang, cur_ang) > math.radians(max(6.0, img_angle_tol_deg)):
                 continue
             yc = _y_at_x(c["line"], x_ref)
             if yc is None:
@@ -3598,12 +5861,14 @@ def _refine_bottom_baseline_postfit(
             dy_px = float(yc - y_cur_ref)
             if dy_px < min_improve_px:
                 continue
-            if abs(dy_px - expected_gap_px) > gap_tol_px:
+            if abs(dy_px - expected_gap_px_eff) > gap_tol_px:
                 continue
             sup = float(c["support"])
             if sup < min_support:
                 continue
-            score_img = float(sup + 0.35 * math.exp(-abs(dy_px - expected_gap_px) / max(1e-6, 0.4 * expected_gap_px)))
+            score_img = float(
+                sup + 0.35 * math.exp(-abs(dy_px - expected_gap_px_eff) / max(1e-6, 0.4 * expected_gap_px_eff))
+            )
             if score_img > best_img_score:
                 best_img_score = score_img
                 best_img = c
@@ -3611,6 +5876,7 @@ def _refine_bottom_baseline_postfit(
             chosen = best_img
             choose_reason = "img_parallel_below_expected_gap"
             meta["expected_gap_px"] = float(expected_gap_px)
+            meta["expected_gap_px_eff"] = float(expected_gap_px_eff)
             meta["gap_tol_px"] = float(gap_tol_px)
 
     if chosen is None:
@@ -3816,6 +6082,31 @@ def _parse_float_csv(text: str, default: Sequence[float]) -> list[float]:
     if not vals:
         return [float(v) for v in default]
     return vals
+
+
+def _weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> Optional[float]:
+    vals = np.asarray(values, dtype=np.float32).reshape(-1)
+    wts = np.asarray(weights, dtype=np.float32).reshape(-1)
+    if vals.size == 0 or wts.size == 0 or vals.size != wts.size:
+        return None
+    finite = np.isfinite(vals) & np.isfinite(wts)
+    if not np.any(finite):
+        return None
+    vals = vals[finite]
+    wts = wts[finite]
+    if vals.size == 0:
+        return None
+    wts = np.clip(wts, 0.0, None)
+    if float(np.sum(wts)) <= 1e-6:
+        return float(np.percentile(vals, float(q)))
+    order = np.argsort(vals)
+    vals = vals[order]
+    wts = wts[order]
+    cdf = np.cumsum(wts)
+    target = float(np.clip(q, 0.0, 100.0)) / 100.0 * float(cdf[-1])
+    idx = int(np.searchsorted(cdf, target, side="left"))
+    idx = max(0, min(idx, int(vals.size - 1)))
+    return float(vals[idx])
 
 
 def _compress_axis_observations(
@@ -4997,6 +7288,8 @@ def _fit_court_homography_from_raw_floor_debug(
     # Prefer full-court fits by default; service-box configs can be noisy. Re-enable via env if needed.
     if int(os.getenv("BADC_RAW_FLOOR_DISABLE_SERVICE_CFG", "1") or "0") == 1:
         model_cfgs = [cfg for cfg in model_cfgs if not str(cfg[0]).startswith("service")]
+    if int(os.getenv("BADC_RAW_FLOOR_DISABLE_SINGLES_CFG", "0") or "0") == 1:
+        model_cfgs = [cfg for cfg in model_cfgs if str(cfg[0]) != "singles"]
 
     Xw_full, w_full, names_full = sample_model_points(points_per_meter=25.0, min_weight=0.3)
     w_full, role_w_cfg = _apply_model_role_weights(names_full, w_full)
@@ -5008,9 +7301,11 @@ def _fit_court_homography_from_raw_floor_debug(
     best_mixer_parts: Optional[Dict[str, float]] = None
     best_area_ratio_img: Optional[float] = None
     best_ymax_ratio: Optional[float] = None
+    best_top_edge_floor_ratio: Optional[float] = None
     best_bottom_support: Optional[float] = None
     best_role_prior_bonus: Optional[float] = None
     best_role_prior_meta: Optional[Dict[str, float]] = None
+    best_cfg_prior: Optional[float] = None
     num_quads = 0
     num_scored = 0
     rejects = {
@@ -5042,6 +7337,7 @@ def _fit_court_homography_from_raw_floor_debug(
         "inlier_ratio_low": 0,
         "cover_ratio_low": 0,
         "oob_frac_high": 0,
+        "bottom_span_floor_ratio_low": 0,
     }
     img_area = float(h * w)
     roi_area = float(np.count_nonzero(floor_roi_mask)) or img_area
@@ -5060,10 +7356,18 @@ def _fit_court_homography_from_raw_floor_debug(
     min_bottom_corners_in_image = int(os.getenv("BADC_FIT_MIN_BOTTOM_CORNERS_IN_IMAGE", "2"))
     require_bottom_in_floor = int(os.getenv("BADC_FIT_REQUIRE_BOTTOM_IN_FLOOR", "1")) == 1
     bottom_in_floor_margin = int(os.getenv("BADC_FIT_BOTTOM_IN_FLOOR_MARGIN", "8"))
+    max_top_edge_floor_ratio_hard = float(os.getenv("BADC_FIT_MAX_TOP_EDGE_FLOOR_RATIO", "0.30"))
     min_inlier_ratio_hard = float(os.getenv("BADC_FIT_MIN_INLIER_RATIO", "0.25"))
     min_cover_ratio_hard = float(os.getenv("BADC_FIT_MIN_COVER_RATIO", "0.22"))
     max_oob_frac_hard = float(os.getenv("BADC_FIT_MAX_OOB_FRAC", "0.70"))
     allow_small_quads = int(os.getenv("BADC_FIT_ALLOW_SMALL_QUADS", "0")) == 1
+    floor_bbox_w_px = float(max(1.0, float(floor_bbox[2] - floor_bbox[0])))
+    min_bottom_span_floor_ratio_hard = float(
+        os.getenv("BADC_FIT_MIN_BOTTOM_SPAN_FLOOR_RATIO", "0.45")
+    )
+    cfg_prior_outer = float(_env_float("BADC_RAW_FLOOR_CFG_PRIOR_OUTER", 1.2))
+    cfg_prior_singles = float(_env_float("BADC_RAW_FLOOR_CFG_PRIOR_SINGLES", -0.8))
+    cfg_prior_service = float(_env_float("BADC_RAW_FLOOR_CFG_PRIOR_SERVICE", -2.0))
     vp_min_dist = float(os.getenv("BADC_FIT_MIN_VP_DIST", "0.0"))  # 0 disables
     role_prior_enabled = bool(_env_flag("BADC_ROLE_PRIOR_ENABLE", False))
     role_prior_mask = white_mask_raw_floor_noblob if white_mask_raw_floor_noblob is not None else white_mask_raw_floor
@@ -5084,6 +7388,7 @@ def _fit_court_homography_from_raw_floor_debug(
     for relax_scale in (1.0, 0.7):
         if relax_scale < 1.0:
             relaxed_pass = 1
+        min_bottom_span_floor_ratio_loop = float(max(0.28, min_bottom_span_floor_ratio_hard * float(relax_scale)))
         best_H = None
         best_score = float("-inf")
         best_cfg = None
@@ -5091,9 +7396,11 @@ def _fit_court_homography_from_raw_floor_debug(
         best_mixer_parts = None
         best_area_ratio_img = None
         best_ymax_ratio = None
+        best_top_edge_floor_ratio = None
         best_bottom_support = None
         best_role_prior_bonus = None
         best_role_prior_meta = None
+        best_cfg_prior = None
         num_scored = 0
         top5 = []
         top3_main = []
@@ -5156,6 +7463,17 @@ def _fit_court_homography_from_raw_floor_debug(
                             )
                             if int(np.sum(in_floor)) < 2:
                                 rejects["bottom_corners_outside_floor_bbox"] += 1
+                                continue
+                        bottom_span_px = float(np.linalg.norm(bottom[1] - bottom[0]))
+                        bottom_span_floor_ratio = float(bottom_span_px / max(1.0, floor_bbox_w_px))
+                        if bottom_span_floor_ratio < min_bottom_span_floor_ratio_loop:
+                            rejects["bottom_span_floor_ratio_low"] += 1
+                            if not allow_small_quads:
+                                continue
+                        top_edge_floor_ratio = _top_edge_floor_ratio(ordered, floor_bbox)
+                        if top_edge_floor_ratio > max_top_edge_floor_ratio_hard:
+                            rejects["top_endpoints_too_low"] += 1
+                            if not allow_small_quads:
                                 continue
                         ok, why_gate, _gate_metrics = _passes_geom_gates(ordered, floor_bbox)
                         if not ok:
@@ -5278,6 +7596,14 @@ def _fit_court_homography_from_raw_floor_debug(
                                 + 4.0 * bottom_support
                                 + float(role_bonus)
                             )
+                            cfg_prior = 0.0
+                            if str(cfg_name) == "outer":
+                                cfg_prior = float(cfg_prior_outer)
+                            elif str(cfg_name) == "singles":
+                                cfg_prior = float(cfg_prior_singles)
+                            elif str(cfg_name).startswith("service"):
+                                cfg_prior = float(cfg_prior_service)
+                            score_final = float(score_final + cfg_prior)
                             num_scored += 1
                             if score_final > best_score:
                                 best_score = score_final
@@ -5290,6 +7616,7 @@ def _fit_court_homography_from_raw_floor_debug(
                                 best_bottom_support = float(bottom_support)
                                 best_role_prior_bonus = float(role_bonus)
                                 best_role_prior_meta = dict(role_meta) if role_meta else None
+                                best_cfg_prior = float(cfg_prior)
                             top5.append((score_final, img_pts.copy(), cfg_name))
                             top3_main.append((score_final, area_ratio_img, ymax_ratio, bottom_support))
         if best_H is not None:
@@ -5332,16 +7659,29 @@ def _fit_court_homography_from_raw_floor_debug(
             "raw_floor_reject_inlier_ratio_low": int(rejects.get("inlier_ratio_low", 0)),
             "raw_floor_reject_cover_ratio_low": int(rejects.get("cover_ratio_low", 0)),
             "raw_floor_reject_oob_frac_high": int(rejects.get("oob_frac_high", 0)),
+            "raw_floor_reject_bottom_span_floor_ratio_low": int(rejects.get("bottom_span_floor_ratio_low", 0)),
             "raw_floor_relaxed_pass": int(relaxed_pass),
             "raw_floor_gate_min_corners_in_image": int(min_corners_in_image_hard),
             "raw_floor_gate_min_bottom_corners_in_image": int(min_bottom_corners_in_image),
             "raw_floor_gate_require_bottom_in_floor": bool(require_bottom_in_floor),
             "raw_floor_gate_bottom_in_floor_margin": int(bottom_in_floor_margin),
+            "raw_floor_gate_max_top_edge_floor_ratio": float(max_top_edge_floor_ratio_hard),
             "raw_floor_gate_min_inlier_ratio": float(min_inlier_ratio_hard),
             "raw_floor_gate_min_cover_ratio": float(min_cover_ratio_hard),
             "raw_floor_gate_max_oob_frac": float(max_oob_frac_hard),
+            "raw_floor_gate_min_bottom_span_floor_ratio": float(min_bottom_span_floor_ratio_hard),
+            "raw_floor_cfg_prior_outer": float(cfg_prior_outer),
+            "raw_floor_cfg_prior_singles": float(cfg_prior_singles),
+            "raw_floor_cfg_prior_service": float(cfg_prior_service),
+            "raw_floor_cfg_disable_service": bool(
+                int(os.getenv("BADC_RAW_FLOOR_DISABLE_SERVICE_CFG", "1") or "0") == 1
+            ),
+            "raw_floor_cfg_disable_singles": bool(
+                int(os.getenv("BADC_RAW_FLOOR_DISABLE_SINGLES_CFG", "0") or "0") == 1
+            ),
             "raw_floor_best_score": float(best_score) if np.isfinite(best_score) else None,
             "raw_floor_best_model_config": best_cfg,
+            "raw_floor_best_cfg_prior": float(best_cfg_prior) if best_cfg_prior is not None else None,
             "raw_floor_oob_points": int(best_oob),
             "raw_floor_best_mixer": best_mixer_parts if isinstance(best_mixer_parts, dict) else None,
             "raw_floor_best_role_prior_bonus": float(best_role_prior_bonus)
@@ -5524,6 +7864,7 @@ def _compute_loss_terms(
     r = np.clip(r, 0.0, float(clamp_max))
     num_valid = int(np.count_nonzero(valid))
     num_oob = int(uv.shape[0] - num_valid)
+    w_valid = None
     if num_valid > 0:
         w_valid = weights[valid].astype(np.float32)
         huber_vals = _huber(r[valid], float(huber_delta))
@@ -5533,7 +7874,17 @@ def _compute_loss_terms(
 
     inlier_mask = (r < float(tau_px)) & valid
     num_inliers = int(np.count_nonzero(inlier_mask))
-    inlier_ratio = float(num_inliers) / float(max(num_valid, 1))
+    inlier_ratio_unweighted = float(num_inliers) / float(max(num_valid, 1))
+    if w_valid is not None and w_valid.size > 0:
+        w_valid_sum = float(np.sum(w_valid))
+    else:
+        w_valid_sum = 0.0
+    w_inlier = weights[inlier_mask].astype(np.float32) if np.any(inlier_mask) else np.zeros((0,), dtype=np.float32)
+    w_inlier_sum = float(np.sum(w_inlier)) if w_inlier.size > 0 else 0.0
+    if w_valid_sum > 1e-6:
+        inlier_ratio = float(w_inlier_sum / w_valid_sum)
+    else:
+        inlier_ratio = float(inlier_ratio_unweighted)
     cover_ratio = float(inlier_ratio)
     inlier_dists = r[inlier_mask]
     inlier_dist_p90 = float(np.percentile(inlier_dists, 90)) if inlier_dists.size > 0 else None
@@ -5543,6 +7894,10 @@ def _compute_loss_terms(
     sample_dist_p90 = float(np.percentile(r[valid], 90)) if np.any(valid) else None
     sample_dist_max = float(np.max(r[valid])) if np.any(valid) else None
     sample_dist_p90_raw = float(np.percentile(r_raw[valid], 90)) if np.any(valid) else None
+    sample_dist_p90_weighted = _weighted_percentile(r[valid], w_valid, 90.0) if np.any(valid) and w_valid is not None else None
+    sample_dist_p90_raw_weighted = (
+        _weighted_percentile(r_raw[valid], w_valid, 90.0) if np.any(valid) and w_valid is not None else None
+    )
 
     l_cover = 0.0
     if cover_points is not None and cover_points.size > 0:
@@ -5581,8 +7936,13 @@ def _compute_loss_terms(
         "valid_ratio_penalty": float(valid_ratio_penalty),
         "area_ratio": float(area_ratio),
         "cover_ratio": float(cover_ratio),
+        "cover_ratio_unweighted": float(inlier_ratio_unweighted),
         "cover_penalty": float(cover_penalty),
         "inlier_ratio": float(inlier_ratio),
+        "inlier_ratio_unweighted": float(inlier_ratio_unweighted),
+        "inlier_ratio_weighted": float(inlier_ratio),
+        "weighted_valid_sum": float(w_valid_sum),
+        "weighted_inlier_sum": float(w_inlier_sum),
         "inlier_dist_p90": inlier_dist_p90,
         "num_inliers": num_inliers,
         "num_valid_samples": num_valid,
@@ -5593,6 +7953,8 @@ def _compute_loss_terms(
         "sample_dist_p90": sample_dist_p90,
         "sample_dist_max": sample_dist_max,
         "sample_dist_p90_raw": sample_dist_p90_raw,
+        "sample_dist_p90_weighted": sample_dist_p90_weighted,
+        "sample_dist_p90_raw_weighted": sample_dist_p90_raw_weighted,
         "sample_dists": r,
         "sample_uv": uv,
     }
@@ -6307,6 +8669,8 @@ def _fit_court_homography_hough(
     debug_dir: Optional[str] = None
     debug_prefix: str = "court_fit"
     floor_mask, floor_debug = get_floor_roi_mask_debug(frame_bgr)
+    # Lock to legacy HV split to keep oriA/oriB behavior aligned with backup logic.
+    legacy_ori_split = True
     # Keep these defined for early-failure returns / debug.
     linepix_mask_pre: Optional[np.ndarray] = None
     floor_gate_mask: Optional[np.ndarray] = None
@@ -6391,6 +8755,8 @@ def _fit_court_homography_hough(
     floor_roi_mask = floor_mask
     floor_roi_source = "floor_mask"
     floor_y_cut = floor_debug.get("floor_y_cut")
+    top_guard_meta = floor_debug.get("floor_roi_top_guard")
+    top_guard_applied = bool(isinstance(top_guard_meta, dict) and top_guard_meta.get("applied", False))
     x0, y0, x1, y1 = _white_mask_stats(floor_mask)[2]
 
     # Ensure dimensions are defined before padding
@@ -6414,14 +8780,41 @@ def _fit_court_homography_hough(
     if floor_y_cut is not None:
         bbox_mask[: int(floor_y_cut), :] = 0
     green_ratio = None
+    bottom_only = 0
+    y_split_for_floor = None
+    green_in_bbox = np.zeros_like(bbox_mask)
     green_mask = floor_debug.get("green_mask")
+    green_direct_apply = bool(isinstance(green_mask, np.ndarray) and green_mask.size > 0) and _env_flag(
+        "BADC_FLOOR_ROI_DIRECT_USE_GREEN_MASK", True
+    )
+    if legacy_ori_split and ("BADC_FLOOR_ROI_DIRECT_USE_GREEN_MASK" not in os.environ):
+        green_direct_apply = False
+        floor_debug["floor_roi_green_direct_disabled_by_legacy_ori"] = 1
+    green_direct_strict = bool(green_direct_apply and _env_flag("BADC_FLOOR_ROI_DIRECT_STRICT", True))
     if isinstance(green_mask, np.ndarray) and green_mask.size > 0:
         ys, xs = np.where(bbox_mask > 0)
         if xs.size > 0:
             green_ratio = float(np.mean(green_mask[ys, xs] > 0))
-        if green_ratio is None or green_ratio < 0.15 or green_ratio > 0.95:
+        if green_direct_apply:
+            green_bin = ((green_mask > 0).astype(np.uint8) * 255)
+            green_in_bbox = cv2.bitwise_and(green_bin, bbox_mask)
+            if _env_flag("BADC_FLOOR_ROI_DIRECT_CLIP_TO_BBOX", False):
+                floor_roi_mask = green_in_bbox
+                floor_roi_source = "green_direct_mask_bbox"
+            else:
+                floor_roi_mask = green_bin
+                floor_roi_source = "green_direct_mask"
+            floor_debug["floor_roi_green_direct_applied"] = 1
+            floor_debug["floor_roi_direct_strict"] = int(green_direct_strict)
+        elif green_ratio is None or green_ratio < 0.15 or green_ratio > 0.95:
             floor_roi_mask = bbox_mask
             floor_roi_source = "bbox_fallback"
+        elif top_guard_applied and _env_flag("BADC_FLOOR_ROI_TOP_GUARD_SKIP_GREEN_FLOOD", False):
+            # Top-guard means the initial green coverage was unreliable; re-running
+            # flood fill on green often collapses ROI back to near-half only.
+            floor_roi_mask = bbox_mask
+            floor_roi_source = "bbox_top_guard"
+            floor_debug["floor_roi_green_flood_skipped_by_top_guard"] = 1
         else:
             # --- Flood-fill based pick of main floor region (bottom seeds) ---
             green_bin = ((green_mask > 0).astype(np.uint8) * 255)
@@ -6568,6 +8961,8 @@ def _fit_court_homography_hough(
         floor_roi_source = "bbox_fallback"
     # Optional: post dilate final ROI
     post_d = int(os.getenv("BADC_FLOOR_ROI_POST_DILATE", "0") or 0)
+    if green_direct_strict:
+        post_d = 0
     if post_d > 0:
         post_d = max(3, int(post_d))
         if post_d % 2 == 0:
@@ -6578,13 +8973,17 @@ def _fit_court_homography_hough(
 
     # keep_true_floor settings
     keep_true_floor = int(os.getenv("BADC_FLOOR_ROI_KEEP_TRUE_FLOOR", "1") or 0) == 1
+    if green_direct_strict:
+        keep_true_floor = False
     keep_true_floor_top_only = int(os.getenv("BADC_FLOOR_ROI_KEEP_TRUE_FLOOR_TOP_ONLY", "1") or 0) == 1
+    keep_true_floor_top_from_orig = int(os.getenv("BADC_FLOOR_ROI_KEEP_TRUE_FLOOR_TOP_FROM_ORIG", "1") or 0) == 1
 
-    if floor_y_cut is not None:
+    apply_direct_y_cut = _env_flag("BADC_FLOOR_ROI_DIRECT_APPLY_FLOOR_Y_CUT", False)
+    if floor_y_cut is not None and (not green_direct_strict or apply_direct_y_cut):
         floor_roi_mask[: int(floor_y_cut), :] = 0
 
     # Add back any original green pixels in the bottom part that flood/pick/dilate may have missed
-    if bottom_only:
+    if bottom_only and (not green_direct_strict):
         mask_low = np.zeros((h, w), dtype=np.uint8)
         mask_low[y_split_for_floor:, :] = 255
         add_back = cv2.bitwise_and(green_in_bbox, mask_low)
@@ -6593,7 +8992,15 @@ def _fit_court_homography_hough(
     # Apply true floor constraint: either keep strict OR top-only strict when bottom dilation is used
     if keep_true_floor:
         if keep_true_floor_top_only and (y_split_for_floor is not None) and bottom_only:
-            top = cv2.bitwise_and(floor_roi_mask, orig_floor_mask)
+            if keep_true_floor_top_from_orig:
+                top = orig_floor_mask.copy()
+                floor_debug["floor_roi_keep_true_floor_top_from_orig"] = 1
+                try:
+                    last_metrics["floor_roi_keep_true_floor_top_from_orig"] = 1
+                except Exception:
+                    pass
+            else:
+                top = cv2.bitwise_and(floor_roi_mask, orig_floor_mask)
             top[y_split_for_floor:, :] = 0
             bot = floor_roi_mask.copy()
             bot[:y_split_for_floor, :] = 0
@@ -6605,6 +9012,264 @@ def _fit_court_homography_hough(
                 pass
         else:
             floor_roi_mask = cv2.bitwise_and(floor_roi_mask, orig_floor_mask)
+
+    # Reinjection pass: ensure green court pixels are not lost by top clipping/strict intersection.
+    reinject_green = int(os.getenv("BADC_FLOOR_ROI_REINJECT_GREEN", "1") or 0) == 1
+    if green_direct_strict:
+        reinject_green = False
+    if green_direct_apply and _env_flag("BADC_FLOOR_ROI_GREEN_DIRECT_DISABLE_REINJECT", True):
+        reinject_green = False
+        floor_debug["floor_roi_reinject_green_skipped_green_direct"] = 1
+    if reinject_green and isinstance(green_mask, np.ndarray) and green_mask.size > 0:
+        green_reinject = cv2.bitwise_and(((green_mask > 0).astype(np.uint8) * 255), bbox_mask)
+        if floor_y_cut is not None:
+            green_reinject[: int(floor_y_cut), :] = 0
+        if keep_true_floor and keep_true_floor_top_only and (y_split_for_floor is not None) and bottom_only:
+            rein_top = cv2.bitwise_and(green_reinject, orig_floor_mask)
+            rein_top[y_split_for_floor:, :] = 0
+            rein_bot = green_reinject.copy()
+            rein_bot[:y_split_for_floor, :] = 0
+            green_reinject = cv2.bitwise_or(rein_top, rein_bot)
+        floor_roi_mask = cv2.bitwise_or(floor_roi_mask, green_reinject)
+        reinject_close_k = int(os.getenv("BADC_FLOOR_ROI_REINJECT_CLOSE_K", "9") or 9)
+        reinject_close_k = max(3, reinject_close_k)
+        if reinject_close_k % 2 == 0:
+            reinject_close_k += 1
+        floor_roi_mask = cv2.morphologyEx(
+            floor_roi_mask,
+            cv2.MORPH_CLOSE,
+            np.ones((reinject_close_k, reinject_close_k), np.uint8),
+            iterations=1,
+        )
+        floor_debug["floor_roi_reinject_green"] = 1
+        floor_debug["floor_roi_reinject_area"] = int(np.count_nonzero(green_reinject))
+        floor_debug["floor_roi_reinject_close_k"] = int(reinject_close_k)
+
+    # Final regularization: fill internal holes while preserving plausible far-end
+    # components (largest-CC-only can wrongly drop disconnected top-half floor).
+    fill_holes = int(os.getenv("BADC_FLOOR_ROI_FILL_HOLES", "0") or 0) == 1
+    if green_direct_strict:
+        fill_holes = False
+    if fill_holes and int(np.count_nonzero(floor_roi_mask)) > 0:
+        bin_mask = ((floor_roi_mask > 0).astype(np.uint8) * 255)
+        num_cc, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+        kept_cc_ids: list[int] = []
+        dropped_cc_ids: list[int] = []
+        if num_cc > 1:
+            best_idx = 1 + int(np.argmax(stats_cc[1:, cv2.CC_STAT_AREA]))
+            main_cc = (labels_cc == best_idx).astype(np.uint8) * 255
+            kept_cc_ids.append(int(best_idx))
+            keep_top_cc = _env_flag("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_CC", True)
+            if keep_top_cc:
+                ys_m, xs_m = np.where(main_cc > 0)
+                if xs_m.size > 0:
+                    mx1 = int(xs_m.min())
+                    my1 = int(ys_m.min())
+                    mx2 = int(xs_m.max())
+                    my2 = int(ys_m.max())
+                    min_area_frac = float(
+                        np.clip(_env_float("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_MIN_AREA_FRAC", 0.0012), 0.0, 0.20)
+                    )
+                    min_area_px = int(max(64, round(min_area_frac * float(max(h * w, 1)))))
+                    max_gap_frac = float(
+                        np.clip(_env_float("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_MAX_GAP_FRAC", 0.12), 0.0, 0.70)
+                    )
+                    max_gap_px = int(max(2, round(max_gap_frac * float(max(h, 1)))))
+                    max_start_below_frac = float(
+                        np.clip(_env_float("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_MAX_START_BELOW_FRAC", 0.08), 0.0, 0.50)
+                    )
+                    max_start_below_px = int(max(0, round(max_start_below_frac * float(max(h, 1)))))
+                    min_overlap = float(
+                        np.clip(_env_float("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_MIN_X_OVERLAP", 0.55), 0.0, 1.0)
+                    )
+                    min_w_frac = float(
+                        np.clip(_env_float("BADC_FLOOR_ROI_FILL_HOLES_KEEP_TOP_MIN_W_FRAC", 0.06), 0.0, 1.0)
+                    )
+                    min_w_px = int(max(6, round(min_w_frac * float(max(w, 1)))))
+                    for idx in range(1, int(num_cc)):
+                        if idx == best_idx:
+                            continue
+                        x = int(stats_cc[idx, cv2.CC_STAT_LEFT])
+                        y = int(stats_cc[idx, cv2.CC_STAT_TOP])
+                        ww = int(stats_cc[idx, cv2.CC_STAT_WIDTH])
+                        hh = int(stats_cc[idx, cv2.CC_STAT_HEIGHT])
+                        area = int(stats_cc[idx, cv2.CC_STAT_AREA])
+                        cx1 = int(x)
+                        cy1 = int(y)
+                        cx2 = int(x + ww - 1)
+                        cy2 = int(y + hh - 1)
+                        overlap = int(max(0, min(mx2, cx2) - max(mx1, cx1) + 1))
+                        overlap_frac = float(overlap) / float(max(1, ww))
+                        gap_to_main_top = int(max(0, my1 - cy2))
+                        keep_this = (
+                            area >= min_area_px
+                            and ww >= min_w_px
+                            and cy1 <= (my1 + max_start_below_px)
+                            and gap_to_main_top <= max_gap_px
+                            and overlap_frac >= min_overlap
+                        )
+                        if keep_this:
+                            main_cc[labels_cc == idx] = 255
+                            kept_cc_ids.append(int(idx))
+                        else:
+                            dropped_cc_ids.append(int(idx))
+                    floor_debug["floor_roi_fill_holes_keep_top_cc"] = 1
+                    floor_debug["floor_roi_fill_holes_keep_top_min_area_px"] = int(min_area_px)
+                    floor_debug["floor_roi_fill_holes_keep_top_max_gap_px"] = int(max_gap_px)
+                    floor_debug["floor_roi_fill_holes_keep_top_max_start_below_px"] = int(max_start_below_px)
+                    floor_debug["floor_roi_fill_holes_keep_top_min_x_overlap"] = float(min_overlap)
+                    floor_debug["floor_roi_fill_holes_keep_top_min_w_px"] = int(min_w_px)
+                    floor_debug["floor_roi_fill_holes_keep_top_main_bbox"] = [int(mx1), int(my1), int(mx2), int(my2)]
+        else:
+            main_cc = bin_mask
+            kept_cc_ids.append(1)
+        h_fill, w_fill = main_cc.shape[:2]
+        flood = main_cc.copy()
+        flood_mask = np.zeros((h_fill + 2, w_fill + 2), np.uint8)
+        seed_pt = None
+        border_pts = []
+        for xx in range(w_fill):
+            border_pts.append((xx, 0))
+            border_pts.append((xx, h_fill - 1))
+        for yy in range(h_fill):
+            border_pts.append((0, yy))
+            border_pts.append((w_fill - 1, yy))
+        for sx, sy in border_pts:
+            if flood[sy, sx] == 0:
+                seed_pt = (int(sx), int(sy))
+                break
+        if seed_pt is not None:
+            cv2.floodFill(flood, flood_mask, seedPoint=seed_pt, newVal=255)
+            holes = cv2.bitwise_not(flood)
+            filled = cv2.bitwise_or(main_cc, holes)
+        else:
+            filled = main_cc
+        hole_close_k = int(os.getenv("BADC_FLOOR_ROI_HOLE_CLOSE_K", "7") or 7)
+        hole_close_k = max(3, hole_close_k)
+        if hole_close_k % 2 == 0:
+            hole_close_k += 1
+        filled = cv2.morphologyEx(
+            filled,
+            cv2.MORPH_CLOSE,
+            np.ones((hole_close_k, hole_close_k), np.uint8),
+            iterations=1,
+        )
+        floor_roi_mask = filled
+        floor_debug["floor_roi_fill_holes"] = 1
+        floor_debug["floor_roi_fill_holes_close_k"] = int(hole_close_k)
+        floor_debug["floor_roi_main_cc_area"] = int(np.count_nonzero(main_cc))
+        floor_debug["floor_roi_filled_area"] = int(np.count_nonzero(filled))
+        floor_debug["floor_roi_fill_holes_kept_cc"] = [int(i) for i in kept_cc_ids]
+        floor_debug["floor_roi_fill_holes_dropped_cc"] = [int(i) for i in dropped_cc_ids]
+        floor_debug["floor_roi_fill_holes_kept_cc_count"] = int(len(kept_cc_ids))
+        floor_debug["floor_roi_fill_holes_dropped_cc_count"] = int(len(dropped_cc_ids))
+
+    # Top-band row completion:
+    # fill staircase-like gaps near far court caused by players/shadows/strict color mask.
+    row_fill_top = int(os.getenv("BADC_FLOOR_ROI_ROW_FILL_TOP", "0") or 0) == 1
+    if green_direct_strict:
+        row_fill_top = False
+    if row_fill_top and int(np.count_nonzero(floor_roi_mask)) > 0:
+        bin_mask = ((floor_roi_mask > 0).astype(np.uint8) * 255)
+        ys_any = np.where(np.any(bin_mask > 0, axis=1))[0]
+        if ys_any.size > 0:
+            y_top = int(ys_any.min())
+            y_bot = int(ys_any.max())
+            roi_h = int(max(1, y_bot - y_top + 1))
+            top_frac = float(max(0.15, min(0.95, _env_float("BADC_FLOOR_ROI_ROW_FILL_TOP_FRAC", 0.85))))
+            y_end = int(min(y_bot, y_top + int(round(top_frac * float(roi_h)))))
+            neighbor = int(max(1, _env_int("BADC_FLOOR_ROI_ROW_FILL_NEIGHBOR", 3)))
+            widths_ref: list[float] = []
+            y_ref0 = int(max(y_top, y_bot - int(round(0.45 * float(roi_h)))))
+            for yy in range(y_ref0, y_bot + 1):
+                xs = np.where(bin_mask[yy] > 0)[0]
+                if xs.size >= 2:
+                    widths_ref.append(float(xs[-1] - xs[0] + 1))
+            if widths_ref:
+                ref_width = float(np.median(np.asarray(widths_ref, dtype=np.float32)))
+            else:
+                row_counts = np.count_nonzero(bin_mask > 0, axis=1)
+                ref_width = float(np.max(row_counts)) if row_counts.size > 0 else 0.0
+            min_w_frac = float(max(0.08, min(0.95, _env_float("BADC_FLOOR_ROI_ROW_FILL_MIN_WIDTH_FRAC", 0.15))))
+            min_w_px_cfg = float(max(0.0, _env_float("BADC_FLOOR_ROI_ROW_FILL_MIN_WIDTH_PX", 0.0)))
+            min_w_req = float(max(20.0, min_w_px_cfg, min_w_frac * max(1.0, ref_width)))
+            fill = np.zeros_like(bin_mask)
+            filled_rows = 0
+            for yy in range(y_top, y_end + 1):
+                yy0 = int(max(y_top, yy - neighbor))
+                yy1 = int(min(y_bot, yy + neighbor))
+                row_union = np.any(bin_mask[yy0 : yy1 + 1] > 0, axis=0)
+                xs = np.where(row_union)[0]
+                if xs.size < 2:
+                    continue
+                xl = int(xs[0])
+                xr = int(xs[-1])
+                if float(xr - xl + 1) < min_w_req:
+                    continue
+                fill[yy, xl : xr + 1] = 255
+                filled_rows += 1
+            floor_debug["floor_roi_row_fill_top"] = 1
+            floor_debug["floor_roi_row_fill_top_frac"] = float(top_frac)
+            floor_debug["floor_roi_row_fill_neighbor"] = int(neighbor)
+            floor_debug["floor_roi_row_fill_min_width_px"] = float(min_w_req)
+            floor_debug["floor_roi_row_fill_rows"] = int(filled_rows)
+            if filled_rows > 0:
+                bin_mask = cv2.bitwise_or(bin_mask, fill)
+                bin_mask = cv2.bitwise_and(bin_mask, bbox_mask)
+                if floor_y_cut is not None:
+                    bin_mask[: int(floor_y_cut), :] = 0
+                floor_roi_mask = bin_mask
+
+    # If far-end rows are still missing, extrapolate the top span upward by a short distance.
+    top_extend_enable = bool(_env_flag("BADC_FLOOR_ROI_TOP_EXTEND_ENABLE", False))
+    if green_direct_strict:
+        top_extend_enable = False
+    if top_extend_enable and int(np.count_nonzero(floor_roi_mask)) > 0:
+        floor_bbox_top = _white_mask_stats(floor_roi_mask)[2]
+        bbox_rows = np.where(np.any((bbox_mask > 0), axis=1))[0]
+        y_bbox_min = int(bbox_rows.min()) if bbox_rows.size > 0 else 0
+        bin_mask = ((floor_roi_mask > 0).astype(np.uint8) * 255)
+        ys_any = np.where(np.any(bin_mask > 0, axis=1))[0]
+        if ys_any.size > 0:
+            y_top = int(ys_any.min())
+            y_bot = int(ys_any.max())
+            roi_h = int(max(1, y_bot - y_top + 1))
+            ext_frac = float(max(0.02, min(0.45, _env_float("BADC_FLOOR_ROI_TOP_EXTEND_FRAC", 0.14))))
+            ext_rows = int(max(0, round(ext_frac * float(roi_h))))
+            if ext_rows > 0:
+                max_up = int(max(0, y_top - y_bbox_min))
+                if max_up > 0:
+                    fill_missing_frac = float(
+                        max(0.0, min(1.0, _env_float("BADC_FLOOR_ROI_TOP_EXTEND_MISS_FILL_FRAC", 0.75)))
+                    )
+                    ext_rows = int(max(ext_rows, round(fill_missing_frac * float(max_up))))
+                    ext_rows = int(min(ext_rows, max_up))
+                ref_span_rows = int(max(2, _env_int("BADC_FLOOR_ROI_TOP_EXTEND_REF_ROWS", 6)))
+                y_ref1 = int(min(y_bot, y_top + ref_span_rows))
+                row_union = np.any(bin_mask[y_top : y_ref1 + 1] > 0, axis=0)
+                xs = np.where(row_union)[0]
+                if xs.size >= 2:
+                    xl = int(xs[0])
+                    xr = int(xs[-1])
+                    span_w = float(xr - xl + 1)
+                    floor_w = float(max(1, int(floor_bbox_top[2]) - int(floor_bbox_top[0]) + 1))
+                    min_span_frac = float(max(0.20, min(0.95, _env_float("BADC_FLOOR_ROI_TOP_EXTEND_MIN_SPAN_FRAC", 0.45))))
+                    if span_w >= min_span_frac * floor_w:
+                        y_from = int(max(int(y_bbox_min), y_top - ext_rows))
+                        if y_from < y_top:
+                            fill = np.zeros_like(bin_mask)
+                            fill[y_from:y_top, xl : xr + 1] = 255
+                            bin_mask = cv2.bitwise_or(bin_mask, fill)
+                            bin_mask = cv2.bitwise_and(bin_mask, bbox_mask)
+                            if floor_y_cut is not None:
+                                bin_mask[: int(floor_y_cut), :] = 0
+                            floor_roi_mask = bin_mask
+                            floor_debug["floor_roi_top_extend"] = 1
+                            floor_debug["floor_roi_top_extend_rows"] = int(y_top - y_from)
+                            floor_debug["floor_roi_top_extend_span"] = [int(xl), int(xr)]
+                            floor_debug["floor_roi_top_extend_frac"] = float(ext_frac)
+                            floor_debug["floor_roi_top_extend_bbox_y_min"] = int(y_bbox_min)
+                            floor_debug["floor_roi_top_extend_min_span_frac"] = float(min_span_frac)
 
     floor_mask = floor_roi_mask
     floor_debug["floor_roi_source"] = floor_roi_source
@@ -6641,9 +9306,94 @@ def _fit_court_homography_hough(
     roi_vals = tophat[floor_mask > 0]
     thin_line_mask = None
     if roi_vals.size > 0:
-        thresh = max(float(np.percentile(roi_vals, 75.0)), 10.0)
+        floor_bbox_preblob = _white_mask_stats(floor_mask)[2]
+        base_pct = float(max(40.0, min(95.0, _env_float("BADC_PREBLOB_TOPHAT_PCT", 75.0))))
+        thresh = max(float(np.percentile(roi_vals, base_pct)), 10.0)
         thin_line_mask = (tophat >= thresh).astype(np.uint8) * 255
         thin_line_mask = cv2.bitwise_and(thin_line_mask, floor_mask)
+        floor_debug["preblob_tophat_pct"] = float(base_pct)
+        floor_debug["preblob_tophat_thr"] = float(thresh)
+
+        # Recover weak far-end lines: in top court band use a looser tophat gate,
+        # then keep only elongated white structures to avoid pulling in logos/blobs.
+        top_relax_enable = bool(_env_flag("BADC_PREBLOB_TOP_RELAX_ENABLE", True))
+        if legacy_ori_split and ("BADC_PREBLOB_TOP_RELAX_ENABLE" not in os.environ):
+            top_relax_enable = False
+        if top_relax_enable:
+            y0f, y1f = int(floor_bbox_preblob[1]), int(floor_bbox_preblob[3])
+            roi_h = int(max(1, y1f - y0f + 1))
+            top_frac = float(max(0.10, min(0.75, _env_float("BADC_PREBLOB_TOP_RELAX_FRAC", 0.54))))
+            y_top_end = int(max(y0f, min(y1f, y0f + int(round(top_frac * float(roi_h))))))
+            top_band = np.zeros_like(floor_mask)
+            if y_top_end >= y0f:
+                top_band[y0f : y_top_end + 1, :] = 255
+            top_vals = tophat[np.logical_and(floor_mask > 0, top_band > 0)]
+            top_pct = float(max(25.0, min(base_pct, _env_float("BADC_PREBLOB_TOP_RELAX_PCT", 50.0))))
+            if top_vals.size > 0:
+                top_thr = max(float(np.percentile(top_vals, top_pct)), 8.0)
+            else:
+                top_thr = max(8.0, 0.88 * float(thresh))
+            thin_top = (tophat >= top_thr).astype(np.uint8) * 255
+            thin_top = cv2.bitwise_and(thin_top, floor_mask)
+            thin_top = cv2.bitwise_and(thin_top, top_band)
+            thin_line_mask = cv2.bitwise_or(thin_line_mask, thin_top)
+            floor_debug["preblob_top_relax_enabled"] = 1
+            floor_debug["preblob_top_relax_frac"] = float(top_frac)
+            floor_debug["preblob_top_relax_pct"] = float(top_pct)
+            floor_debug["preblob_top_relax_thr"] = float(top_thr)
+            floor_debug["preblob_top_relax_rows"] = int(max(0, y_top_end - y0f + 1))
+
+            top_raw_recover = bool(_env_flag("BADC_PREBLOB_TOP_RAW_RECOVER_ENABLE", True))
+            if legacy_ori_split and ("BADC_PREBLOB_TOP_RAW_RECOVER_ENABLE" not in os.environ):
+                top_raw_recover = False
+            if top_raw_recover and y_top_end >= y0f:
+                top_raw = cv2.bitwise_and(white_mask_raw_full, top_band)
+
+                k_h = int(max(5, _env_int("BADC_PREBLOB_TOP_RAW_OPEN_H", 9)))
+                if k_h % 2 == 0:
+                    k_h += 1
+                k_v = int(max(5, _env_int("BADC_PREBLOB_TOP_RAW_OPEN_V", 9)))
+                if k_v % 2 == 0:
+                    k_v += 1
+
+                top_keep_h = cv2.morphologyEx(
+                    top_raw,
+                    cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (k_h, 1)),
+                )
+                top_keep_v = cv2.morphologyEx(
+                    top_raw,
+                    cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_v)),
+                )
+                top_keep = cv2.bitwise_or(top_keep_h, top_keep_v)
+                bridge_h = int(max(3, _env_int("BADC_PREBLOB_TOP_RAW_BRIDGE_H", 11)))
+                if bridge_h % 2 == 0:
+                    bridge_h += 1
+                bridge_v = int(max(3, _env_int("BADC_PREBLOB_TOP_RAW_BRIDGE_V", 5)))
+                if bridge_v % 2 == 0:
+                    bridge_v += 1
+                top_keep = cv2.morphologyEx(
+                    top_keep,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_h, 1)),
+                    iterations=1,
+                )
+                top_keep = cv2.morphologyEx(
+                    top_keep,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (1, bridge_v)),
+                    iterations=1,
+                )
+                top_keep = cv2.bitwise_and(top_keep, floor_mask)
+                top_keep = cv2.bitwise_and(top_keep, top_band)
+                thin_line_mask = cv2.bitwise_or(thin_line_mask, top_keep)
+                floor_debug["preblob_top_raw_recover"] = 1
+                floor_debug["preblob_top_raw_open_h"] = int(k_h)
+                floor_debug["preblob_top_raw_open_v"] = int(k_v)
+                floor_debug["preblob_top_raw_bridge_h"] = int(bridge_h)
+                floor_debug["preblob_top_raw_bridge_v"] = int(bridge_v)
+                floor_debug["preblob_top_raw_recover_area"] = int(np.count_nonzero(top_keep))
     if thin_line_mask is not None:
         white_mask_raw_floor_preblob = cv2.bitwise_and(white_mask_raw_full, thin_line_mask)
     else:
@@ -7486,7 +10236,11 @@ def _fit_court_homography_hough(
         if H_raw is not None:
             corners_raw = project_points(H_raw, get_bwf_corners()).astype(np.float32)
             raw_score = float(raw_metrics.get("raw_floor_best_score", 0.0)) if isinstance(raw_metrics, dict) else 0.0
-            conf = float(np.exp(-0.02 * raw_score))
+            score_center = float(_env_float("BADC_RAW_FLOOR_SCORE_CENTER", 40.0))
+            score_scale = float(max(1e-3, _env_float("BADC_RAW_FLOOR_SCORE_SCALE", 12.0)))
+            z = float((raw_score - score_center) / score_scale)
+            z = max(-60.0, min(60.0, z))
+            conf = float(1.0 / (1.0 + math.exp(-z)))
             return CourtFitResult(
                 H=H_raw,
                 corners=corners_raw,
@@ -8218,6 +10972,19 @@ def _fit_court_homography_hough(
     if best_center2 is None:
         best_center2 = float((center1 + math.pi * 0.5) % math.pi)
     center2 = best_center2
+    ori_centers_force_ortho = _env_flag("BADC_ORI_CENTERS_FORCE_ORTHO", False)
+    if legacy_ori_split and ("BADC_ORI_CENTERS_FORCE_ORTHO" not in os.environ):
+        ori_centers_force_ortho = True
+    ori_centers_ortho_max_dev_deg = float(_env_float("BADC_ORI_CENTERS_ORTHO_MAX_DEV_DEG", 20.0))
+    ori_center_diff = float(_angle_distance(center1, center2))
+    ori_center_diff_deg = float(math.degrees(ori_center_diff))
+    ori_center_forced_orth = False
+    # Robustness guard: when the two dominant peaks collapse to near-parallel groups,
+    # force the second center to an orthogonal direction.
+    if ori_centers_force_ortho:
+        if abs(ori_center_diff - 0.5 * math.pi) > math.radians(max(5.0, ori_centers_ortho_max_dev_deg)):
+            center2 = float((center1 + math.pi * 0.5) % math.pi)
+            ori_center_forced_orth = True
 
     # Orientation band for splitting RANSAC lines into two families (A/B).
     # In strong perspective, the same world-parallel family can span a wider angle range
@@ -8239,6 +11006,14 @@ def _fit_court_homography_hough(
     ori_force_nearest_max_add = int(max(0, _env_int("BADC_ORI_FORCE_NEAREST_MAX_ADD", 4)))
     ori_force_nearest_minlen_frac = float(os.getenv("BADC_ORI_FORCE_NEAREST_MINLEN_FRAC", "0.40"))
     ori_force_nearest_max_angle_deg = float(os.getenv("BADC_ORI_FORCE_NEAREST_MAX_ANGLE_DEG", "58.0"))
+    if legacy_ori_split:
+        # Legacy mode: prefer clean horizontal/vertical separation.
+        if "BADC_ORI_ASSIGN_NEAREST" not in os.environ:
+            ori_assign_nearest = False
+        if "BADC_ORI_ENABLE_SOFT_ASSIGN" not in os.environ:
+            ori_enable_soft_assign = False
+        if "BADC_ORI_FORCE_NEAREST_REMAINING" not in os.environ:
+            ori_force_nearest_remaining = False
     bbox_x0, bbox_y0, bbox_x1, bbox_y1 = [float(v) for v in floor_bbox]
     max_w = float(np.max(weights)) if isinstance(weights, np.ndarray) and weights.size > 0 else 1.0
     linesA = []
@@ -8412,6 +11187,11 @@ def _fit_court_homography_hough(
     base_metrics["num_hough_lines_b"] = int(len(linesB))
     base_metrics["ori_center1_deg"] = float(np.degrees(center1))
     base_metrics["ori_center2_deg"] = float(np.degrees(center2))
+    base_metrics["ori_center_diff_deg"] = float(ori_center_diff_deg)
+    base_metrics["ori_centers_force_ortho"] = bool(ori_centers_force_ortho)
+    base_metrics["ori_centers_ortho_max_dev_deg"] = float(ori_centers_ortho_max_dev_deg)
+    base_metrics["ori_center_forced_orth"] = bool(ori_center_forced_orth)
+    base_metrics["ori_legacy_hv_split"] = bool(legacy_ori_split)
     base_metrics["ori_band_deg"] = float(band_deg)
     base_metrics["ori_band_soft_deg"] = float(band_soft_deg)
     base_metrics["ori_soft_minlen_frac"] = float(soft_minlen_frac)
@@ -8727,6 +11507,7 @@ def _fit_court_homography_hough(
     reject_aspect_ratio = 0
     reject_roi_corner = 0
     h, w = white_mask_clean.shape[:2]
+    diag_img = float(max(1.0, math.hypot(float(w), float(h))))
     margin = 20
     img_bbox = (margin, margin, int(w - 1 - margin), int(h - 1 - margin))
     bbox_w = max(1, int(x1 - x0))
@@ -8738,11 +11519,16 @@ def _fit_court_homography_hough(
     best_mixer_parts: Optional[Dict[str, float]] = None
     best_area_ratio_img: Optional[float] = None
     best_ymax_ratio: Optional[float] = None
+    best_top_edge_floor_ratio: Optional[float] = None
     best_bottom_support: Optional[float] = None
     reject_area_ratio_low = 0
+    reject_area_ratio_high = 0
     reject_ymax_ratio_low = 0
     reject_degenerate_bbox = 0
     reject_degenerate_min_edge = 0
+    reject_corner_oob = 0
+    reject_bottom_span_floor_ratio = 0
+    reject_top_edge_ratio_high = 0
     top3_main: list[Tuple[float, float, float, float]] = []
     relaxed_pass = 0
     vp_a = _estimate_vanishing_point(
@@ -8789,9 +11575,16 @@ def _fit_court_homography_hough(
     best_ratio_meta: Optional[Dict[str, Any]] = None
     best_ratio_bonus: Optional[float] = None
     ratio_refine_used = False
+    semantic_rerank_used = False
+    semantic_rerank_switched = False
+    semantic_rerank_meta: Optional[Dict[str, Any]] = None
+    min_bottom_span_floor_ratio_hard = float(
+        _env_float("BADC_QRT_MIN_BOTTOM_SPAN_FLOOR_RATIO", _env_float("BADC_FIT_MIN_BOTTOM_SPAN_FLOOR_RATIO", 0.45))
+    )
     for relax_scale in (1.0, 0.7):
         if relax_scale < 1.0:
             relaxed_pass = 1
+        min_bottom_span_floor_ratio_loop = float(max(0.28, min_bottom_span_floor_ratio_hard * float(relax_scale)))
         best_pairA = None
         best_pairB = None
         best_ordered = None
@@ -8801,11 +11594,13 @@ def _fit_court_homography_hough(
         best_mixer_parts = None
         best_area_ratio_img = None
         best_ymax_ratio = None
+        best_top_edge_floor_ratio = None
         best_bottom_support = None
         best_role_prior_bonus = None
         best_role_prior_meta = None
         best_ratio_meta = None
         best_ratio_bonus = None
+        candidate_pool: list[Dict[str, Any]] = []
         top3_main = []
         deg_bbox_w = float(max(1.0, qrt_min_bbox_w_frac * float(w) * float(relax_scale)))
         deg_bbox_h = float(max(1.0, qrt_min_bbox_h_frac * float(h) * float(relax_scale)))
@@ -8813,6 +11608,16 @@ def _fit_court_homography_hough(
         min_area_ratio_img = float(os.environ.get("BADC_QRT_MIN_AREA_RATIO_IMG", "0.04"))
         aspect_min = float(os.environ.get("BADC_QRT_ASPECT_MIN", "1.4"))
         aspect_max = float(os.environ.get("BADC_QRT_ASPECT_MAX", "3.0"))
+        max_corner_oob_px = float(
+            _env_float("BADC_QRT_MAX_CORNER_OOB_PX", max(160.0, 0.26 * float(max(h, w))))
+        )
+        corner_oob_soft_k = float(_env_float("BADC_QRT_CORNER_OOB_SOFT_K", 9.0))
+        floor_oob_soft_k = float(_env_float("BADC_QRT_FLOOR_OOB_SOFT_K", 16.0))
+        roi_corner_soft_bias = float(_env_float("BADC_QRT_ROI_CORNER_SOFT_BIAS", 2.0))
+        max_area_ratio_floor = float(_env_float("BADC_QRT_MAX_AREA_RATIO_FLOOR", 0.45))
+        max_top_edge_floor_ratio = float(_env_float("BADC_QRT_MAX_TOP_EDGE_FLOOR_RATIO", 0.58))
+        top_edge_soft_ref = float(_env_float("BADC_QRT_TOP_EDGE_SOFT_REF", 0.22))
+        top_edge_soft_w = float(_env_float("BADC_QRT_TOP_EDGE_SOFT_W", 18.0))
         for pairA, _scoreA in pairsA:
             for pairB, _scoreB in pairsB:
                 quad = _intersections_from_pairs(pairA, pairB)
@@ -8823,9 +11628,40 @@ def _fit_court_homography_hough(
                     continue
                 if _quad_area(ordered) < 1.0:
                     continue
+                bottom_span_floor_ratio = _bottom_span_floor_ratio(ordered, floor_bbox)
+                if bottom_span_floor_ratio < min_bottom_span_floor_ratio_loop:
+                    reject_bottom_span_floor_ratio += 1
+                    continue
                 ok, _gate_reason, _gate_metrics = _passes_geom_gates(ordered, floor_bbox)
                 if not ok:
                     continue
+                x = ordered[:, 0]
+                y = ordered[:, 1]
+                oob_l = np.maximum(0.0, -x)
+                oob_r = np.maximum(0.0, x - float(max(0, w - 1)))
+                oob_t = np.maximum(0.0, -y)
+                oob_b = np.maximum(0.0, y - float(max(0, h - 1)))
+                corner_oob_each = oob_l + oob_r + oob_t + oob_b
+                corner_oob_sum = float(np.sum(corner_oob_each))
+                if np.any(
+                    corner_oob_each > float(max_corner_oob_px)
+                ):
+                    reject_corner_oob += 1
+                    continue
+                roi_corner_ok = _corners_inside_floor_roi(
+                    ordered,
+                    floor_bbox,
+                    margin_x=float(corner_margin_x),
+                    margin_y=float(corner_margin_y),
+                )
+                if not roi_corner_ok:
+                    reject_roi_corner += 1
+                x0f, y0f, x1f, y1f = [float(v) for v in floor_bbox]
+                floor_oob_l = np.maximum(0.0, (x0f - float(corner_margin_x)) - x)
+                floor_oob_r = np.maximum(0.0, x - (x1f + float(corner_margin_x)))
+                floor_oob_t = np.maximum(0.0, (y0f - float(corner_margin_y)) - y)
+                floor_oob_b = np.maximum(0.0, y - (y1f + float(corner_margin_y)))
+                floor_oob_sum = float(np.sum(floor_oob_l + floor_oob_r + floor_oob_t + floor_oob_b))
                 bbox_w = float(np.max(ordered[:, 0]) - np.min(ordered[:, 0]))
                 bbox_h = float(np.max(ordered[:, 1]) - np.min(ordered[:, 1]))
                 min_edge = float(np.min(_quad_edges(ordered)))
@@ -8856,8 +11692,12 @@ def _fit_court_homography_hough(
                 y_vals = ordered[:, 1]
                 ymax_ratio = max(0.0, min(1.0, float(np.max(y_vals)) / float(max(h - 1, 1))))
                 ymean_ratio = max(0.0, min(1.0, float(np.mean(y_vals)) / float(max(h - 1, 1))))
+                top_edge_floor_ratio = _top_edge_floor_ratio(ordered, floor_bbox)
                 if ymax_ratio < 0.70:
                     reject_ymax_ratio_low += 1
+                if top_edge_floor_ratio > max_top_edge_floor_ratio:
+                    reject_top_edge_ratio_high += 1
+                    continue
                 H_cand = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), ordered.astype(np.float32))
                 if not np.all(np.isfinite(H_cand)):
                     continue
@@ -8871,6 +11711,10 @@ def _fit_court_homography_hough(
                     tau_px=6.0,
                     dt_oob=dt_oob,
                 )
+                area_ratio = float(loss_info.get("area_ratio", 0.0))
+                if area_ratio > max_area_ratio_floor:
+                    reject_area_ratio_high += 1
+                    continue
                 score, mixer_parts = _mixer_score_candidate(
                     ordered,
                     loss_info,
@@ -8879,12 +11723,16 @@ def _fit_court_homography_hough(
                     vp_short=vp_b,
                 )
                 bottom_support = _bottom_support_from_loss(loss_info, ymax_ratio, h, tau_px=6.0)
+                top_edge_soft_penalty = float(
+                    max(0.0, float(top_edge_floor_ratio) - float(top_edge_soft_ref)) * float(top_edge_soft_w)
+                )
                 score_final = float(
                     score
                     + 6.0 * math.log(max(area_ratio_img, 1e-6))
                     + 3.0 * ymean_ratio
                     + 2.0 * ymax_ratio
                     + 4.0 * bottom_support
+                    - top_edge_soft_penalty
                 )
                 inside_count_val, _inside_flags = _count_points_inside_quad(ordered, foot_points)
                 inside_bonus = 10.0 * float(inside_count_val)
@@ -8901,12 +11749,15 @@ def _fit_court_homography_hough(
                     anchor_score = float(math.exp(-err_mean / 200.0))
                     score_final *= (0.8 + 0.2 * anchor_score)
                     best_anchor_score = anchor_score
-                area_ratio = float(loss_info.get("area_ratio", 0.0))
                 area_w = _env_float("BADC_QUAD_AREA_PRIOR_W", 2.5)
                 area_min = _env_float("BADC_QUAD_AREA_PRIOR_MIN", 0.10)
-                area_bonus = area_w * area_ratio
+                area_max = _env_float("BADC_QUAD_AREA_PRIOR_MAX", 0.42)
+                area_high_penalty_mult = _env_float("BADC_QUAD_AREA_PRIOR_HIGH_PENALTY_MULT", 8.0)
+                area_bonus = area_w * min(area_ratio, area_max)
                 if area_ratio < area_min:
                     area_bonus -= area_w * 3.0 * (area_min - area_ratio)
+                if area_ratio > area_max:
+                    area_bonus -= area_w * area_high_penalty_mult * (area_ratio - area_max)
                 role_bonus = 0.0
                 role_meta: Dict[str, float] = {}
                 if role_prior_enabled:
@@ -8935,7 +11786,44 @@ def _fit_court_homography_hough(
                     ratio_meta["bonus"] = float(ratio_bonus)
                     if ratio_verify_hard_gate and not ratio_pass:
                         continue
-                score_total = float(score_final + inside_bonus + area_bonus + float(role_bonus) + float(ratio_bonus))
+                geom_soft_penalty = float(
+                    corner_oob_soft_k * (corner_oob_sum / diag_img)
+                    + floor_oob_soft_k * (floor_oob_sum / diag_img)
+                    + (roi_corner_soft_bias if not roi_corner_ok else 0.0)
+                )
+                score_total = float(
+                    score_final + inside_bonus + area_bonus + float(role_bonus) + float(ratio_bonus) - geom_soft_penalty
+                )
+                candidate_pool.append(
+                    {
+                        "pairA": pairA,
+                        "pairB": pairB,
+                        "ordered": np.asarray(ordered, dtype=np.float32).copy(),
+                        "score_total": float(score_total),
+                        "score_base": float(score_final),
+                        "area_ratio_floor": float(loss_info.get("area_ratio", 0.0)),
+                        "inside_ratio": float(_points_inside_ratio(ordered, img_bbox)),
+                        "area_ratio_img": float(area_ratio_img),
+                        "ymax_ratio": float(ymax_ratio),
+                        "top_edge_floor_ratio": float(top_edge_floor_ratio),
+                        "bottom_support": float(bottom_support),
+                        "inside_count": int(inside_count_val),
+                        "inside_bonus": float(inside_bonus),
+                        "role_bonus": float(role_bonus),
+                        "role_meta": dict(role_meta) if role_meta else None,
+                        "ratio_bonus": float(ratio_bonus),
+                        "ratio_meta": dict(ratio_meta) if isinstance(ratio_meta, dict) else None,
+                        "mixer_parts": dict(mixer_parts) if isinstance(mixer_parts, dict) else None,
+                        "top_edge_soft_penalty": float(top_edge_soft_penalty),
+                        "geom_soft_penalty": float(geom_soft_penalty),
+                        "corner_oob_sum": float(corner_oob_sum),
+                        "floor_oob_sum": float(floor_oob_sum),
+                        "roi_corner_ok": bool(roi_corner_ok),
+                    }
+                )
+                if len(candidate_pool) > 32:
+                    candidate_pool.sort(key=lambda it: float(it.get("score_total", -1e9)), reverse=True)
+                    candidate_pool = candidate_pool[:32]
                 if score_total > best_score:
                     best_score = score_total
                     best_score_base = float(score_final)
@@ -8947,6 +11835,7 @@ def _fit_court_homography_hough(
                     best_mixer_parts = mixer_parts
                     best_area_ratio_img = float(area_ratio_img)
                     best_ymax_ratio = float(ymax_ratio)
+                    best_top_edge_floor_ratio = float(top_edge_floor_ratio)
                     best_bottom_support = float(bottom_support)
                     best_inside_count = int(inside_count_val)
                     best_inside_bonus = float(inside_bonus)
@@ -8954,6 +11843,10 @@ def _fit_court_homography_hough(
                     best_role_prior_meta = dict(role_meta) if role_meta else None
                     best_ratio_bonus = float(ratio_bonus)
                     best_ratio_meta = dict(ratio_meta) if isinstance(ratio_meta, dict) else None
+                    base_metrics["best_geom_soft_penalty"] = float(geom_soft_penalty)
+                    base_metrics["best_corner_oob_sum"] = float(corner_oob_sum)
+                    base_metrics["best_floor_oob_sum"] = float(floor_oob_sum)
+                    base_metrics["best_roi_corner_ok"] = bool(roi_corner_ok)
                 top3_main.append(
                     (score_total, area_ratio_img, ymax_ratio, bottom_support, int(inside_count_val), float(ratio_score_val))
                 )
@@ -8998,12 +11891,123 @@ def _fit_court_homography_hough(
             best_ratio_bonus = float(ratio_verify_weight * float(best_ratio_meta.get("score", 0.0)))
             ratio_refine_used = True
 
+    semantic_rerank_enable = bool(_env_flag("BADC_SEMANTIC_RERANK_ENABLE", True))
+    semantic_rerank_hard_only = bool(_env_flag("BADC_SEMANTIC_RERANK_HARD_ONLY", True))
+    semantic_rerank_topk = int(max(1, _env_int("BADC_SEMANTIC_RERANK_TOPK", 14)))
+    semantic_rerank_weight = float(_env_float("BADC_SEMANTIC_RERANK_W", 2.2))
+    if semantic_rerank_enable and best_ordered is not None and candidate_pool:
+        semantic_mask_rank = (
+            linepix_mask
+            if isinstance(linepix_mask, np.ndarray) and int(np.count_nonzero(linepix_mask)) > 0
+            else white_mask_clean
+        )
+        ranked_candidates = sorted(candidate_pool, key=lambda it: float(it.get("score_total", -1e9)), reverse=True)[
+            :semantic_rerank_topk
+        ]
+        rank_rows: list[Dict[str, Any]] = []
+        selected_cand: Optional[Dict[str, Any]] = None
+        selected_sem: Optional[Dict[str, Any]] = None
+        selected_total = float("-inf")
+        for ridx, cand in enumerate(ranked_candidates, start=1):
+            q = np.asarray(cand.get("ordered"), dtype=np.float32).reshape(4, 2)
+            H_cand = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), q.astype(np.float32))
+            _, sem_meta = _semantic_refine_homography(H_cand, semantic_mask_rank)
+            sem_score = float(sem_meta.get("final_score", sem_meta.get("score", -1e9)))
+            hard_ok = bool(sem_meta.get("hard_pass", True))
+            total_rank = float(cand.get("score_total", -1e9)) + float(semantic_rerank_weight) * sem_score
+            rank_rows.append(
+                {
+                    "rank": int(ridx),
+                    "base_score": float(cand.get("score_total", -1e9)),
+                    "semantic_score": float(sem_score),
+                    "rank_score": float(total_rank),
+                    "hard_pass": bool(hard_ok),
+                    "hard_reason": sem_meta.get("hard_reason"),
+                }
+            )
+            if semantic_rerank_hard_only and not hard_ok:
+                continue
+            if total_rank > selected_total:
+                selected_total = total_rank
+                selected_cand = cand
+                selected_sem = sem_meta
+        if selected_cand is None and ranked_candidates:
+            for cand, row in zip(ranked_candidates, rank_rows):
+                total_rank = float(row.get("rank_score", -1e9))
+                if total_rank > selected_total:
+                    selected_total = total_rank
+                    selected_cand = cand
+                    selected_sem = None
+
+        if selected_cand is not None:
+            semantic_rerank_used = True
+            prev_ordered = np.asarray(best_ordered, dtype=np.float32).reshape(4, 2)
+            new_ordered = np.asarray(selected_cand.get("ordered"), dtype=np.float32).reshape(4, 2)
+            switched = not np.allclose(prev_ordered, new_ordered, atol=1.0)
+            semantic_rerank_switched = bool(switched)
+            if switched:
+                best_pairA = selected_cand.get("pairA")
+                best_pairB = selected_cand.get("pairB")
+                best_ordered = new_ordered
+                best_score = float(selected_cand.get("score_total", best_score))
+                best_score_base = float(selected_cand.get("score_base", best_score_base or 0.0))
+                best_area_ratio = float(selected_cand.get("area_ratio_floor", best_area_ratio or 0.0))
+                best_inside_ratio = float(selected_cand.get("inside_ratio", best_inside_ratio or 0.0))
+                best_mixer_parts = (
+                    dict(selected_cand.get("mixer_parts"))
+                    if isinstance(selected_cand.get("mixer_parts"), dict)
+                    else best_mixer_parts
+                )
+                best_area_ratio_img = float(selected_cand.get("area_ratio_img", best_area_ratio_img or 0.0))
+                best_ymax_ratio = float(selected_cand.get("ymax_ratio", best_ymax_ratio or 0.0))
+                best_top_edge_floor_ratio = float(
+                    selected_cand.get("top_edge_floor_ratio", best_top_edge_floor_ratio or 0.0)
+                )
+                best_bottom_support = float(selected_cand.get("bottom_support", best_bottom_support or 0.0))
+                best_inside_count = int(selected_cand.get("inside_count", best_inside_count or 0))
+                best_inside_bonus = float(selected_cand.get("inside_bonus", best_inside_bonus or 0.0))
+                best_role_prior_bonus = float(selected_cand.get("role_bonus", best_role_prior_bonus or 0.0))
+                best_role_prior_meta = (
+                    dict(selected_cand.get("role_meta"))
+                    if isinstance(selected_cand.get("role_meta"), dict)
+                    else best_role_prior_meta
+                )
+                best_ratio_bonus = float(selected_cand.get("ratio_bonus", best_ratio_bonus or 0.0))
+                best_ratio_meta = (
+                    dict(selected_cand.get("ratio_meta"))
+                    if isinstance(selected_cand.get("ratio_meta"), dict)
+                    else best_ratio_meta
+                )
+                base_metrics["best_geom_soft_penalty"] = float(selected_cand.get("geom_soft_penalty", 0.0))
+                base_metrics["best_corner_oob_sum"] = float(selected_cand.get("corner_oob_sum", 0.0))
+                base_metrics["best_floor_oob_sum"] = float(selected_cand.get("floor_oob_sum", 0.0))
+                base_metrics["best_roi_corner_ok"] = bool(selected_cand.get("roi_corner_ok", False))
+
+            semantic_rerank_meta = {
+                "enabled": True,
+                "used": bool(semantic_rerank_used),
+                "switched": bool(semantic_rerank_switched),
+                "hard_only": bool(semantic_rerank_hard_only),
+                "topk": int(semantic_rerank_topk),
+                "weight": float(semantic_rerank_weight),
+                "rows": rank_rows,
+                "selected_rank_score": float(selected_total),
+                "selected_hard_pass": bool((selected_sem or {}).get("hard_pass", True)),
+                "selected_hard_reason": (selected_sem or {}).get("hard_reason"),
+            }
+
     base_metrics["reject_roi_corner"] = int(reject_roi_corner)
     base_metrics["reject_manual_anchor"] = int(reject_manual_anchor)
     base_metrics["reject_area_ratio_low"] = int(reject_area_ratio_low)
+    base_metrics["reject_area_ratio_high"] = int(reject_area_ratio_high)
     base_metrics["reject_ymax_ratio_low"] = int(reject_ymax_ratio_low)
     base_metrics["reject_degenerate_bbox"] = int(reject_degenerate_bbox)
     base_metrics["reject_degenerate_min_edge"] = int(reject_degenerate_min_edge)
+    base_metrics["reject_corner_oob"] = int(reject_corner_oob)
+    base_metrics["reject_bottom_span_floor_ratio_low"] = int(reject_bottom_span_floor_ratio)
+    base_metrics["reject_top_edge_floor_ratio_high"] = int(reject_top_edge_ratio_high)
+    base_metrics["gate_min_bottom_span_floor_ratio"] = float(min_bottom_span_floor_ratio_hard)
+    base_metrics["gate_max_top_edge_floor_ratio"] = float(_env_float("BADC_QRT_MAX_TOP_EDGE_FLOOR_RATIO", 0.58))
     base_metrics["reject_aspect_ratio"] = int(reject_aspect_ratio)
     base_metrics["relaxed_pass"] = int(relaxed_pass)
     top3_main.sort(key=lambda item: item[0], reverse=True)
@@ -9020,7 +12024,11 @@ def _fit_court_homography_hough(
         for s, a, y, b, ic, rs in top3_main[:3]
     ]
     base_metrics["selected_area_ratio"] = float(best_area_ratio_img) if best_area_ratio_img is not None else None
+    base_metrics["selected_area_ratio_floor"] = float(best_area_ratio) if best_area_ratio is not None else None
     base_metrics["selected_ymax_ratio"] = float(best_ymax_ratio) if best_ymax_ratio is not None else None
+    base_metrics["selected_top_edge_floor_ratio"] = (
+        float(best_top_edge_floor_ratio) if best_top_edge_floor_ratio is not None else None
+    )
     base_metrics["selected_bottom_support"] = (
         float(best_bottom_support) if best_bottom_support is not None else None
     )
@@ -9035,6 +12043,9 @@ def _fit_court_homography_hough(
     base_metrics["court_ratio_refine_used"] = bool(ratio_refine_used)
     base_metrics["court_ratio_bonus"] = float(best_ratio_bonus) if best_ratio_bonus is not None else None
     base_metrics["court_ratio_meta"] = best_ratio_meta if isinstance(best_ratio_meta, dict) else None
+    base_metrics["semantic_rerank_used"] = bool(semantic_rerank_used)
+    base_metrics["semantic_rerank_switched"] = bool(semantic_rerank_switched)
+    base_metrics["semantic_rerank_meta"] = semantic_rerank_meta if isinstance(semantic_rerank_meta, dict) else None
     base_metrics["inside_count"] = int(best_inside_count) if best_inside_count is not None else 0
     base_metrics["inside_bonus"] = float(best_inside_bonus) if best_inside_bonus is not None else 0.0
     base_metrics["score_final"] = base_metrics["score_base"]
@@ -9057,6 +12068,19 @@ def _fit_court_homography_hough(
             white_mask_raw_floor_noblob=white_mask_raw_floor_noblob,
         )
         if H_raw is not None:
+            semantic_mask_raw = (
+                white_mask_raw_floor_postblob
+                if isinstance(white_mask_raw_floor_postblob, np.ndarray)
+                and int(np.count_nonzero(white_mask_raw_floor_postblob)) > 0
+                else white_mask_raw_floor_noblob
+            )
+            H_raw_refined, semantic_meta_raw = _semantic_refine_homography(H_raw, semantic_mask_raw)
+            if bool(semantic_meta_raw.get("improved", False)):
+                H_raw = H_raw_refined
+            base_metrics["semantic_refine_enabled"] = bool(semantic_meta_raw.get("enabled", False))
+            base_metrics["semantic_refine_applied"] = bool(semantic_meta_raw.get("applied", False))
+            base_metrics["semantic_refine_meta"] = semantic_meta_raw if isinstance(semantic_meta_raw, dict) else None
+
             dt_raw = build_distance_transform(white_mask_raw_floor_postblob)
             dt_raw_min = float(np.min(dt_raw)) if dt_raw.size > 0 else None
             dt_raw_mean = float(np.mean(dt_raw)) if dt_raw.size > 0 else None
@@ -9072,11 +12096,26 @@ def _fit_court_homography_hough(
                 tau_px=3.0,
                 dt_oob=dt_oob,
             )
-            p90_raw = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 999.0)
+            p90_raw = float(
+                loss_info.get("sample_dist_p90_raw_weighted")
+                or loss_info.get("sample_dist_p90_raw")
+                or loss_info.get("sample_dist_p90")
+                or 999.0
+            )
+            p90_conf = float(
+                loss_info.get("sample_dist_p90_weighted")
+                or loss_info.get("sample_dist_p90")
+                or min(float(p90_raw), 18.0)
+            )
             cover_ratio = float(loss_info.get("cover_ratio", 0.0))
             inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
             cost = 0.6 * p90_raw + 0.4 * (1.0 - cover_ratio) * 50.0 + (1.0 - inlier_ratio) * 30.0
-            conf_terms = _confidence_terms(inlier_ratio, cover_ratio, p90_raw, float(loss_info.get("area_ratio", 0.0)))
+            conf_terms = _confidence_terms(
+                inlier_ratio,
+                cover_ratio,
+                p90_conf,
+                float(loss_info.get("area_ratio", 0.0)),
+            )
             conf = float(conf_terms["confidence"])
             score1 = raw_metrics.get("raw_floor_best_score")
             top5 = raw_metrics.get("raw_floor_top5") if isinstance(raw_metrics, dict) else None
@@ -9086,23 +12125,70 @@ def _fit_court_homography_hough(
                     score2 = float(top5[1].get("score"))
                 except Exception:
                     score2 = None
-            conf_raw = None
-            conf_gap = None
-            conf_gap_input = None
+            score_norm_conf = None
+            rank_gap_conf = None
+            rank_gap_input = None
             if score1 is not None and isinstance(score1, (int, float)):
-                conf_raw = float(math.exp(-float(score1) / 3.0))
-                gap = float(score2 - score1) if score2 is not None else 0.0
-                z = float(gap / 0.5)
+                score_center = float(_env_float("BADC_RAW_FLOOR_SCORE_CENTER", 40.0))
+                score_scale = float(max(1e-3, _env_float("BADC_RAW_FLOOR_SCORE_SCALE", 12.0)))
+                z_score = float((float(score1) - score_center) / score_scale)
+                z_score = max(-60.0, min(60.0, z_score))
+                score_norm_conf = float(1.0 / (1.0 + math.exp(-z_score)))
+                gap = float(score1 - score2) if score2 is not None else 0.0
+                gap_mid = float(_env_float("BADC_RAW_FLOOR_SCORE_GAP_MID", 0.12))
+                gap_scale = float(max(1e-3, _env_float("BADC_RAW_FLOOR_SCORE_GAP_SCALE", 0.08)))
+                z = float((gap - gap_mid) / gap_scale)
                 z = max(-60.0, min(60.0, z))
-                conf_gap_input = float(z)
-                conf_gap = float(1.0 / (1.0 + math.exp(-z)))
-                conf = max(0.0, min(1.0, conf_raw * conf_gap))
+                rank_gap_input = float(z)
+                rank_gap_conf = float(1.0 / (1.0 + math.exp(-z)))
+                rank_mix = float(
+                    0.5 * float(score_norm_conf)
+                    + 0.5 * float(rank_gap_conf)
+                )
+                conf_blend = float(max(0.0, min(0.8, _env_float("BADC_RAW_FLOOR_CONF_BLEND", 0.25))))
+                conf = float((1.0 - conf_blend) * conf + conf_blend * rank_mix)
             conf_auto = float(conf)
-            reason = "OK" if conf >= 0.10 else "R_fit_poor"
+            raw_conf_ok_thr = float(
+                _env_float(
+                    "BADC_RAW_FLOOR_CONF_OK_THR",
+                    _env_float("BADC_FIT_CONF_OK_THR", 0.35),
+                )
+            )
+            reason = "OK" if conf >= raw_conf_ok_thr else "R_fit_poor"
             corners_uv = project_points(H_raw, corners_world)
             ordered_corners = _order_corners_lb_rb_rt_lt(corners_uv)
             span_ok, span_metrics = _quad_span_ok(ordered_corners, frame_bgr.shape[1], frame_bgr.shape[0])
             base_metrics.update(span_metrics)
+            ordered_clip = ordered_corners.copy()
+            ordered_clip[:, 0] = np.clip(ordered_clip[:, 0], 0.0, float(frame_bgr.shape[1] - 1))
+            ordered_clip[:, 1] = np.clip(ordered_clip[:, 1], 0.0, float(frame_bgr.shape[0] - 1))
+            selected_area_ratio_guard = float(
+                _quad_area(ordered_clip) / float(max(frame_bgr.shape[0] * frame_bgr.shape[1], 1))
+            )
+            min_selected_area_ratio_guard = float(_env_float("BADC_FIT_MIN_SELECTED_AREA_RATIO", 0.12))
+            base_metrics["selected_area_ratio_guard"] = float(selected_area_ratio_guard)
+            base_metrics["selected_area_ratio_guard_min"] = float(min_selected_area_ratio_guard)
+            min_raw_floor_area_ratio = float(_env_float("BADC_RAW_FLOOR_MIN_AREA_RATIO", 0.20))
+            raw_floor_area_ratio = float(loss_info.get("area_ratio", 0.0))
+            base_metrics["raw_floor_min_area_ratio"] = float(min_raw_floor_area_ratio)
+            base_metrics["raw_floor_area_ratio"] = float(raw_floor_area_ratio)
+            min_bottom_span_floor_ratio_guard_base = float(
+                _env_float("BADC_FIT_MIN_BOTTOM_SPAN_FLOOR_RATIO", 0.45)
+            )
+            min_bottom_span_floor_ratio_guard = float(
+                max(
+                    0.28,
+                    min_bottom_span_floor_ratio_guard_base * (0.7 if int(relaxed_pass) > 0 else 1.0),
+                )
+            )
+            bottom_span_floor_ratio_guard = _bottom_span_floor_ratio(ordered_corners, floor_bbox)
+            max_top_edge_floor_ratio_guard = float(_env_float("BADC_FIT_MAX_TOP_EDGE_FLOOR_RATIO", 0.30))
+            top_edge_floor_ratio_guard = _top_edge_floor_ratio(ordered_corners, floor_bbox)
+            base_metrics["bottom_span_floor_ratio"] = float(bottom_span_floor_ratio_guard)
+            base_metrics["bottom_span_floor_ratio_min"] = float(min_bottom_span_floor_ratio_guard)
+            base_metrics["bottom_span_floor_ratio_min_base"] = float(min_bottom_span_floor_ratio_guard_base)
+            base_metrics["top_edge_floor_ratio"] = float(top_edge_floor_ratio_guard)
+            base_metrics["top_edge_floor_ratio_max"] = float(max_top_edge_floor_ratio_guard)
             corners_out = ordered_corners.astype(np.float32)
             deg_bbox_w = float(np.max(ordered_corners[:, 0]) - np.min(ordered_corners[:, 0]))
             deg_bbox_h = float(np.max(ordered_corners[:, 1]) - np.min(ordered_corners[:, 1]))
@@ -9115,6 +12201,73 @@ def _fit_court_homography_hough(
                 reason = "R_degenerate_quad"
                 conf = 0.0
                 conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and bottom_span_floor_ratio_guard < min_bottom_span_floor_ratio_guard:
+                reason = "R_bottom_span_small"
+                conf = 0.0
+                conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and top_edge_floor_ratio_guard > max_top_edge_floor_ratio_guard:
+                reason = "R_top_edge_low"
+                conf = 0.0
+                conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and selected_area_ratio_guard < min_selected_area_ratio_guard:
+                reason = "R_area_small"
+                conf = 0.0
+                conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and raw_floor_area_ratio < min_raw_floor_area_ratio:
+                reason = "R_small_area"
+                conf = 0.0
+                conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                corners_out = None
+            if corners_out is not None and isinstance(semantic_meta_raw, dict) and not bool(
+                semantic_meta_raw.get("hard_pass", True)
+            ):
+                bypass_conf = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_CONF", 0.65))
+                bypass_inlier = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_INLIER", 0.70))
+                bypass_cover = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_COVER", 0.70))
+                hard_bypass = bool(
+                    float(conf) >= bypass_conf
+                    and float(inlier_ratio) >= bypass_inlier
+                    and float(cover_ratio) >= bypass_cover
+                )
+                base_metrics["semantic_hard_bypass"] = bool(hard_bypass)
+                base_metrics["semantic_hard_bypass_conf"] = float(bypass_conf)
+                base_metrics["semantic_hard_bypass_inlier"] = float(bypass_inlier)
+                base_metrics["semantic_hard_bypass_cover"] = float(bypass_cover)
+                if not hard_bypass:
+                    reason = str(semantic_meta_raw.get("hard_reason") or "R_semantic")
+                    conf = 0.0
+                    conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+                    corners_out = None
+            if corners_out is not None and reason == "R_fit_poor":
+                fit_poor_rescue_enable = bool(_env_flag("BADC_RAW_FLOOR_FIT_POOR_RESCUE_ENABLE", True))
+                fit_poor_rescue_min_area = float(_env_float("BADC_RAW_FLOOR_FIT_POOR_RESCUE_MIN_AREA", 0.36))
+                fit_poor_rescue_min_bottom = float(_env_float("BADC_RAW_FLOOR_FIT_POOR_RESCUE_MIN_BOTTOM_SPAN", 0.62))
+                fit_poor_rescue_max_top = float(_env_float("BADC_RAW_FLOOR_FIT_POOR_RESCUE_MAX_TOP_EDGE", 0.26))
+                fit_poor_rescue_min_conf = float(_env_float("BADC_RAW_FLOOR_FIT_POOR_RESCUE_MIN_CONF", 0.20))
+                sem_hard_pass = bool((semantic_meta_raw or {}).get("hard_pass", True))
+                fit_poor_rescue_ok = bool(
+                    fit_poor_rescue_enable
+                    and sem_hard_pass
+                    and float(raw_floor_area_ratio) >= fit_poor_rescue_min_area
+                    and float(bottom_span_floor_ratio_guard) >= fit_poor_rescue_min_bottom
+                    and float(top_edge_floor_ratio_guard) <= fit_poor_rescue_max_top
+                )
+                base_metrics["raw_floor_fit_poor_rescue_enable"] = bool(fit_poor_rescue_enable)
+                base_metrics["raw_floor_fit_poor_rescue_ok"] = bool(fit_poor_rescue_ok)
+                base_metrics["raw_floor_fit_poor_rescue_sem_hard_pass"] = bool(sem_hard_pass)
+                base_metrics["raw_floor_fit_poor_rescue_min_area"] = float(fit_poor_rescue_min_area)
+                base_metrics["raw_floor_fit_poor_rescue_min_bottom_span"] = float(fit_poor_rescue_min_bottom)
+                base_metrics["raw_floor_fit_poor_rescue_max_top_edge"] = float(fit_poor_rescue_max_top)
+                if fit_poor_rescue_ok:
+                    reason = "OK"
+                    conf = max(float(conf), fit_poor_rescue_min_conf)
+                    conf_terms = dict(conf_terms)
+                    conf_terms["confidence"] = float(conf)
+            if corners_out is not None and reason != "OK":
                 corners_out = None
             if corners_out is not None and not manual:
                 fb_w = max(1, int(floor_bbox[2] - floor_bbox[0]))
@@ -9160,7 +12313,12 @@ def _fit_court_homography_hough(
                     tau_px=3.0,
                     dt_oob=dt_oob,
                 )
-                p90_manual = float(manual_loss.get("sample_dist_p90_raw") or manual_loss.get("sample_dist_p90") or 999.0)
+                p90_manual = float(
+                    manual_loss.get("sample_dist_p90_raw_weighted")
+                    or manual_loss.get("sample_dist_p90_raw")
+                    or manual_loss.get("sample_dist_p90")
+                    or 999.0
+                )
                 cover_manual = float(manual_loss.get("cover_ratio", 0.0))
                 inlier_manual = float(manual_loss.get("inlier_ratio", 0.0))
                 conf_manual_terms = _confidence_terms(
@@ -9203,10 +12361,12 @@ def _fit_court_homography_hough(
                 "l_reg": float(loss_info.get("l_reg", 0.0)),
                 "area_ratio": float(loss_info.get("area_ratio", 0.0)),
                 "cover_ratio": float(cover_ratio),
-                "raw_floor_conf_raw": float(conf_raw) if conf_raw is not None else None,
-                "raw_floor_conf_gap": float(conf_gap) if conf_gap is not None else None,
-                "conf_gap_input": float(conf_gap_input) if conf_gap_input is not None else None,
+                "p90_dist_px_conf": float(p90_conf),
+                "raw_floor_score_norm_conf": float(score_norm_conf) if score_norm_conf is not None else None,
+                "raw_floor_rank_gap_conf": float(rank_gap_conf) if rank_gap_conf is not None else None,
+                "raw_floor_rank_gap_input": float(rank_gap_input) if rank_gap_input is not None else None,
                 "raw_floor_conf_final": float(conf),
+                "raw_floor_conf_ok_thr": float(raw_conf_ok_thr),
                 "confidence_auto": float(conf_auto),
                 "confidence_final": float(conf),
                 "conf_geom": float(conf_geom),
@@ -9293,24 +12453,223 @@ def _fit_court_homography_hough(
     completion_used = False
     completion_meta: Dict[str, Any] = {}
     completion_reject_reason = None
+
+    def _detect_baseline_ambiguity_for_completion(
+        ordered_quad: np.ndarray,
+        candidate_lines: Sequence[Tuple[float, float, float, float]],
+        floor_bbox_xyxy: Tuple[int, int, int, int],
+        line_mask_local: Optional[np.ndarray],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Detect whether current bottom edge is likely an inner service line instead of the true baseline.
+        Trigger condition (image-space): a sufficiently strong near-parallel line exists below current bottom.
+        """
+        meta_local: Dict[str, Any] = {"enabled": True, "ambiguous": False}
+        if ordered_quad is None or len(candidate_lines) == 0:
+            meta_local["reason"] = "no_input"
+            return False, meta_local
+        try:
+            q = np.asarray(ordered_quad, dtype=np.float32).reshape(4, 2)
+        except Exception:
+            meta_local["reason"] = "bad_quad"
+            return False, meta_local
+        if q.shape != (4, 2) or not np.all(np.isfinite(q)):
+            meta_local["reason"] = "bad_quad"
+            return False, meta_local
+
+        x0f, y0f, x1f, y1f = [float(v) for v in floor_bbox_xyxy]
+        floor_w = float(max(1.0, x1f - x0f))
+        x_ref = float(0.5 * (x0f + x1f))
+        curr_bottom = _line_from_points((float(q[0, 0]), float(q[0, 1])), (float(q[1, 0]), float(q[1, 1])))
+        curr_ang = float(np.mod(math.atan2(float(q[1, 1] - q[0, 1]), float(q[1, 0] - q[0, 0])), math.pi))
+        y_curr = _y_at_x(curr_bottom, x_ref)
+        if y_curr is None or not math.isfinite(float(y_curr)):
+            y_curr = float(0.5 * (float(q[0, 1]) + float(q[1, 1])))
+
+        angle_tol_deg = float(_env_float("BADC_COMPLETION_BASELINE_AMBIG_ANGLE_TOL_DEG", 14.0))
+        min_below_px = float(_env_float("BADC_COMPLETION_BASELINE_AMBIG_MIN_BELOW_PX", 10.0))
+        max_below_px = float(_env_float("BADC_COMPLETION_BASELINE_AMBIG_MAX_BELOW_PX", 180.0))
+        min_support = float(max(0.0, min(1.0, _env_float("BADC_COMPLETION_BASELINE_AMBIG_MIN_SUPPORT", 0.10))))
+        min_len_frac = float(max(0.10, min(1.0, _env_float("BADC_COMPLETION_BASELINE_AMBIG_MIN_LEN_FRAC", 0.28))))
+        expected_gap_m = float(_env_float("BADC_POSTFIT_BASELINE_TARGET_GAP_M", 0.76))
+        expected_gap_tol_ratio = float(max(0.20, _env_float("BADC_COMPLETION_BASELINE_AMBIG_GAP_TOL_RATIO", 0.55)))
+
+        # Estimate expected ~0.76m vertical gap in image for extra confidence.
+        expected_gap_px = None
+        try:
+            H_m2i = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), q.astype(np.float32))
+            model_w = float(np.max(get_bwf_corners()[:, 0]) - np.min(get_bwf_corners()[:, 0]))
+            p_gap = project_points(
+                H_m2i,
+                np.array([[0.5 * model_w, 0.0], [0.5 * model_w, float(expected_gap_m)]], dtype=np.float32),
+            )
+            if p_gap.shape == (2, 2):
+                expected_gap_px = float(abs(float(p_gap[1, 1]) - float(p_gap[0, 1])))
+        except Exception:
+            expected_gap_px = None
+        if expected_gap_px is not None and (not math.isfinite(expected_gap_px) or expected_gap_px < 4.0):
+            expected_gap_px = None
+
+        best: Optional[Dict[str, Any]] = None
+        ang_tol = math.radians(max(3.0, angle_tol_deg))
+        min_len_px = float(min_len_frac * floor_w)
+        for seg in candidate_lines:
+            x1s, y1s, x2s, y2s = [float(v) for v in seg]
+            seg_len = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+            if seg_len < min_len_px:
+                continue
+            seg_ang = float(np.mod(math.atan2(float(y2s - y1s), float(x2s - x1s)), math.pi))
+            if _angle_distance(seg_ang, curr_ang) > ang_tol:
+                continue
+            line_i = _line_from_points((x1s, y1s), (x2s, y2s))
+            yi = _y_at_x(line_i, x_ref)
+            if yi is None or not math.isfinite(float(yi)):
+                yi = float(0.5 * (y1s + y2s))
+            dy = float(yi - float(y_curr))
+            if dy < min_below_px or dy > max_below_px:
+                continue
+            sup = _line_support((x1s, y1s, x2s, y2s), line_mask_local) if line_mask_local is not None else None
+            sup_val = float(sup) if sup is not None else 0.0
+            if sup_val < min_support:
+                continue
+            gap_bonus = 0.0
+            if expected_gap_px is not None:
+                tol_px = max(6.0, expected_gap_tol_ratio * expected_gap_px)
+                gap_bonus = float(math.exp(-abs(dy - expected_gap_px) / max(1e-6, tol_px)))
+            score = float(0.70 * sup_val + 0.20 * min(1.0, seg_len / max(1.0, floor_w)) + 0.10 * gap_bonus)
+            cand = {
+                "dy_px": float(dy),
+                "support": float(sup_val),
+                "seg_len_px": float(seg_len),
+                "score": float(score),
+                "gap_bonus": float(gap_bonus),
+                "x1": float(x1s),
+                "y1": float(y1s),
+                "x2": float(x2s),
+                "y2": float(y2s),
+            }
+            if best is None or float(cand["score"]) > float(best["score"]):
+                best = cand
+
+        meta_local["current_bottom_y_ref"] = float(y_curr)
+        meta_local["x_ref"] = float(x_ref)
+        meta_local["expected_gap_px"] = float(expected_gap_px) if expected_gap_px is not None else None
+        meta_local["num_candidates"] = int(len(candidate_lines))
+        if best is None:
+            meta_local["reason"] = "no_lower_parallel_line"
+            return False, meta_local
+        meta_local["best_candidate"] = best
+        meta_local["ambiguous"] = True
+        meta_local["reason"] = "lower_parallel_line_detected"
+        return True, meta_local
+
     if ordered is not None and lines_left and lines_bottom:
-        lines_left_comp, line_ids_left_comp = _filter_lines_for_completion(lines_left, line_ids_left, ordered)
+        floor_w = float(max(1.0, float(floor_bbox[2] - floor_bbox[0])))
         floor_h = float(max(1.0, float(floor_bbox[3] - floor_bbox[1])))
+        completion_left_min_span_ratio = float(
+            max(0.0, min(1.0, _env_float("BADC_COMPLETION_LEFT_FILTER_MIN_SPAN_RATIO", 0.55)))
+        )
+        completion_left_min_span_px = float(max(80.0, _env_float("BADC_COMPLETION_LEFT_FILTER_MIN_SPAN_PX", 260.0)))
+        completion_left_extreme_keep = int(max(1, _env_int("BADC_COMPLETION_LEFT_FILTER_EXTREME_KEEP", 2)))
+        comp_left_margin_x = float(
+            max(
+                8.0,
+                _env_float(
+                    "BADC_COMPLETION_LEFT_MARGIN_X_PX",
+                    _env_float("BADC_COMPLETION_LEFT_MARGIN_X_FRAC", 0.60) * floor_w,
+                ),
+            )
+        )
+        comp_left_margin_top = float(
+            max(8.0, _env_float("BADC_COMPLETION_LEFT_MARGIN_TOP_PX", _env_float("BADC_COMPLETION_LEFT_MARGIN_TOP_FRAC", 0.15) * floor_h))
+        )
+        comp_left_margin_bottom = float(
+            max(8.0, _env_float("BADC_COMPLETION_LEFT_MARGIN_BOTTOM_PX", _env_float("BADC_COMPLETION_LEFT_MARGIN_BOTTOM_FRAC", 0.35) * floor_h))
+        )
+        lines_left_comp, line_ids_left_comp = _filter_lines_for_completion(
+            lines_left,
+            line_ids_left,
+            ordered,
+            margin_px=8.0,
+            margin_x_px=comp_left_margin_x,
+            margin_top_px=comp_left_margin_top,
+            margin_bottom_px=comp_left_margin_bottom,
+            expand_span_axis="x",
+            min_span_ratio=completion_left_min_span_ratio,
+            min_span_px=completion_left_min_span_px,
+            extreme_keep=completion_left_extreme_keep,
+        )
         comp_bottom_extra_px = _env_float(
             "BADC_COMPLETION_BOTTOM_EXTRA_PX",
             _env_float("BADC_COMPLETION_BOTTOM_EXTRA_FRAC", 0.22) * floor_h,
+        )
+        comp_bottom_margin_x = float(
+            max(
+                8.0,
+                _env_float(
+                    "BADC_COMPLETION_BOTTOM_MARGIN_X_PX",
+                    _env_float("BADC_COMPLETION_BOTTOM_MARGIN_X_FRAC", 0.65) * floor_w,
+                ),
+            )
+        )
+        comp_bottom_margin_top = float(
+            max(8.0, _env_float("BADC_COMPLETION_BOTTOM_MARGIN_TOP_PX", _env_float("BADC_COMPLETION_BOTTOM_MARGIN_TOP_FRAC", 0.12) * floor_h))
         )
         lines_bottom_comp, line_ids_bottom_comp = _filter_lines_for_completion(
             lines_bottom,
             line_ids_bottom,
             ordered,
             margin_px=8.0,
-            margin_top_px=8.0,
+            margin_x_px=comp_bottom_margin_x,
+            margin_top_px=comp_bottom_margin_top,
             margin_bottom_px=max(8.0, float(comp_bottom_extra_px)),
         )
         base_metrics["completion_bottom_extra_px"] = float(max(8.0, float(comp_bottom_extra_px)))
+        base_metrics["completion_bottom_margin_x_px"] = float(comp_bottom_margin_x)
+        base_metrics["completion_bottom_margin_top_px"] = float(comp_bottom_margin_top)
         base_metrics["completion_bottom_lines_before"] = int(len(lines_bottom))
         base_metrics["completion_bottom_lines_after"] = int(len(lines_bottom_comp))
+        base_metrics["completion_left_lines_before"] = int(len(lines_left))
+        base_metrics["completion_left_lines_after"] = int(len(lines_left_comp))
+        base_metrics["completion_left_filter_min_span_ratio"] = float(completion_left_min_span_ratio)
+        base_metrics["completion_left_filter_min_span_px"] = float(completion_left_min_span_px)
+        base_metrics["completion_left_filter_extreme_keep"] = int(completion_left_extreme_keep)
+        base_metrics["completion_left_margin_x_px"] = float(comp_left_margin_x)
+        base_metrics["completion_left_margin_top_px"] = float(comp_left_margin_top)
+        base_metrics["completion_left_margin_bottom_px"] = float(comp_left_margin_bottom)
+        completion_lines_preview_limit = int(max(4, _env_int("BADC_COMPLETION_LINES_PREVIEW_LIMIT", 24)))
+
+        def _completion_line_preview(
+            segs: Sequence[Tuple[float, float, float, float]],
+            ids: Sequence[Optional[int]],
+        ) -> list[Dict[str, Any]]:
+            out: list[Dict[str, Any]] = []
+            for idx, seg in enumerate(segs[:completion_lines_preview_limit]):
+                x1s, y1s, x2s, y2s = [float(v) for v in seg]
+                theta = float(np.mod(math.degrees(math.atan2(float(y2s - y1s), float(x2s - x1s))), 180.0))
+                length = float(math.hypot(float(x2s - x1s), float(y2s - y1s)))
+                sup = _line_support((x1s, y1s, x2s, y2s), linepix_mask) if linepix_mask is not None else None
+                line_abc = _line_from_points((x1s, y1s), (x2s, y2s))
+                x_ref_at_bottom = _x_at_y(line_abc, float(floor_bbox[3] - 1.0))
+                out.append(
+                    {
+                        "line_id": ids[idx] if idx < len(ids) else None,
+                        "theta_deg": float(theta),
+                        "length": float(length),
+                        "support": float(sup) if sup is not None else None,
+                        "x1": float(x1s),
+                        "y1": float(y1s),
+                        "x2": float(x2s),
+                        "y2": float(y2s),
+                        "x_at_floor_bottom": float(x_ref_at_bottom)
+                        if x_ref_at_bottom is not None and math.isfinite(float(x_ref_at_bottom))
+                        else None,
+                    }
+                )
+            return out
+
+        base_metrics["completion_left_lines_preview"] = _completion_line_preview(lines_left_comp, line_ids_left_comp)
+        base_metrics["completion_bottom_lines_preview"] = _completion_line_preview(lines_bottom_comp, line_ids_bottom_comp)
         y_sorted = np.sort(ordered[:, 1])
         bottom_min = float(y_sorted[-2]) if y_sorted.size >= 2 else float(np.max(ordered[:, 1]))
         out_of_frame = np.any(
@@ -9319,18 +12678,132 @@ def _fit_court_homography_hough(
             | (ordered[:, 1] < -0.05 * h)
             | (ordered[:, 1] > 1.05 * h)
         )
+        baseline_ambiguous, baseline_ambig_meta = _detect_baseline_ambiguity_for_completion(
+            ordered,
+            lines_bottom,
+            floor_bbox,
+            linepix_mask,
+        )
+        base_metrics["completion_baseline_ambiguous"] = bool(baseline_ambiguous)
+        base_metrics["completion_baseline_ambiguous_meta"] = baseline_ambig_meta
         if (not lines_left_comp or not lines_bottom_comp) and completion_reject_reason is None:
             completion_reject_reason = "completion_no_inlier_lines"
-        if (out_of_frame or bottom_min < (float(floor_bbox[1]) + 0.65 * floor_h)) and lines_left_comp and lines_bottom_comp:
+        completion_force = bool(_env_flag("BADC_COMPLETION_FORCE", False))
+        completion_trigger = bool(
+            completion_force
+            or out_of_frame
+            or baseline_ambiguous
+            or (bottom_min < (float(floor_bbox[1]) + 0.65 * floor_h))
+        )
+        base_metrics["completion_force"] = bool(completion_force)
+        base_metrics["completion_triggered"] = bool(completion_trigger)
+        base_metrics["completion_trigger_reasons"] = {
+            "force": bool(completion_force),
+            "out_of_frame": bool(out_of_frame),
+            "baseline_ambiguous": bool(baseline_ambiguous),
+            "bottom_too_high": bool(bottom_min < (float(floor_bbox[1]) + 0.65 * floor_h)),
+        }
+        if completion_trigger and lines_left_comp and lines_bottom_comp:
+            left_union_enabled = _env_flag("BADC_COMPLETION_LEFT_USE_UNION", True)
+            all_union_enabled = _env_flag("BADC_COMPLETION_USE_ALL_LINES", baseline_ambiguous)
+            lines_left_completion: list[Tuple[float, float, float, float]] = list(lines_left_comp)
+            line_ids_left_completion: list[Optional[int]] = list(line_ids_left_comp)
+            lines_all_comp: list[Tuple[float, float, float, float]] = []
+            line_ids_all_comp: list[Optional[int]] = []
+            if all_union_enabled:
+                comp_all_margin_x = float(
+                    max(
+                        8.0,
+                        _env_float(
+                            "BADC_COMPLETION_ALL_MARGIN_X_PX",
+                            _env_float("BADC_COMPLETION_ALL_MARGIN_X_FRAC", 0.70) * floor_w,
+                        ),
+                    )
+                )
+                comp_all_margin_top = float(
+                    max(8.0, _env_float("BADC_COMPLETION_ALL_MARGIN_TOP_PX", _env_float("BADC_COMPLETION_ALL_MARGIN_TOP_FRAC", 0.18) * floor_h))
+                )
+                comp_all_margin_bottom = float(
+                    max(
+                        8.0,
+                        _env_float(
+                            "BADC_COMPLETION_ALL_MARGIN_BOTTOM_PX",
+                            max(32.0, _env_float("BADC_COMPLETION_ALL_MARGIN_BOTTOM_FRAC", 0.40) * floor_h),
+                        ),
+                    )
+                )
+                comp_all_min_span_ratio = float(
+                    max(
+                        completion_left_min_span_ratio,
+                        min(1.0, _env_float("BADC_COMPLETION_ALL_MIN_SPAN_RATIO", 0.70)),
+                    )
+                )
+                comp_all_min_span_px = float(
+                    max(
+                        completion_left_min_span_px,
+                        max(120.0, _env_float("BADC_COMPLETION_ALL_MIN_SPAN_PX", 320.0)),
+                    )
+                )
+                comp_all_extreme_keep = int(
+                    max(
+                        completion_left_extreme_keep,
+                        max(1, _env_int("BADC_COMPLETION_ALL_EXTREME_KEEP", 3)),
+                    )
+                )
+                lines_all_comp, line_ids_all_comp = _filter_lines_for_completion(
+                    lines_all,
+                    line_ids_all,
+                    ordered,
+                    margin_px=8.0,
+                    margin_x_px=comp_all_margin_x,
+                    margin_top_px=comp_all_margin_top,
+                    margin_bottom_px=comp_all_margin_bottom,
+                    expand_span_axis="x",
+                    min_span_ratio=comp_all_min_span_ratio,
+                    min_span_px=comp_all_min_span_px,
+                    extreme_keep=comp_all_extreme_keep,
+                )
+            if left_union_enabled:
+                seen_keys: set[Tuple[int, int, int, int]] = set()
+                merged_lines: list[Tuple[float, float, float, float]] = []
+                merged_ids: list[Optional[int]] = []
+                merged_input_lines = list(lines_left_comp) + list(lines_bottom_comp) + list(lines_all_comp)
+                merged_input_ids = list(line_ids_left_comp) + list(line_ids_bottom_comp) + list(line_ids_all_comp)
+                for seg, lid in zip(merged_input_lines, merged_input_ids):
+                    x1s, y1s, x2s, y2s = [float(v) for v in seg]
+                    p1 = (x1s, y1s)
+                    p2 = (x2s, y2s)
+                    if (p2[0], p2[1]) < (p1[0], p1[1]):
+                        p1, p2 = p2, p1
+                    # Coarse quantization for dedup across nearly identical segments.
+                    key = (
+                        int(round(p1[0] / 2.0)),
+                        int(round(p1[1] / 2.0)),
+                        int(round(p2[0] / 2.0)),
+                        int(round(p2[1] / 2.0)),
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged_lines.append((x1s, y1s, x2s, y2s))
+                    merged_ids.append(lid)
+                lines_left_completion = merged_lines
+                line_ids_left_completion = merged_ids
+            base_metrics["completion_left_union_enabled"] = bool(left_union_enabled)
+            base_metrics["completion_all_union_enabled"] = bool(all_union_enabled)
+            base_metrics["completion_left_lines_base"] = int(len(lines_left_comp))
+            base_metrics["completion_left_lines_merged"] = int(len(lines_left_completion))
+            base_metrics["completion_all_lines_base"] = int(len(lines_all))
+            base_metrics["completion_all_lines_filtered"] = int(len(lines_all_comp))
             completed, ok, meta = _complete_corners_from_lines(
                 ordered,
-                lines_left=lines_left_comp,
+                lines_left=lines_left_completion,
                 lines_bottom=lines_bottom_comp,
                 floor_bbox=floor_bbox,
                 img_w=w,
                 img_h=h,
                 line_mask=linepix_mask,
-                line_ids_left=line_ids_left_comp,
+                line_ids_left=line_ids_left_completion,
                 line_ids_bottom=line_ids_bottom_comp,
                 component_id=component_id,
             )
@@ -9340,13 +12813,99 @@ def _fit_court_homography_hough(
                 comp_min_edge = float(np.min(_quad_edges(completed)))
                 comp_area = float(_quad_area(completed))
                 comp_area_ratio = comp_area / float(max(w * h, 1.0))
-                if comp_min_edge < 0.05 * float(min(w, h)):
+                base_metrics["completion_candidate_bbox_w"] = float(comp_bbox_w)
+                base_metrics["completion_candidate_bbox_h"] = float(comp_bbox_h)
+                base_metrics["completion_candidate_min_edge"] = float(comp_min_edge)
+                base_metrics["completion_candidate_area_ratio"] = float(comp_area_ratio)
+                comp_min_edge_frac = float(max(0.0, _env_float("BADC_COMPLETION_MIN_EDGE_FRAC", 0.05)))
+                comp_min_edge_relaxed_frac = float(
+                    max(0.0, _env_float("BADC_COMPLETION_MIN_EDGE_RELAXED_FRAC", 0.045))
+                )
+                comp_min_edge_relax_area = float(
+                    max(0.0, _env_float("BADC_COMPLETION_MIN_EDGE_RELAX_AREA_RATIO", 0.08))
+                )
+                comp_min_edge_req = float(comp_min_edge_frac * float(min(w, h)))
+                if comp_area_ratio >= comp_min_edge_relax_area:
+                    comp_min_edge_req = min(comp_min_edge_req, float(comp_min_edge_relaxed_frac * float(min(w, h))))
+                base_metrics["completion_min_edge_req"] = float(comp_min_edge_req)
+                if isinstance(meta, dict):
+                    base_metrics["completion_candidate_meta"] = meta
+                if comp_min_edge < comp_min_edge_req:
                     completion_reject_reason = "completion_min_edge"
                 elif comp_area_ratio < 0.02:
                     completion_reject_reason = "completion_area_small"
                 elif comp_bbox_h < 0.06 * float(h):
                     completion_reject_reason = "completion_bbox_h_small"
                 else:
+                    comp_floor_margin_px = float(max(8.0, _env_float("BADC_COMPLETION_BOTTOM_FLOOR_MARGIN_PX", 24.0)))
+                    comp_bottom = np.asarray(completed[:2], dtype=np.float32)
+                    x0f, y0f, x1f, y1f = [float(v) for v in floor_bbox]
+                    bottom_x = comp_bottom[:, 0].astype(np.float32)
+                    bottom_y = comp_bottom[:, 1].astype(np.float32)
+                    oob_l = np.maximum(0.0, (x0f - comp_floor_margin_px) - bottom_x)
+                    oob_r = np.maximum(0.0, bottom_x - (x1f + comp_floor_margin_px))
+                    oob_t = np.maximum(0.0, (y0f - comp_floor_margin_px) - bottom_y)
+                    oob_b = np.maximum(0.0, bottom_y - (y1f + comp_floor_margin_px))
+                    bottom_oob = oob_l + oob_r + oob_t + oob_b
+                    bottom_oob_max = float(np.max(bottom_oob)) if bottom_oob.size else 0.0
+                    bottom_oob_sum = float(np.sum(bottom_oob)) if bottom_oob.size else 0.0
+                    bottom_inside_floor = bool(
+                        np.all(
+                            (comp_bottom[:, 0] >= x0f - comp_floor_margin_px)
+                            & (comp_bottom[:, 0] <= x1f + comp_floor_margin_px)
+                            & (comp_bottom[:, 1] >= y0f - comp_floor_margin_px)
+                            & (comp_bottom[:, 1] <= y1f + comp_floor_margin_px)
+                        )
+                    )
+                    base_metrics["completion_bottom_inside_floor_bbox"] = bool(bottom_inside_floor)
+                    base_metrics["completion_bottom_floor_margin_px"] = float(comp_floor_margin_px)
+                    base_metrics["completion_bottom_floor_oob_max_px"] = float(bottom_oob_max)
+                    base_metrics["completion_bottom_floor_oob_sum_px"] = float(bottom_oob_sum)
+                    allow_bottom_oob = bool(_env_flag("BADC_COMPLETION_BOTTOM_ALLOW_OOB", True))
+                    oob_max_px = float(
+                        max(
+                            80.0,
+                            _env_float(
+                                "BADC_COMPLETION_BOTTOM_OOB_MAX_PX",
+                                max(220.0, 1.70 * float(floor_h)),
+                            ),
+                        )
+                    )
+                    oob_sum_px = float(
+                        max(
+                            oob_max_px,
+                            _env_float(
+                                "BADC_COMPLETION_BOTTOM_OOB_SUM_MAX_PX",
+                                max(420.0, 3.30 * float(floor_h)),
+                            ),
+                        )
+                    )
+                    oob_min_area_ratio = float(max(0.0, _env_float("BADC_COMPLETION_BOTTOM_OOB_MIN_AREA_RATIO", 0.10)))
+                    oob_min_edge_frac = float(max(0.0, _env_float("BADC_COMPLETION_BOTTOM_OOB_MIN_EDGE_FRAC", 0.08)))
+                    oob_min_edge_px = float(oob_min_edge_frac * float(min(w, h)))
+                    baseline_refined = bool(
+                        isinstance(meta, dict)
+                        and isinstance(meta.get("baseline_refine_meta"), dict)
+                        and bool(meta.get("baseline_refine_meta", {}).get("used"))
+                    )
+                    bottom_oob_accepted = bool(
+                        (not bottom_inside_floor)
+                        and allow_bottom_oob
+                        and baseline_refined
+                        and (comp_area_ratio >= oob_min_area_ratio)
+                        and (comp_min_edge >= oob_min_edge_px)
+                        and (bottom_oob_max <= oob_max_px)
+                        and (bottom_oob_sum <= oob_sum_px)
+                    )
+                    base_metrics["completion_bottom_oob_accepted"] = bool(bottom_oob_accepted)
+                    base_metrics["completion_bottom_oob_allow_enabled"] = bool(allow_bottom_oob)
+                    base_metrics["completion_bottom_oob_max_px"] = float(oob_max_px)
+                    base_metrics["completion_bottom_oob_sum_px"] = float(oob_sum_px)
+                    base_metrics["completion_bottom_oob_min_area_ratio"] = float(oob_min_area_ratio)
+                    base_metrics["completion_bottom_oob_min_edge_px"] = float(oob_min_edge_px)
+                    if (not bottom_inside_floor) and (not bottom_oob_accepted):
+                        completion_reject_reason = "completion_bottom_outside_floor_bbox"
+                if completion_reject_reason is None:
                     ordered = completed
                     completion_used = True
                     completion_meta = meta
@@ -9375,6 +12934,7 @@ def _fit_court_homography_hough(
     postfit_baseline_used = False
     postfit_baseline_meta: Dict[str, Any] = {}
     if ordered is not None:
+        ordered_before_postfit = np.asarray(ordered, dtype=np.float32).copy()
         refined_ordered, postfit_baseline_used, postfit_baseline_meta = _refine_bottom_baseline_postfit(
             ordered,
             lines_bottom=lines_bottom,
@@ -9383,11 +12943,86 @@ def _fit_court_homography_hough(
             line_mask=linepix_mask,
         )
         if postfit_baseline_used:
-            ordered = refined_ordered
+            def _quad_image_oob_stats(quad_xy: np.ndarray, img_w: int, img_h: int) -> Tuple[float, float]:
+                q = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+                x = q[:, 0]
+                y = q[:, 1]
+                oob_l = np.maximum(0.0, -x)
+                oob_r = np.maximum(0.0, x - float(max(0, img_w - 1)))
+                oob_t = np.maximum(0.0, -y)
+                oob_b = np.maximum(0.0, y - float(max(0, img_h - 1)))
+                per_corner = oob_l + oob_r + oob_t + oob_b
+                return float(np.max(per_corner)), float(np.sum(per_corner))
+
+            def _quad_floor_oob_sum(quad_xy: np.ndarray, bbox: Tuple[int, int, int, int], margin: float) -> float:
+                q = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+                x0f, y0f, x1f, y1f = [float(v) for v in bbox]
+                x = q[:, 0]
+                y = q[:, 1]
+                oob_l = np.maximum(0.0, (x0f - float(margin)) - x)
+                oob_r = np.maximum(0.0, x - (x1f + float(margin)))
+                oob_t = np.maximum(0.0, (y0f - float(margin)) - y)
+                oob_b = np.maximum(0.0, y - (y1f + float(margin)))
+                return float(np.sum(oob_l + oob_r + oob_t + oob_b))
+
+            h_img, w_img = frame_bgr.shape[:2]
+            pre_oob_max, pre_oob_sum = _quad_image_oob_stats(ordered_before_postfit, w_img, h_img)
+            post_oob_max, post_oob_sum = _quad_image_oob_stats(refined_ordered, w_img, h_img)
+            floor_h_px = float(max(1.0, float(floor_bbox[3] - floor_bbox[1])))
+            floor_margin = float(_env_float("BADC_POSTFIT_BASELINE_OOB_FLOOR_MARGIN_FRAC", 0.12)) * floor_h_px
+            pre_floor_oob = _quad_floor_oob_sum(ordered_before_postfit, floor_bbox, floor_margin)
+            post_floor_oob = _quad_floor_oob_sum(refined_ordered, floor_bbox, floor_margin)
+            max_inc = float(_env_float("BADC_POSTFIT_BASELINE_OOB_MAX_INC_PX", 60.0))
+            sum_inc = float(_env_float("BADC_POSTFIT_BASELINE_OOB_SUM_INC_PX", 160.0))
+            abs_sum_max = float(_env_float("BADC_POSTFIT_BASELINE_OOB_ABS_SUM_MAX_PX", 260.0))
+            floor_sum_inc = float(_env_float("BADC_POSTFIT_BASELINE_FLOOR_OOB_SUM_INC_PX", 140.0))
+            floor_abs_max = float(_env_float("BADC_POSTFIT_BASELINE_FLOOR_OOB_ABS_MAX_PX", 220.0))
+
+            reject_postfit = False
+            if (post_oob_max > pre_oob_max + max_inc) or (post_oob_sum > pre_oob_sum + sum_inc):
+                reject_postfit = True
+            if post_oob_sum > abs_sum_max:
+                reject_postfit = True
+            if (post_floor_oob > pre_floor_oob + floor_sum_inc) or (post_floor_oob > floor_abs_max):
+                reject_postfit = True
+
+            postfit_baseline_meta = dict(postfit_baseline_meta or {})
+            postfit_baseline_meta["pre_oob_max"] = float(pre_oob_max)
+            postfit_baseline_meta["pre_oob_sum"] = float(pre_oob_sum)
+            postfit_baseline_meta["post_oob_max"] = float(post_oob_max)
+            postfit_baseline_meta["post_oob_sum"] = float(post_oob_sum)
+            postfit_baseline_meta["pre_floor_oob_sum"] = float(pre_floor_oob)
+            postfit_baseline_meta["post_floor_oob_sum"] = float(post_floor_oob)
+            postfit_baseline_meta["oob_guard_rejected"] = bool(reject_postfit)
+            postfit_baseline_meta["oob_guard_thresholds"] = {
+                "max_inc": float(max_inc),
+                "sum_inc": float(sum_inc),
+                "abs_sum_max": float(abs_sum_max),
+                "floor_sum_inc": float(floor_sum_inc),
+                "floor_abs_max": float(floor_abs_max),
+                "floor_margin_px": float(floor_margin),
+            }
+
+            if reject_postfit:
+                postfit_baseline_used = False
+            else:
+                ordered = refined_ordered
     base_metrics["postfit_baseline_verify_used"] = bool(postfit_baseline_used)
     base_metrics["postfit_baseline_verify_meta"] = postfit_baseline_meta if isinstance(postfit_baseline_meta, dict) else None
 
     H_best = cv2.getPerspectiveTransform(get_bwf_corners().astype(np.float32), ordered.astype(np.float32))
+    semantic_mask_main = (
+        linepix_mask
+        if isinstance(linepix_mask, np.ndarray) and int(np.count_nonzero(linepix_mask)) > 0
+        else white_mask_clean
+    )
+    H_best_refined, semantic_meta_main = _semantic_refine_homography(H_best, semantic_mask_main)
+    if bool(semantic_meta_main.get("improved", False)):
+        H_best = H_best_refined
+    base_metrics["semantic_refine_enabled"] = bool(semantic_meta_main.get("enabled", False))
+    base_metrics["semantic_refine_applied"] = bool(semantic_meta_main.get("applied", False))
+    base_metrics["semantic_refine_meta"] = semantic_meta_main if isinstance(semantic_meta_main, dict) else None
+
     cover_points = _sample_white_points(white_mask_clean, max_points=1500, rng=rng)
     tau_px = 6.0
     loss_info = _compute_loss_terms(
@@ -9400,7 +13035,12 @@ def _fit_court_homography_hough(
         tau_px=tau_px,
         dt_oob=dt_oob,
     )
-    p90_raw = float(loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90") or 999.0)
+    p90_raw = float(
+        loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or loss_info.get("sample_dist_p90")
+        or 999.0
+    )
     cover_ratio = float(loss_info.get("cover_ratio", 0.0))
     inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
     cost = 0.6 * p90_raw + 0.4 * (1.0 - cover_ratio) * 50.0 + (1.0 - inlier_ratio) * 30.0
@@ -9408,7 +13048,8 @@ def _fit_court_homography_hough(
     conf_terms = _confidence_terms(inlier_ratio, cover_ratio, p90_raw, float(loss_info.get("area_ratio", 0.0)))
     conf = float(conf_terms["confidence"])
     conf_auto = float(conf)
-    reason = "OK" if conf >= 0.35 else "R_fit_poor"
+    fit_conf_ok_thr = float(_env_float("BADC_FIT_CONF_OK_THR", 0.35))
+    reason = "OK" if conf >= fit_conf_ok_thr else "R_fit_poor"
     dt_oob_count = int(loss_info.get("dt_oob_count", 0))
     num_samples = int(loss_info.get("num_samples", 0))
     dt_oob_ratio = float(dt_oob_count) / float(max(num_samples, 1))
@@ -9421,6 +13062,32 @@ def _fit_court_homography_hough(
     ordered_corners = _order_corners_lb_rb_rt_lt(corners_uv)
     span_ok, span_metrics = _quad_span_ok(ordered_corners, w, h)
     base_metrics.update(span_metrics)
+    ordered_clip = ordered_corners.copy()
+    ordered_clip[:, 0] = np.clip(ordered_clip[:, 0], 0.0, float(w - 1))
+    ordered_clip[:, 1] = np.clip(ordered_clip[:, 1], 0.0, float(h - 1))
+    selected_area_ratio_guard = float(_quad_area(ordered_clip) / float(max(h * w, 1)))
+    min_selected_area_ratio_guard = float(_env_float("BADC_FIT_MIN_SELECTED_AREA_RATIO", 0.12))
+    min_bottom_span_floor_ratio_guard_base = float(
+        _env_float("BADC_FIT_MIN_BOTTOM_SPAN_FLOOR_RATIO", 0.45)
+    )
+    min_bottom_span_floor_ratio_guard = float(
+        max(
+            0.28,
+            min_bottom_span_floor_ratio_guard_base * (0.7 if int(relaxed_pass) > 0 else 1.0),
+        )
+    )
+    max_top_edge_floor_ratio_guard = float(
+        _env_float("BADC_FIT_MAX_TOP_EDGE_FLOOR_RATIO", 0.60)
+    )
+    bottom_span_floor_ratio_guard = _bottom_span_floor_ratio(ordered_corners, floor_bbox)
+    top_edge_floor_ratio_guard = _top_edge_floor_ratio(ordered_corners, floor_bbox)
+    base_metrics["bottom_span_floor_ratio"] = float(bottom_span_floor_ratio_guard)
+    base_metrics["bottom_span_floor_ratio_min"] = float(min_bottom_span_floor_ratio_guard)
+    base_metrics["bottom_span_floor_ratio_min_base"] = float(min_bottom_span_floor_ratio_guard_base)
+    base_metrics["selected_area_ratio_guard"] = float(selected_area_ratio_guard)
+    base_metrics["selected_area_ratio_guard_min"] = float(min_selected_area_ratio_guard)
+    base_metrics["top_edge_floor_ratio"] = float(top_edge_floor_ratio_guard)
+    base_metrics["top_edge_floor_ratio_max"] = float(max_top_edge_floor_ratio_guard)
     corners_out = ordered_corners.astype(np.float32)
     deg_bbox_w = float(np.max(ordered_corners[:, 0]) - np.min(ordered_corners[:, 0]))
     deg_bbox_h = float(np.max(ordered_corners[:, 1]) - np.min(ordered_corners[:, 1]))
@@ -9434,6 +13101,39 @@ def _fit_court_homography_hough(
         conf = 0.0
         conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
         corners_out = None
+    if corners_out is not None and bottom_span_floor_ratio_guard < min_bottom_span_floor_ratio_guard:
+        reason = "R_bottom_span_small"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+        corners_out = None
+    if corners_out is not None and selected_area_ratio_guard < min_selected_area_ratio_guard:
+        reason = "R_area_small"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+        corners_out = None
+    if corners_out is not None and top_edge_floor_ratio_guard > max_top_edge_floor_ratio_guard:
+        reason = "R_top_edge_too_low"
+        conf = 0.0
+        conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+        corners_out = None
+    if corners_out is not None and isinstance(semantic_meta_main, dict) and not bool(semantic_meta_main.get("hard_pass", True)):
+        bypass_conf = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_CONF", 0.65))
+        bypass_inlier = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_INLIER", 0.70))
+        bypass_cover = float(_env_float("BADC_SEMANTIC_HARD_BYPASS_COVER", 0.70))
+        hard_bypass = bool(
+            float(conf) >= bypass_conf
+            and float(inlier_ratio) >= bypass_inlier
+            and float(cover_ratio) >= bypass_cover
+        )
+        base_metrics["semantic_hard_bypass"] = bool(hard_bypass)
+        base_metrics["semantic_hard_bypass_conf"] = float(bypass_conf)
+        base_metrics["semantic_hard_bypass_inlier"] = float(bypass_inlier)
+        base_metrics["semantic_hard_bypass_cover"] = float(bypass_cover)
+        if not hard_bypass:
+            reason = str(semantic_meta_main.get("hard_reason") or "R_semantic")
+            conf = 0.0
+            conf_terms = {"confidence": 0.0, "s_inlier": 0.0, "s_cover": 0.0, "s_p90": 0.0, "s_area": 0.0}
+            corners_out = None
     if corners_out is not None and not manual:
         fb_w = max(1, int(floor_bbox[2] - floor_bbox[0]))
         fb_h = max(1, int(floor_bbox[3] - floor_bbox[1]))
@@ -9462,7 +13162,11 @@ def _fit_court_homography_hough(
         used_anchor_prior = True
     conf_final = max(conf_auto, conf_support * conf_geom * conf_visible, anchor_prior)
     conf = conf_final
-    reason = "OK" if conf_final >= 0.35 else reason
+    if reason in ("OK", "R_fit_poor"):
+        reason = "OK" if conf_final >= fit_conf_ok_thr else "R_fit_poor"
+    if reason != "OK":
+        corners_out = None
+    base_metrics["fit_conf_ok_thr"] = float(fit_conf_ok_thr)
     if reason == "OK" and corners_out is None:
         corners_out = ordered_corners.astype(np.float32)
     if manual_vis and not base_metrics.get("manual_override", False):
@@ -9488,7 +13192,12 @@ def _fit_court_homography_hough(
             tau_px=tau_px,
             dt_oob=dt_oob,
         )
-        p90_manual = float(manual_loss.get("sample_dist_p90_raw") or manual_loss.get("sample_dist_p90") or 999.0)
+        p90_manual = float(
+            manual_loss.get("sample_dist_p90_raw_weighted")
+            or manual_loss.get("sample_dist_p90_raw")
+            or manual_loss.get("sample_dist_p90")
+            or 999.0
+        )
         cover_manual = float(manual_loss.get("cover_ratio", 0.0))
         inlier_manual = float(manual_loss.get("inlier_ratio", 0.0))
         conf_manual_terms = _confidence_terms(
@@ -9523,7 +13232,9 @@ def _fit_court_homography_hough(
         dt_p90=dt_p90,
         sample_dist_mean=loss_info.get("sample_dist_mean"),
         sample_dist_p50=loss_info.get("sample_dist_p50"),
-        sample_dist_p90=loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
+        sample_dist_p90=loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or loss_info.get("sample_dist_p90"),
         sample_dist_max=loss_info.get("sample_dist_max"),
         sample_uv=loss_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
         sample_dist=loss_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
@@ -9851,7 +13562,12 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
             dt_debug=None,
         )
 
-    init_p90 = float(init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90") or 999.0)
+    init_p90 = float(
+        init_info.get("sample_dist_p90_raw_weighted")
+        or init_info.get("sample_dist_p90_raw")
+        or init_info.get("sample_dist_p90")
+        or 999.0
+    )
     init_conf_terms = _confidence_terms(
         float(init_info.get("inlier_ratio", 0.0)),
         float(init_info.get("cover_ratio", 0.0)),
@@ -9870,7 +13586,12 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         s_area=float(init_conf_terms["s_area"]),
         inlier_ratio=float(init_info.get("inlier_ratio", 0.0)),
         mean_dist_px=float(init_info.get("sample_dist_mean") or 0.0),
-        p90_dist_px=float(init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90") or 0.0),
+        p90_dist_px=float(
+            init_info.get("sample_dist_p90_raw_weighted")
+            or init_info.get("sample_dist_p90_raw")
+            or init_info.get("sample_dist_p90")
+            or 0.0
+        ),
         white_mask_ratio=float(clean_ratio),
         cover_ratio=float(init_info.get("cover_ratio", 0.0)),
         l_dist=float(init_info.get("l_dist", 0.0)),
@@ -9882,7 +13603,9 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         dt_p90=dt_p90,
         sample_dist_mean=init_info.get("sample_dist_mean"),
         sample_dist_p50=init_info.get("sample_dist_p50"),
-        sample_dist_p90=init_info.get("sample_dist_p90_raw") or init_info.get("sample_dist_p90"),
+        sample_dist_p90=init_info.get("sample_dist_p90_raw_weighted")
+        or init_info.get("sample_dist_p90_raw")
+        or init_info.get("sample_dist_p90"),
         sample_dist_max=init_info.get("sample_dist_max"),
         sample_uv=init_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
         sample_dist=init_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
@@ -9911,7 +13634,11 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
     )
     mean_dist = loss_info.get("sample_dist_mean")
     p90_clamped = loss_info.get("sample_dist_p90")
-    p90_dist = loss_info.get("sample_dist_p90_raw") or p90_clamped
+    p90_dist = (
+        loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or p90_clamped
+    )
     inlier_ratio = float(loss_info.get("inlier_ratio", 0.0))
     cover_ratio = float(loss_info.get("cover_ratio", 0.0))
     area_ratio = float(loss_info.get("area_ratio", 0.0))
@@ -9959,7 +13686,9 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         dt_p90=dt_p90,
         sample_dist_mean=loss_info.get("sample_dist_mean"),
         sample_dist_p50=loss_info.get("sample_dist_p50"),
-        sample_dist_p90=loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
+        sample_dist_p90=loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or loss_info.get("sample_dist_p90"),
         sample_dist_max=loss_info.get("sample_dist_max"),
         sample_uv=loss_info.get("sample_uv", np.zeros((0, 2), dtype=np.float32)),
         sample_dist=loss_info.get("sample_dists", np.zeros((0,), dtype=np.float32)),
@@ -9995,7 +13724,9 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         "inlier_dist_p90": loss_info.get("inlier_dist_p90"),
         "sample_dist_mean": loss_info.get("sample_dist_mean"),
         "sample_dist_p50": loss_info.get("sample_dist_p50"),
-        "sample_dist_p90": loss_info.get("sample_dist_p90_raw") or loss_info.get("sample_dist_p90"),
+        "sample_dist_p90": loss_info.get("sample_dist_p90_raw_weighted")
+        or loss_info.get("sample_dist_p90_raw")
+        or loss_info.get("sample_dist_p90"),
         "sample_dist_max": loss_info.get("sample_dist_max"),
         "vp_long": init_info.get("vp_long") if isinstance(init_info, dict) else None,
         "vp_short": init_info.get("vp_short") if isinstance(init_info, dict) else None,
@@ -10011,7 +13742,14 @@ def _fit_court_homography_lsd(frame_bgr: np.ndarray) -> CourtFitResult:
         "init_ratio": init_info.get("init_ratio") if isinstance(init_info, dict) else None,
         "init_inside_ratio": init_info.get("init_inside_ratio") if isinstance(init_info, dict) else None,
         "init_cover": init_info.get("cover_ratio") if isinstance(init_info, dict) else None,
-        "init_p90": init_info.get("sample_dist_p90_raw") if isinstance(init_info, dict) else None,
+        "init_p90": (
+            (
+                init_info.get("sample_dist_p90_raw_weighted")
+                or init_info.get("sample_dist_p90_raw")
+            )
+            if isinstance(init_info, dict)
+            else None
+        ),
         "init_area_ratio": init_info.get("area_ratio") if isinstance(init_info, dict) else None,
     }
     return CourtFitResult(

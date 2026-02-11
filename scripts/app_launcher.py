@@ -7,15 +7,19 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Any, Dict, Optional
+
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYTHON = sys.executable or "python3"
+STABLE_COURT_ENV_REL = "court_env_profiles/hough_orient_stable.env"
 
 
 class ProcessController:
@@ -76,6 +80,7 @@ class App:
         self.root.geometry("980x760")
 
         self.proc_ctl = ProcessController()
+        self._runtime_config_paths: list[Path] = []
         self._build_ui()
         self._poll_logs()
 
@@ -152,6 +157,7 @@ class App:
         self.video_out_dir = tk.StringVar(value=str(REPO_ROOT / "reports" / "demo_friend"))
         self.video_match_name = tk.StringVar(value="demo_friend")
         self.video_no_llm = tk.BooleanVar(value=True)
+        self.video_use_stable_profile = tk.BooleanVar(value=True)
         self.video_pose = tk.StringVar(value="auto")
         self.video_court_once = tk.StringVar(value="auto")
         self.video_court_idx = tk.StringVar(value="")
@@ -195,8 +201,14 @@ class App:
             row=6, column=1, sticky="w", padx=(6, 6), pady=4
         )
 
+        ttk.Checkbutton(
+            self.video_tab,
+            text="Use stable court profile (hough_orient_stable.env)",
+            variable=self.video_use_stable_profile,
+        ).grid(row=7, column=1, sticky="w", padx=(6, 6), pady=4)
+
         ttk.Checkbutton(self.video_tab, text="Disable LLM (recommended during debugging)", variable=self.video_no_llm).grid(
-            row=7, column=1, sticky="w", padx=(6, 6), pady=4
+            row=8, column=1, sticky="w", padx=(6, 6), pady=4
         )
 
     def _build_camera_tab(self) -> None:
@@ -210,6 +222,7 @@ class App:
         self.cam_lock_seconds = tk.StringVar(value="0")
         self.cam_lock_only = tk.BooleanVar(value=False)
         self.cam_save_debug = tk.BooleanVar(value=True)
+        self.cam_use_stable_profile = tk.BooleanVar(value=True)
 
         self._make_browse_row(self.camera_tab, 0, "Config File", self.cam_config)
         self._make_browse_row(self.camera_tab, 1, "Output Directory", self.cam_out_dir, is_dir=True)
@@ -249,6 +262,49 @@ class App:
         ttk.Checkbutton(self.camera_tab, text="Lock court only and write report", variable=self.cam_lock_only).grid(
             row=9, column=1, sticky="w", padx=(6, 6), pady=4
         )
+        ttk.Checkbutton(
+            self.camera_tab,
+            text="Use stable court profile (hough_orient_stable.env)",
+            variable=self.cam_use_stable_profile,
+        ).grid(row=10, column=1, sticky="w", padx=(6, 6), pady=4)
+
+    def _cleanup_runtime_configs(self) -> None:
+        for p in self._runtime_config_paths:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._runtime_config_paths.clear()
+
+    def _prepare_runtime_config(self, config_path: Path, use_stable_profile: bool) -> Path:
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg_obj = yaml.safe_load(f) or {}
+        if not isinstance(cfg_obj, dict):
+            raise RuntimeError(f"Config must be a YAML mapping: {config_path}")
+        cfg: Dict[str, Any] = dict(cfg_obj)
+        vision_obj = cfg.get("vision")
+        vision_cfg: Dict[str, Any] = dict(vision_obj) if isinstance(vision_obj, dict) else {}
+        current_profile = str(vision_cfg.get("court_env_file") or "").strip()
+        target_profile = STABLE_COURT_ENV_REL if use_stable_profile else ""
+        if current_profile == target_profile:
+            return config_path
+
+        if use_stable_profile:
+            vision_cfg["court_env_file"] = STABLE_COURT_ENV_REL
+        else:
+            vision_cfg.pop("court_env_file", None)
+        cfg["vision"] = vision_cfg
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="badc_launcher_cfg_", suffix=".yaml")
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=False)
+        out_path = Path(tmp_path)
+        self._runtime_config_paths.append(out_path)
+        self.append_log(
+            f"[launcher] generated runtime config: {out_path} "
+            f"(stable_profile={'on' if use_stable_profile else 'off'})"
+        )
+        return out_path
 
     def append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
@@ -291,6 +347,15 @@ class App:
             return
         out_dir = Path(self.video_out_dir.get()).expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_runtime_configs()
+        try:
+            runtime_config = self._prepare_runtime_config(
+                config,
+                use_stable_profile=bool(self.video_use_stable_profile.get()),
+            )
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to build runtime config: {exc}")
+            return
 
         cmd = [
             PYTHON,
@@ -298,7 +363,7 @@ class App:
             "--video",
             str(video),
             "--config",
-            str(config),
+            str(runtime_config),
             "--match-name",
             self.video_match_name.get().strip() or "demo_friend",
             "--out-dir",
@@ -329,6 +394,15 @@ class App:
             return
         out_dir = Path(self.cam_out_dir.get()).expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_runtime_configs()
+        try:
+            runtime_config = self._prepare_runtime_config(
+                config,
+                use_stable_profile=bool(self.cam_use_stable_profile.get()),
+            )
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to build runtime config: {exc}")
+            return
 
         try:
             cam_idx = int(self.cam_index.get().strip())
@@ -348,7 +422,7 @@ class App:
             "--camera-index",
             str(cam_idx),
             "--config",
-            str(config),
+            str(runtime_config),
             "--out-dir",
             str(out_dir),
             "--session-name",

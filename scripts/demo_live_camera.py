@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -22,13 +23,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.pipeline.analyse_video import FrameResult
-from src.pipeline.extract_strokes import StrokeSummary, summarise_strokes_from_analysis
+from src.pipeline.extract_strokes import (
+    StrokeSummary,
+    infer_segment_frame_ranges_from_analysis,
+    summarise_strokes_from_analysis,
+)
+from src.pipeline.label_space import build_label_space_metadata
 from src.tracking.ball_track import BallTrackState, SingleBallTracker
 from src.tracking.bytetrack import SimpleByteTrack, Track
 from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.court_fit_homography import fit_court_homography
+from src.vision.court_env_profile import resolve_and_apply_court_env_overrides
 from src.vision.detectors import PlayerDetector
 from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
 
@@ -270,6 +277,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stroke-buffer-frames", type=int, default=360, help="Rolling buffer length for stroke inference.")
     p.add_argument("--stroke-eval-stride", type=int, default=6, help="Evaluate stroke summaries every N frames.")
     p.add_argument("--stroke-min-frames", type=int, default=60, help="Minimum buffered frames before stroke eval.")
+    p.add_argument(
+        "--stroke-classifier",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help='Stroke classifier mode: "on" force enable, "off" disable, "auto" enable when checkpoint exists.',
+    )
+    p.add_argument(
+        "--stroke-classifier-checkpoint",
+        type=str,
+        default="",
+        help="Path to stroke classifier checkpoint (best_model.pt).",
+    )
+    p.add_argument(
+        "--stroke-classifier-device",
+        type=str,
+        default="auto",
+        help='Stroke classifier device: "auto" | "mps" | "cuda" | "cpu".',
+    )
+    p.add_argument(
+        "--stroke-classifier-topk",
+        type=int,
+        default=3,
+        help="Top-K class predictions stored into each stroke summary.",
+    )
+    p.add_argument(
+        "--stroke-classifier-frame-size",
+        type=int,
+        default=None,
+        help="Optional override for classifier input size.",
+    )
+    p.add_argument(
+        "--stroke-classifier-num-frames",
+        type=int,
+        default=None,
+        help="Optional override for classifier clip length.",
+    )
+    p.add_argument(
+        "--stroke-classifier-min-confidence",
+        type=float,
+        default=None,
+        help="If set, reject classifier labels below this confidence and fallback to spatial logic.",
+    )
     p.add_argument("--display-width", type=int, default=1280, help="Display width; <=0 keeps original size.")
     p.add_argument("--max-frames", type=int, default=0, help="Max processed frames. 0 means unlimited.")
     p.add_argument("--no-window", action="store_true", help="Do not open visualization window.")
@@ -297,6 +346,78 @@ def main() -> None:
     pose_cfg = cfg.get("pose", {}) if isinstance(cfg.get("pose", {}), dict) else {}
     device_cfg = cfg.get("device", {}) if isinstance(cfg.get("device", {}), dict) else {}
     spatial_cfg = cfg.get("spatial_logic", {}) if isinstance(cfg.get("spatial_logic", {}), dict) else {}
+    classifier_cfg = cfg.get("classifier", {}) if isinstance(cfg.get("classifier", {}), dict) else {}
+    court_env = resolve_and_apply_court_env_overrides(vision_cfg, base_dir=cfg_path.parent)
+    if int(court_env.get("num_vars", 0)) > 0:
+        print(
+            f"[COURT_ENV] applied {court_env.get('num_vars')} vars "
+            f"(profile={court_env.get('profile_path')})"
+        )
+    if args.stroke_classifier_min_confidence is not None:
+        classifier_min_confidence = float(max(0.0, args.stroke_classifier_min_confidence))
+    else:
+        classifier_min_confidence = float(classifier_cfg.get("min_confidence", 0.0) or 0.0)
+    expected_num_classes = classifier_cfg.get("expected_num_classes")
+    try:
+        expected_num_classes_i = int(expected_num_classes) if expected_num_classes is not None else None
+    except Exception:
+        expected_num_classes_i = None
+    expected_class_names = classifier_cfg.get("class_names")
+    label_space_meta = build_label_space_metadata(
+        None,
+        version_hint=classifier_cfg.get("label_space_version"),
+        expected_num_classes=expected_num_classes_i,
+        expected_class_names=expected_class_names,
+    )
+
+    classifier_runtime = None
+    classifier_enabled = False
+    classifier_ckpt = None
+    classifier_mode = str(args.stroke_classifier or "auto").strip().lower()
+    classifier_ckpt_raw = str(args.stroke_classifier_checkpoint or "").strip()
+    if not classifier_ckpt_raw:
+        classifier_ckpt_raw = str(classifier_cfg.get("checkpoint", "") or "").strip()
+    if not classifier_ckpt_raw:
+        classifier_ckpt_raw = str(os.environ.get("BADMINTON_STROKE_CKPT", "") or "").strip()
+    if classifier_ckpt_raw:
+        classifier_ckpt = Path(classifier_ckpt_raw).expanduser()
+        if not classifier_ckpt.is_absolute():
+            classifier_ckpt = REPO_ROOT / classifier_ckpt
+
+    want_classifier = classifier_mode == "on" or (
+        classifier_mode == "auto" and classifier_ckpt is not None and classifier_ckpt.exists()
+    )
+    if classifier_mode == "on" and (classifier_ckpt is None or not classifier_ckpt.exists()):
+        print(f"[WARN] stroke classifier forced on but checkpoint not found: {classifier_ckpt}")
+
+    if want_classifier and classifier_ckpt is not None and classifier_ckpt.exists():
+        try:
+            from src.pipeline.stroke_classifier_runtime import StrokeClassifierRuntime
+
+            classifier_runtime = StrokeClassifierRuntime.from_checkpoint(
+                checkpoint_path=classifier_ckpt,
+                device=str(args.stroke_classifier_device or classifier_cfg.get("device", "auto")),
+                frame_size=args.stroke_classifier_frame_size,
+                num_frames=args.stroke_classifier_num_frames,
+                topk=max(1, int(args.stroke_classifier_topk)),
+            )
+            label_space_meta = build_label_space_metadata(
+                classifier_runtime.classes,
+                version_hint=classifier_cfg.get("label_space_version"),
+                expected_num_classes=expected_num_classes_i,
+                expected_class_names=expected_class_names,
+            )
+            if label_space_meta.get("mismatch"):
+                print(
+                    "[WARN] classifier label-space mismatch:",
+                    ",".join(label_space_meta.get("mismatch_reasons", [])),
+                )
+            classifier_enabled = True
+            print(f"[CLS] enabled checkpoint={classifier_ckpt}")
+        except Exception as exc:
+            classifier_runtime = None
+            classifier_enabled = False
+            print(f"[WARN] failed to init stroke classifier runtime: {exc}")
 
     yolo_device = device_cfg.get("yolo_device", "cpu")
     yolo_imgsz = int(vision_cfg.get("yolo_imgsz", 640))
@@ -553,7 +674,9 @@ def main() -> None:
     last_ball_state: Optional[BallTrackState] = None
 
     frame_history: deque[FrameResult] = deque(maxlen=max(30, int(args.stroke_buffer_frames)))
+    frame_rgb_history: Dict[int, np.ndarray] = {}
     pose_history: Dict[int, Dict] = {}
+    classifier_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
     emitted_keys: set[tuple[int, int, str]] = set()
     emitted_summaries: List[Dict[str, Any]] = []
     latest_summary: Optional[StrokeSummary] = None
@@ -565,7 +688,8 @@ def main() -> None:
     print(
         "[LIVE] started. keys: q/ESC quit, r relock court.\n"
         f"[LIVE] camera={args.camera_index} court_source={court_detection.get('source')} "
-        f"reason={court_detection.get('reason')} conf={court_detection.get('confidence')}"
+        f"reason={court_detection.get('reason')} conf={court_detection.get('confidence')} "
+        f"classifier={'on' if classifier_enabled else 'off'}"
     )
 
     if bool(args.lock_only):
@@ -587,6 +711,17 @@ def main() -> None:
                 "report_path": court_detection.get("report_path"),
                 "frame_size": {"width": int(w0), "height": int(h0)},
             },
+            "stroke_classifier": {
+                "enabled": bool(classifier_enabled),
+                "mode": classifier_mode,
+                "checkpoint": str(classifier_ckpt) if classifier_ckpt is not None else None,
+                "device": str(args.stroke_classifier_device),
+                "topk": int(max(1, args.stroke_classifier_topk)),
+                "min_confidence": float(max(0.0, classifier_min_confidence)),
+                "label_space": label_space_meta,
+            },
+            "court_env": court_env,
+            "label_space_version": label_space_meta.get("version"),
             "stroke_count": 0,
             "latest_stroke": None,
             "strokes": [],
@@ -610,6 +745,7 @@ def main() -> None:
             frame_proc = frame_rgb[y1:y2, x1:x2]
         else:
             frame_proc = frame_rgb
+        frame_rgb_history[int(frame_idx)] = frame_rgb.copy()
 
         if frame_idx % detect_stride == 0:
             pdets = player_det.detect([frame_proc])[0]
@@ -705,6 +841,12 @@ def main() -> None:
             stale = [k for k in pose_history.keys() if int(k) < old_limit]
             for k in stale:
                 pose_history.pop(k, None)
+            stale_rgb = [k for k in frame_rgb_history.keys() if int(k) < old_limit]
+            for k in stale_rgb:
+                frame_rgb_history.pop(k, None)
+            stale_cache = [k for k in classifier_cache.keys() if int(k[1]) < old_limit]
+            for k in stale_cache:
+                classifier_cache.pop(k, None)
 
         if (
             len(frame_history) >= max(10, int(args.stroke_min_frames))
@@ -716,9 +858,40 @@ def main() -> None:
                 pose_results=pose_history if enable_pose else None,
             )
             try:
+                classifier_labels = None
+                classifier_outputs = None
+                if classifier_enabled and classifier_runtime is not None:
+                    seg_ranges = infer_segment_frame_ranges_from_analysis(analysis_stub)
+                    classifier_outputs = []
+                    for sr in seg_ranges:
+                        if len(sr) != 2:
+                            classifier_outputs.append({"label": None, "confidence": None, "topk": []})
+                            continue
+                        s_f, e_f = int(sr[0]), int(sr[1])
+                        ckey = (s_f, e_f)
+                        cached = classifier_cache.get(ckey)
+                        if cached is None:
+                            pred = classifier_runtime.predict_from_frame_store(frame_rgb_history, s_f, e_f)
+                            if pred is None:
+                                cached = {"label": None, "confidence": None, "topk": []}
+                            else:
+                                cached = {
+                                    "label": pred.label,
+                                    "confidence": float(pred.confidence),
+                                    "topk": pred.topk,
+                                }
+                            classifier_cache[ckey] = cached
+                        classifier_outputs.append(cached)
+                    classifier_labels = [
+                        str(item.get("label")) if isinstance(item, dict) and item.get("label") is not None else None
+                        for item in classifier_outputs
+                    ]
+
                 summaries = summarise_strokes_from_analysis(
                     analysis_stub,
-                    classifier_labels=None,
+                    classifier_labels=classifier_labels,
+                    classifier_outputs=classifier_outputs,
+                    classifier_min_confidence=float(max(0.0, classifier_min_confidence)),
                     enable_hitter_inference=bool(spatial_cfg.get("enable_hitter_inference", True)),
                     hitter_distance_max=float(spatial_cfg.get("hitter_distance_max", 200.0)),
                     pose_window=pose_window,
@@ -788,6 +961,7 @@ def main() -> None:
         txt = [
             f"LIVE camera={args.camera_index} fps={fps_ema:.1f}",
             f"Court: {court_detection.get('source')} reason={court_detection.get('reason')} conf={float(court_detection.get('confidence') or 0.0):.2f}",
+            f"Classifier: {'on' if classifier_enabled else 'off'}",
             f"Strokes detected: {len(emitted_summaries)}",
             "Keys: q/ESC quit, r relock",
         ]
@@ -859,6 +1033,17 @@ def main() -> None:
             "report_path": court_detection.get("report_path"),
             "frame_size": {"width": int(w0), "height": int(h0)},
         },
+        "stroke_classifier": {
+            "enabled": bool(classifier_enabled),
+            "mode": classifier_mode,
+            "checkpoint": str(classifier_ckpt) if classifier_ckpt is not None else None,
+            "device": str(args.stroke_classifier_device),
+            "topk": int(max(1, args.stroke_classifier_topk)),
+            "min_confidence": float(max(0.0, classifier_min_confidence)),
+            "label_space": label_space_meta,
+        },
+        "court_env": court_env,
+        "label_space_version": label_space_meta.get("version"),
         "stroke_count": int(len(emitted_summaries)),
         "latest_stroke": asdict(latest_summary) if latest_summary is not None else None,
         "strokes": emitted_summaries,
