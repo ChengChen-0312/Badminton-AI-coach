@@ -1,8 +1,28 @@
 vision:
   yolo_model: "yolov8n.pt"
+  court_detector_method: "heuristic"  # "heuristic" | "farin2005"
+  top_crop_ratio: 0.20
+  floor_close_kernel: 35
+  floor_close_iter: 1
+  min_confidence: 0.60
+  court_min_span_x_norm: 0.55
+  court_min_span_y_norm: 0.55
+  court_tpl_weight: 0.30
+  net_suppress_y_min: 0.35
+  net_suppress_y_max: 0.55
+  net_penalty: 0.60
+  court_bottom_min_y_norm: 0.78
+  gap_scan_enable: true
+  gap_row_density_thresh: 0.003
+  gap_min_height_norm: 0.03
+  gap_penalty_or_reject: "reject"   # "reject" | "penalty"
+  gap_penalty: 0.60
   court_model: "court_segmenter.pt"
   pose_model: "yolo-pose-s"
   device: "mps"
+  edge_top_min: 0.20
+  edge_bottom_min: 0.18
+  edge_min_floor: 0.10
 
 tracking:
   player: "bytetrack"

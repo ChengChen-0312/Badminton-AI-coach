@@ -5,6 +5,39 @@ device:
 vision:
   yolo_imgsz: 512
   yolo_conf: 0.25
+  # Optional reproducible BADC_* profile.
+  # court_env_file: "src/config/court_env_profiles/hough_orient_stable.env"
+  edge_top_min: 0.20
+  edge_bottom_min: 0.18
+  edge_min_floor: 0.10
+  court_detector_method: "heuristic"  # "heuristic" | "farin2005"
+  court_detect_once: true
+  court_detect_frame_idx: 0
+  court_detect_fallback_on_fail: true
+  court_detect_fallback_samples: 24
+  court_detect_fallback_stride: 10
+  court_detect_temporal_refine: true
+  court_detect_temporal_refine_topk: 5
+  court_detect_temporal_refine_drift_ref_px: 18.0
+  court_detect_temporal_refine_weight: 30.0
+  top_crop_ratio: 0.20
+  floor_close_kernel: 35
+  floor_close_iter: 1
+  min_confidence: 0.60
+  court_min_span_x_norm: 0.55
+  court_min_span_y_norm: 0.55
+  court_tpl_weight: 0.30
+  net_suppress_y_min: 0.35
+  net_suppress_y_max: 0.55
+  net_penalty: 0.60
+  tpl_net_reject_max: 0.14
+  top_edge_net_reject_max: 0.18
+  court_bottom_min_y_norm: 0.78
+  gap_scan_enable: true
+  gap_row_density_thresh: 0.003
+  gap_min_height_norm: 0.03
+  gap_penalty_or_reject: "reject"   # "reject" | "penalty"
+  gap_penalty: 0.60
   use_court_roi: false
   yolo_model: "yolov8n.pt"
   ball_model: "yolov8n.pt"
@@ -23,6 +56,21 @@ realtime:
 spatial_logic:
   enable_hitter_inference: true
   hitter_distance_max: 200.0
+
+classifier:
+  checkpoint: "runs/v2_highcap_stable/best_model.pt"
+  device: "auto"
+  topk: 3
+  min_confidence: 0.45
+  label_space_version: "stroke_6class_v1"
+  expected_num_classes: 6
+  class_names:
+    - "backhand_drive"
+    - "backhand_net_shot"
+    - "forehand_clear"
+    - "forehand_drive"
+    - "forehand_lift"
+    - "forehand_net_shot"
 
 visualization:
   enable_heatmap: true

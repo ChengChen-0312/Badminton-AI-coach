@@ -1,0 +1,87 @@
+文档名: RESUME_PROJECT_WRITEUP
+更新日期: 2026-02-20
+适用对象: 用于简历/面试介绍 Badminton-AI-coach 项目
+PPT对齐来源: /Users/chencheng/Downloads/a.pdf（汇报日期 2026-02-12）
+
+==============================
+0) 最新进展（PPT同步版）
+==============================
+- 场地锁定阶段结果：5/6 通过（83.3%），剩余难例集中在 Case 05（后场信号在连通域/ROI链路中被截断）。
+- 蒸馏进展：已完成 835 条 teacher labels；高容量 LoRA 训练配置为 32 layers / 1200 iters / lr=5e-5。
+- 移动端进展：iOS MVP 已打通 job -> status -> report 的端到端链路。
+- 下一阶段方向：继续提升 court robustness（目标>95%）并提升 pose-aware feedback 质量。
+
+==============================
+1) 这个项目做了什么（可直接写在简历）
+==============================
+项目名称: Badminton-AI-coach（羽毛球视频智能分析与训练反馈系统）
+
+一句话版本:
+- 构建了一个端到端羽毛球视频分析系统，完成场地识别与单应性标定、球员/羽毛球跟踪、击球事件抽取和战术报告生成，并集成基于本地大模型的动作评分与反馈。
+
+两句话版本:
+- 输入比赛/训练视频后，系统自动识别球场四角并估计 homography，把像素坐标映射到标准球场坐标系。
+- 在此基础上完成击球者识别、落点与区域判断、击球类型推理，并输出 Markdown/JSON/CSV 报告及热力图/时间线可视化。
+
+==============================
+2) 你在技术上做成了什么（按模块）
+==============================
+A. 场地识别与标定（核心亮点）
+- 关键文件:
+  - scripts/demo_friend.py
+  - src/vision/court_fit_homography.py
+- 关键能力:
+  - 设计并实现了多阶段球场线提取与四边形候选筛选流程（白线提取、ROI 约束、Hough/LSD/RANSAC、几何约束与评分融合）。
+  - 输出结构化置信度与失败原因（confidence/reason/metrics），并产出可视化 debug 图，支持快速定位误检来源。
+  - 在主流程中加入 fallback 与运行时开关，提升多场景稳定性和可复现性。
+
+B. 时空事件理解
+- 将跟踪结果转为击球级别结构化事件（contact_frame、landing_frame、hitter_role、region、final_type）。
+- 融合轨迹启发式与分类器输出，形成最终击球类型与置信度。
+
+C. 报告与可视化
+- 自动生成 Markdown/JSON/CSV 报告。
+- 生成落点/击球热力图与时间线图，用于训练复盘和战术统计。
+
+D. AI 评分与蒸馏（加分项）
+- 集成本地 MLX teacher/student 模型，支持动作评分与文本建议。
+- 构建 teacher-label -> chat-format -> MLX train/valid 的蒸馏数据管线。
+
+E. 工程化
+- 提供脚本化入口（demo/eval/regression/server）。
+- 编写单元测试覆盖关键逻辑（label space、评分解析、API 工具等）。
+- 提供本地 API + iOS 客户端对接路径。
+- 通过 profile-driven 参数和 richer debug assets 支持定位与回归复杂场景（如 Case 05）。
+
+==============================
+3) 可直接贴到简历的项目描述（中文）
+==============================
+版本A（偏算法工程）:
+- 负责开发羽毛球视频智能分析系统（Python/OpenCV/YOLO），实现球场四角检测与 homography 标定，完成球员/羽毛球跟踪及击球事件抽取（击球者、落点、区域、类型）。
+- 设计多阶段场地拟合算法（白线提取 + Hough/LSD/RANSAC + 几何评分融合），支持置信度与诊断指标输出，显著提升复杂场景下的识别稳定性与可调试性。
+- 搭建报告生成链路，自动输出 Markdown/JSON/CSV 及热力图/时间线，支撑训练复盘与战术分析。
+
+版本B（偏系统工程）:
+- 从0到1搭建端到端羽毛球 AI 分析管线：视频输入 -> 视觉检测/跟踪 -> 空间时序推理 -> 可视化报告输出。
+- 主导关键场地识别模块，构建可回退、可解释、可回归测试的工程架构，沉淀统一 CLI 与 regression suite。
+- 集成 MLX teacher/student 模型进行动作评分与反馈，并完成蒸馏数据准备流程，支持后续模型迭代。
+
+==============================
+4) 英文简历版本（可直接用）
+==============================
+- Built an end-to-end badminton video analytics system (Python/OpenCV/YOLO), covering court calibration (homography), player/shuttle tracking, stroke-level event extraction, and tactical report generation.
+- Implemented a robust court fitting pipeline with multi-stage line extraction and geometric candidate scoring (Hough/LSD/RANSAC + diagnostics), including confidence/reason metrics and visual debug artifacts for fast failure analysis.
+- Delivered structured outputs (Markdown/JSON/CSV) and visual analytics (heatmaps/timelines), and integrated local MLX teacher/student models for coaching feedback and distillation-ready data generation.
+
+==============================
+5) 面试可讲的“核心难点-解法-结果”
+==============================
+难点:
+- 羽毛球场线细、遮挡多、背景干扰强，自动标定不稳定。
+
+解法:
+- 将单一检测改为多阶段流程：先做白线与 floor ROI，再做线段候选，最后用几何一致性 + DT 距离 + 先验约束综合打分。
+- 同时在主程序里保留 fallback 与诊断输出，保证失败可定位、可回归。
+
+结果:
+- 场地识别稳定性提升，后续落点分析与战术统计可靠性明显提高；系统可直接用于演示、报告产出与模型蒸馏数据生成。

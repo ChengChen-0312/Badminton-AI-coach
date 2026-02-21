@@ -1,0 +1,9 @@
+{
+  "cases": [
+    {
+      "video_path": "archive/demo.mp4",
+      "frame_idx": 0,
+      "expectation": "no_net_like_quad"
+    }
+  ]
+}

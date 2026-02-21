@@ -1,0 +1,492 @@
+VERSION: CODEBASE_INDEX v4 (full scan, non-reports, repo-hardening sync)
+LAST_UPDATED: 2026-02-21
+SCAN_POLICY: Read line-by-line all included text/code files; excluded reports/ and binary/cache artifacts.
+SCAN_TOTAL_FILES: 123
+SCAN_TOTAL_LINES: 30192
+PPT_SYNC_SOURCE: /Users/chencheng/Downloads/a.pdf
+PPT_SYNC_DATE: 2026-02-21 (slides dated 2026-02-12)
+
+INCLUDED ROOTS: README/docs/scripts/src/tests/ios/config/assets(ground-truth json)
+EXCLUDED ROOTS: reports/, archive/, outputs/, runs/, data/, .git/, __pycache__/
+
+--------------------------------
+PROJECT SUMMARY
+--------------------------------
+Badminton-AI-coach is an end-to-end badminton analytics stack:
+- Vision: court/ball/player/pose perception
+- Geometry: homography + court coordinate mapping
+- Tracking + spatial-temporal logic: contact/landing/hitter/stroke reasoning
+- Reporting: markdown/json/csv + heatmap/timeline + tactical summary
+- Optional AI score: MLX teacher/student feedback and distillation tooling
+
+--------------------------------
+PPT SNAPSHOT ALIGNMENT (2026-02-12)
+--------------------------------
+The latest project deck (a.pdf) reports the following status snapshot:
+- Court lock pass rate: 83.3% (5/6), remaining hard case: Case 05.
+- Distillation scale: 835 teacher-labeled videos.
+- iOS MVP status: job -> status -> report flow completed via local API integration.
+- Near-term direction: keep court robustness improvements while lifting feedback quality (pose-aware + rubric-driven).
+
+Note:
+- This section is status/reporting context from slides; implementation truth remains code in src/ and scripts/.
+
+--------------------------------
+CRITICAL FILES (USER-PRIORITY)
+--------------------------------
+[File: scripts/demo_friend.py]
+Lines: 998
+Role: report generation
+Doc: One-command demo for friends: - Run the v3 realtime pipeline on a sample video - Summarize strokes - Generate a Markdown/JSON/CSV report + heatmap/timeline images
+Top-level functions: _adapter_file_in_dir, _resolve_existing_path, _load_yaml, _looks_like_mediapipe_installed, _summarize_for_console, _llm_description_from_summary, _to_text, _extract_json_dict, _to_score_value, _extract_declared_score, _extract_dim_scores, _compute_rubric_score, _read_video_frame_bgr, _looks_like_default_full_frame_corners, _compute_court_roi, _draw_court_debug, _llm_compare, parse_args, _maybe_open, main
+Top-level classes: none
+Key understanding:
+- Full demo orchestrator; loads config, toggles pose/court/classifier/LLM, runs analyse_video -> extract_strokes -> report_generator.
+- Persists court_detection diagnostics into report JSON and writes dedicated court debug image (LB,RB,RT,LT labels + optional ROI).
+- Supports optional MLX teacher/student + LoRA adapter comparison across stroke summaries.
+
+[File: src/vision/court_fit_homography.py]
+Lines: 13769
+Role: court detection/homography
+Top-level functions: get_canonical_points_norm, _env_int, _env_float, _env_str, _env_flag, _apply_legacy_env_aliases, _model_role_weight_params, _apply_model_role_weights, _seg_len_px, _filter_segments_minlen, _filter_segments_minlen_with_boundary_rescue, _order_corners_lb_rb_rt_lt, _quad_span_ok, _bottom_span_floor_ratio, _top_edge_floor_ratio, _find_peaks_1d, _semantic_line_support_in_warp, _semantic_refine_homography, _quad_area, _quad_edges, _edge_vp_angle, _aspect_penalty, _vanishing_point_penalty, _out_of_floor_penalty, _bottom_support_from_loss, _position_penalty, _area_soft_penalty, _mixer_score_candidate, _passes_geom_gates, _is_convex_quad
+Top-level classes: FitMetrics(); CourtFitResult(); LineSeg(); RansacLineSeg()
+Key understanding:
+- Core robust court-fit engine with multi-stage preprocessing, ROI gating, Hough/LSD/RANSAC line handling, candidate quad generation and scoring.
+- Provides fit result object (H/corners/confidence/reason/metrics/debug artifacts) and method fallback orchestration.
+- Heavy use of env-tunable parameters and debug outputs for regression and stability tuning.
+
+--------------------------------
+Core Docs & Metadata
+--------------------------------
+[File: .github/copilot-instructions.md] | lines=88 | role=utility/module
+- Summary: <!-- Auto-generated guidance for coding agents working on Badminton-AI-coach -->
+[File: .github/workflows/ci.yml] | lines=34 | role=utility/module
+- Summary: GitHub Actions CI: install locked deps and run regression suite.
+[File: .editorconfig] | lines=16 | role=utility/module
+- Summary: Editor defaults (LF/newline/indent) for consistent formatting.
+[File: .gitattributes] | lines=15 | role=utility/module
+- Summary: Text normalization + optional LFS policy for large binaries.
+[File: .python-version] | lines=2 | role=utility/module
+- Summary: 3.11
+[File: CODE_OF_CONDUCT.md] | lines=19 | role=utility/module
+- Summary: Contributor behavior and enforcement baseline.
+[File: CONTRIBUTING.md] | lines=55 | role=utility/module
+- Summary: Setup + regression check + PR rules for contributors.
+[File: LICENSE] | lines=21 | role=utility/module
+- Summary: MIT License
+[File: README.md] | lines=156 | role=utility/module
+- Summary: # Badminton AI Coach
+[File: README_PATCH_NOTES.txt] | lines=26 | role=utility/module
+- Summary: Bottom-only ROI dilation/band patch
+[File: project_summary.txt] | lines=50 | role=utility/module
+- Summary: Badminton AI Coach 项目总结（截至 v3.7）
+[File: requirements.lock.txt] | lines=16 | role=utility/module
+- Summary: Locked runtime dependency versions for reproducibility.
+[File: requirements.txt] | lines=12 | role=utility/module
+- Summary: torch>=2.0.0
+[File: SECURITY.md] | lines=24 | role=utility/module
+- Summary: Private security reporting and disclosure policy.
+[File: Makefile] | lines=18 | role=utility/module
+- Summary: Standard local commands (setup/test/regression/demo-help).
+
+--------------------------------
+Docs
+--------------------------------
+[File: docs/court_detection_week_plan.md] | lines=112 | role=court detection/homography
+- Summary: # Court Detection 一周完善计划（3 人）
+[File: docs/engineering_playbook.md] | lines=55 | role=utility/module
+- Summary: # Engineering Playbook (MVP)
+[File: docs/interview_demo.md] | lines=87 | role=utility/module
+- Summary: Minimal reproducible evidence guide for review/interview demos.
+[File: docs/ios_mvp_architecture.md] | lines=117 | role=utility/module
+- Summary: # iOS MVP Architecture (Badminton AI Coach)
+[File: docs/repository_hardening.md] | lines=52 | role=utility/module
+- Summary: Repository size policy and one-time history cleanup instructions.
+[File: docs/stroke_6class_contract.md] | lines=27 | role=utility/module
+- Summary: # Stroke Label Space Contract (`stroke_6class_v1`)
+
+--------------------------------
+Scripts
+--------------------------------
+[File: scripts/analyse_match.py] | lines=37 | role=analysis pipeline
+- Summary: CLI for full match analysis (v3 placeholder).
+- Functions: parse_args, main
+[File: scripts/app_launcher.py] | lines=458 | role=utility/module
+- Summary: Desktop launcher for video-evaluation mode and live-camera mode.
+- Functions: main
+- Classes: ProcessController, App
+[File: scripts/benchmark_court_lock.py] | lines=185 | role=court detection/homography
+- Summary: #!/usr/bin/env python3
+- Functions: _read_frame, _order_gt_corners, _l2, _eval_case, parse_args, main
+[File: scripts/calibrate_court_corners.py] | lines=139 | role=court detection/homography
+- Summary: #!/usr/bin/env python3
+- Functions: _read_frame, _draw_overlay, parse_args, main
+[File: scripts/debug_court_candidates.py] | lines=200 | role=court detection/homography
+- Summary: #!/usr/bin/env python3
+- Functions: _load_yaml, _read_frame, _draw_quad, _draw_text, parse_args, main
+[File: scripts/demo_friend.py] | lines=998 | role=report generation
+- Summary: One-command demo for friends: - Run the v3 realtime pipeline on a sample video - Summarize strokes - Generate a Markdown/JSON/CSV report + heatmap/timeline images
+- Functions: _adapter_file_in_dir, _resolve_existing_path, _load_yaml, _looks_like_mediapipe_installed, _summarize_for_console, _llm_description_from_summary, _to_text, _extract_json_dict, _to_score_value, _extract_declared_score, _extract_dim_scores, _compute_rubric_score, _read_video_frame_bgr, _looks_like_default_full_frame_corners, _compute_court_roi, _draw_court_debug ...
+[File: scripts/demo_live_camera.py] | lines=1057 | role=court detection/homography
+- Summary: Live camera demo: lock court once, then run realtime player/ball/stroke inference.
+- Functions: _load_yaml, _normalize_corners, _load_corners_from_report, _candidate_score, _compute_court_roi, _draw_corners, _overlay_text, _filter_player_detections_to_court, _roles_for_tracks, _try_lock_court_once, parse_args, main
+[File: scripts/download_qwen3_mlx.py] | lines=26 | role=utility/module
+- Summary: Download mlx-vlm Qwen3 models to local directories.
+- Functions: main
+[File: scripts/eval_court_fit_vs_gt.py] | lines=104 | role=court detection/homography
+- Summary: #!/usr/bin/env python3
+- Functions: _order_corners_lb_rb_rt_lt, _l2, _select_sample, main
+[File: scripts/eval_court_gt.py] | lines=65 | role=court detection/homography
+- Summary: #!/usr/bin/env python3
+- Functions: _l2, main
+[File: scripts/export_court_map.py] | lines=17 | role=court detection/homography
+- Summary: Export court calibration map (placeholder).
+- Functions: main
+[File: scripts/full_distill_pipeline.py] | lines=104 | role=training/eval
+- Summary: Full MLX distillation pipeline: 1) (optional) generate teacher labels (already available) 2) prepare data for mlx-lm (train/valid jsonl) 3) run mlx-lm LoRA training (command invoca
+- Functions: run_cmd, prepare_data, main
+[File: scripts/generate_teacher_labels_mlx.py] | lines=131 | role=analysis pipeline
+- Summary: Generate teacher labels using local MLX teacher model (Qwen3-VL-30B 4bit).  Pipeline:   video (.mp4)     -> analyse_video(...)     -> stroke summaries     -> prompt (from summary) 
+- Functions: build_prompt_from_summary, main
+[File: scripts/monitor_report_quality.py] | lines=120 | role=report generation
+- Summary: #!/usr/bin/env python3
+- Functions: _load_report, _compute_metrics, _evaluate, parse_args, main
+[File: scripts/prepare_distill_dataset.py] | lines=100 | role=distillation/data prep
+- Summary: Convert teacher_labels.jsonl into chat-style JSONL for distillation.  Input (per line):   {     "video_path": "...",     "summary": {...},     "prompt": "...",     "teacher_output"
+- Functions: teacher_output_to_text, main
+[File: scripts/prepare_mlx_data.py] | lines=80 | role=training/eval
+- Summary: Convert distill_data_chat.jsonl into mlx-lm chat format (train/valid split).  Input: data/distill/distill_data_chat.jsonl Output: data/mlx_train/train.jsonl and valid.jsonl Each li
+- Functions: load_data, convert_to_mlx_format, main
+[File: scripts/regress_court_demo_friend.sh] | lines=4 | role=court detection/homography
+- Summary: #!/usr/bin/env bash
+[File: scripts/run_analysis_api.py] | lines=15 | role=server api
+- Summary: #!/usr/bin/env python3
+[File: scripts/run_regression_suite.py] | lines=55 | role=utility/module
+- Summary: #!/usr/bin/env python3
+- Functions: _run, parse_args, main
+[File: scripts/stageB_eval_gt.py] | lines=27 | role=utility/module
+- Summary: import json, math, sys
+- Functions: l2
+[File: scripts/stageB_eval_only.py] | lines=129 | role=utility/module
+- Summary: import json
+- Functions: load_report, dist, main
+[File: scripts/test_realtime_fps.py] | lines=34 | role=test
+- Summary: Quick FPS benchmark for the realtime pipeline.
+- Functions: test
+[File: scripts/train_strokes.py] | lines=45 | role=training/eval
+- Summary: CLI entrypoint to train the badminton stroke classifier.
+- Functions: parse_args, main
+[File: scripts/train_strokes_v2.py] | lines=50 | role=training/eval
+- Summary: CLI entrypoint for Version 2 training with advanced schedulers/AMP.
+- Functions: parse_args, main
+[File: scripts/train_student_distill_mlx.py] | lines=45 | role=training/eval
+- Summary: Placeholder for MLX-based finetuning of Qwen3-VL-4B.  NOTE: Full parameter-efficient finetuning for mlx_vlm is not implemented here. This script documents the expected workflow and
+- Functions: main
+
+--------------------------------
+Source: ai_score
+--------------------------------
+[File: src/ai_score/__init__.py] | lines=22 | role=ai coaching feedback
+- Summary: AI scoring and feedback package (MLX teacher/student only).
+- Functions: __getattr__
+[File: src/ai_score/action_feedback.py] | lines=40 | role=ai coaching feedback
+- Summary: from __future__ import annotations
+- Classes: ActionFeedback
+[File: src/ai_score/rubric.py] | lines=53 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: build_prompt
+[File: src/ai_score/scoring_engine.py] | lines=218 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _clamp_score, _extract_json_dict, _extract_declared_score, _extract_dim_scores, _weighted_score, _fallback_dim_scores, _fallback_text, _extract_confidence, normalize_llm_score_output
+[File: src/ai_score/student_mlx.py] | lines=122 | role=utility/module
+- Summary: from __future__ import annotations
+- Classes: MLXStudent
+[File: src/ai_score/teacher_mlx.py] | lines=47 | role=utility/module
+- Summary: from __future__ import annotations
+- Classes: MLXTeacher
+
+--------------------------------
+Source: analysis
+--------------------------------
+[File: src/analysis/__init__.py] | lines=3 | role=utility/module
+- Summary: from .tactical_stats import classify_phase, summarize_tactics  # noqa: F401
+[File: src/analysis/heatmap.py] | lines=220 | role=visualization
+- Summary: import numpy as np
+- Functions: _draw_court, _create_xy_heatmap, create_landing_heatmap, create_hitter_heatmap
+[File: src/analysis/tactical_stats.py] | lines=134 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _region_row, classify_phase, _safe_role, summarize_tactics
+[File: src/analysis/timeline.py] | lines=39 | role=visualization
+- Summary: import matplotlib.pyplot as plt
+- Functions: create_stroke_timeline
+
+--------------------------------
+Source: config
+--------------------------------
+[File: src/config/court_env_profiles/hough_orient_stable.env] | lines=64 | role=court detection/homography
+- Summary: # Tuned court-fit profile for multi-court indoor videos.
+[File: src/config/default.yaml] | lines=36 | role=configuration
+- Summary: seed: 42
+[File: src/config/v2_highcap.yaml] | lines=38 | role=configuration
+- Summary: seed: 42
+[File: src/config/v2_highcap_stable.yaml] | lines=42 | role=configuration
+- Summary: seed: 42
+[File: src/config/v3.yaml] | lines=40 | role=configuration
+- Summary: vision:
+[File: src/config/v3_ai_score.yaml] | lines=82 | role=configuration
+- Summary: device:
+[File: src/config/v3_realtime.yaml] | lines=96 | role=configuration
+- Summary: video:
+
+--------------------------------
+Source: geometry
+--------------------------------
+[File: src/geometry/__init__.py] | lines=1 | role=utility/module
+- Summary: Geometry utilities (homography, coordinate mapping).
+[File: src/geometry/coordinate_mapper.py] | lines=16 | role=utility/module
+- Summary: Coordinate mapping helpers.
+- Classes: CoordinateMapper
+[File: src/geometry/homography.py] | lines=54 | role=utility/module
+- Summary: from __future__ import annotations
+- Classes: CourtHomography
+[File: src/geometry/metrics.py] | lines=19 | role=utility/module
+- Summary: Geometry-based metrics (distances, angles).
+- Functions: distance, angle
+[File: src/geometry/region_definitions.py] | lines=74 | role=utility/module
+- Summary: from __future__ import annotations
+- Classes: CourtRegions, CourtGrid9
+
+--------------------------------
+Source: models
+--------------------------------
+[File: src/models/__init__.py] | lines=3 | role=utility/module
+- Summary: Model definitions for Badminton AI Coach.
+[File: src/models/video_classifier.py] | lines=162 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _infer_feature_dim, _build_backbone
+- Classes: VideoClassifier
+
+--------------------------------
+Source: pipeline
+--------------------------------
+[File: src/pipeline/__init__.py] | lines=1 | role=report generation
+- Summary: Pipelines for full video analysis and reporting.
+[File: src/pipeline/action_feedback_pipeline.py] | lines=126 | role=ai coaching feedback
+- Summary: from __future__ import annotations
+- Functions: run_action_feedback
+[File: src/pipeline/analyse_video.py] | lines=1088 | role=analysis pipeline
+- Summary: Unified video analysis pipeline placeholder.
+- Functions: analyse_video
+- Classes: FrameResult, AnalyseResult
+[File: src/pipeline/extract_strokes.py] | lines=484 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: build_homography_from_analysis, _frame_idx_of, _player_states_of, _point_to_bbox_distance, _nearest_player_distance, _cluster_contact_candidates, _find_nearest_pose, _build_segment_bounds, _parse_classifier_output, infer_segment_frame_ranges_from_analysis, summarise_strokes_from_analysis, stroke_summaries_to_dicts
+- Classes: StrokeSummary
+[File: src/pipeline/label_space.py] | lines=65 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _norm_labels, infer_label_space_version, build_label_space_metadata
+[File: src/pipeline/readme.txt] | lines=5 | role=utility/module
+- Summary: This folder contains the unified pipeline entrypoints:
+[File: src/pipeline/render_overlay.py] | lines=29 | role=utility/module
+- Summary: Rendering utilities to overlay detections/metrics on video frames.
+- Functions: render_players, render_ball
+[File: src/pipeline/report_generator.py] | lines=291 | role=report generation
+- Summary: from __future__ import annotations
+- Functions: generate_markdown_report, generate_json_report, generate_csv_report, generate_match_report, generate_report
+[File: src/pipeline/stroke_classifier_runtime.py] | lines=258 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _resolve_device
+- Classes: ClassifierPrediction, StrokeClassifierRuntime
+
+--------------------------------
+Source: server
+--------------------------------
+[File: src/server/__init__.py] | lines=2 | role=server api
+- Summary: HTTP API server package for iOS/web integration.
+[File: src/server/analysis_api.py] | lines=370 | role=server api
+- Summary: from __future__ import annotations
+- Functions: _json_response, _load_request_json, _resolve_video_path, _choose_config_path, _simple_summary, build_handler, run_server, parse_args, main
+- Classes: JobState, AnalysisAPIServer
+
+--------------------------------
+Source: spatial_logic
+--------------------------------
+[File: src/spatial_logic/__init__.py] | lines=1 | role=utility/module
+- Summary: Spatial reasoning utilities.
+[File: src/spatial_logic/events.py] | lines=59 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: infer_event_from_trajectory
+- Classes: StrokeEvent
+[File: src/spatial_logic/hitter_detector.py] | lines=57 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _bbox_center, _point_to_bbox_distance, infer_hitter_for_stroke
+- Classes: HitterInfo
+[File: src/spatial_logic/landing_detector.py] | lines=283 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: _get_ball_from_frame, _get_ball_center, extract_ball_track, smooth_track, detect_landing_point, infer_landing
+- Classes: BallState, LandingPoint, HomographyMapper, RegionClassifier
+[File: src/spatial_logic/pose_features.py] | lines=100 | role=pose estimation/features
+- Summary: from __future__ import annotations
+- Functions: _to_np, _get_pt, _angle, _angle_with_vertical, extract_pose_features
+[File: src/spatial_logic/pose_quality.py] | lines=36 | role=pose estimation/features
+- Summary: from __future__ import annotations
+- Functions: pose_features_to_prompt
+[File: src/spatial_logic/region_logic.py] | lines=9 | role=court detection/homography
+- Summary: Region logic for court zones.
+- Functions: court_zone
+[File: src/spatial_logic/relations.py] | lines=11 | role=tracking
+- Summary: Spatial relations between tracked entities.
+- Functions: relative_left_right
+[File: src/spatial_logic/stroke_reasoner.py] | lines=81 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: combine_classifier_and_event
+- Classes: FinalStroke
+[File: src/spatial_logic/temporal_logic.py] | lines=26 | role=utility/module
+- Summary: Temporal reasoning utilities.
+- Functions: smooth_events, slice_segments
+
+--------------------------------
+Source: tracking
+--------------------------------
+[File: src/tracking/__init__.py] | lines=1 | role=tracking
+- Summary: Tracking subpackage.
+[File: src/tracking/ball_track.py] | lines=108 | role=tracking
+- Summary: from __future__ import annotations
+- Classes: BallTrackState, SingleBallTracker
+[File: src/tracking/bytetrack.py] | lines=131 | role=tracking
+- Summary: from __future__ import annotations
+- Classes: Track, SimpleByteTrack
+[File: src/tracking/id_assign.py] | lines=34 | role=tracking
+- Summary: from __future__ import annotations
+- Functions: assign_player_roles
+[File: src/tracking/player_track.py] | lines=135 | role=tracking
+- Summary: from __future__ import annotations
+- Classes: PlayerState, PlayerTracker
+[File: src/tracking/utils.py] | lines=28 | role=tracking
+- Summary: from __future__ import annotations
+- Functions: iou_xyxy
+
+--------------------------------
+Source: training
+--------------------------------
+[File: src/training/eval.py] | lines=174 | role=training/eval
+- Summary: from __future__ import annotations
+- Functions: evaluate_model, run_eval
+[File: src/training/train.py] | lines=360 | role=training/eval
+- Summary: from __future__ import annotations
+- Functions: load_config, build_dataloaders, _validate, _build_scheduler, train, _parse_args, main
+[File: src/training/utils.py] | lines=84 | role=training/eval
+- Summary: from __future__ import annotations
+- Functions: set_seed, set_num_threads, accuracy, save_checkpoint, load_checkpoint, get_device, move_to_device
+
+--------------------------------
+Source: vision
+--------------------------------
+[File: src/vision/__init__.py] | lines=1 | role=court detection/homography
+- Summary: Vision subpackage (detection, pose, court).
+[File: src/vision/ball_detector.py] | lines=256 | role=utility/module
+- Summary: from __future__ import annotations
+- Classes: BallDetector
+[File: src/vision/court_detector.py] | lines=882 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Classes: CourtLines, CourtDetector
+[File: src/vision/court_detector_farin2005.py] | lines=862 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Classes: _LineModel, _CourtCandidate, CourtDetectorFarin2005
+[File: src/vision/court_env_profile.py] | lines=111 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Functions: _normalize_env_mapping, parse_env_file, _resolve_profile_path, resolve_court_env_overrides, apply_court_env_overrides, resolve_and_apply_court_env_overrides, resolve_local_path_from_url_or_path
+[File: src/vision/court_fit_homography.py] | lines=13769 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Functions: get_canonical_points_norm, _env_int, _env_float, _env_str, _env_flag, _apply_legacy_env_aliases, _model_role_weight_params, _apply_model_role_weights, _seg_len_px, _filter_segments_minlen, _filter_segments_minlen_with_boundary_rescue, _order_corners_lb_rb_rt_lt, _quad_span_ok, _bottom_span_floor_ratio, _top_edge_floor_ratio, _find_peaks_1d ...
+- Classes: FitMetrics, CourtFitResult, LineSeg, RansacLineSeg
+[File: src/vision/court_fit_homography_副本.py] | lines=10031 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Functions: get_canonical_points_norm, _env_int, _env_float, _env_str, _env_flag, _model_role_weight_params, _apply_model_role_weights, _seg_len_px, _filter_segments_minlen, _filter_segments_minlen_with_boundary_rescue, _order_corners_lb_rb_rt_lt, _quad_span_ok, _quad_area, _quad_edges, _edge_vp_angle, _aspect_penalty ...
+- Classes: FitMetrics, CourtFitResult, LineSeg, RansacLineSeg
+[File: src/vision/court_match_farin2005.py] | lines=1054 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Functions: _P, badminton_model_segments_m, model_corners_m, model_aspect_ratio_m, _is_close, _outer_boundary_indices, _quad_edge_ar_lb_rb_rt_lt, _quad_oob_too_far, _line_from_points, _angle_mod_pi, _angle_diff, _project_points, _poly_area, _extent_and_ar, compute_dt_to_lines, _order_corners_lb_rb_rt_lt ...
+- Classes: LineSeg, MatchResult
+[File: src/vision/court_model_bwf.py] | lines=98 | role=court detection/homography
+- Summary: from __future__ import annotations
+- Functions: get_bwf_corners, get_bwf_lines, _sample_segment, sample_model_points
+- Classes: CourtLine
+[File: src/vision/detectors.py] | lines=147 | role=utility/module
+- Summary: from __future__ import annotations
+- Functions: filter_by_class_name
+- Classes: Detection, YoloDetector, PlayerDetector
+[File: src/vision/pose_estimator.py] | lines=57 | role=pose estimation/features
+- Summary: from __future__ import annotations
+- Classes: PoseKeypoints, PoseEstimator
+[File: src/vision/utils.py] | lines=15 | role=utility/module
+- Summary: Utility helpers for vision preprocessing/postprocessing.
+- Functions: letterbox, nms
+
+--------------------------------
+iOS
+--------------------------------
+[File: ios/BadmintonAICoach/BadmintonAICoach/APIClient.swift] | lines=69 | role=server api
+- Summary: import Foundation
+[File: ios/BadmintonAICoach/BadmintonAICoach/BadmintonAICoachApp.swift] | lines=10 | role=utility/module
+- Summary: import SwiftUI
+[File: ios/BadmintonAICoach/BadmintonAICoach/ContentView.swift] | lines=169 | role=utility/module
+- Summary: import SwiftUI
+[File: ios/BadmintonAICoach/BadmintonAICoach/Models.swift] | lines=61 | role=utility/module
+- Summary: import Foundation
+[File: ios/BadmintonAICoach/BadmintonAICoach.xcodeproj/project.pbxproj] | lines=243 | role=utility/module
+- Summary: // !$*UTF8*$!
+[File: ios/BadmintonAICoach/BadmintonAICoach.xcodeproj/xcshareddata/xcschemes/BadmintonAICoach.xcscheme] | lines=78 | role=utility/module
+- Summary: <?xml version="1.0" encoding="UTF-8"?>
+[File: ios/BadmintonAICoach/README.md] | lines=21 | role=utility/module
+- Summary: # BadmintonAICoach iOS MVP
+
+--------------------------------
+Tests
+--------------------------------
+[File: tests/assets/court_fail_cases.json] | lines=9 | role=court detection/homography
+- Summary: {
+[File: tests/assets/sample_report.json] | lines=26 | role=report generation
+- Summary: {
+[File: tests/test_analysis_api_utils.py] | lines=40 | role=server api
+- Summary: import unittest
+- Classes: AnalysisAPIUtilsTests
+[File: tests/test_court_env_profile.py] | lines=71 | role=court detection/homography
+- Summary: import os
+- Classes: CourtEnvProfileTests
+[File: tests/test_extract_strokes_classifier_gate.py] | lines=59 | role=test
+- Summary: import unittest
+- Classes: _FakeBall, _FakeFrame, ExtractStrokesClassifierGateTests
+[File: tests/test_label_space.py] | lines=34 | role=test
+- Summary: import unittest
+- Classes: LabelSpaceTests
+[File: tests/test_scoring_engine.py] | lines=37 | role=test
+- Summary: import unittest
+- Classes: ScoringEngineTests
+
+--------------------------------
+Assets
+--------------------------------
+[File: assets/gt/demo_friend_gt.json] | lines=15 | role=utility/module
+- Summary: {
+
+--------------------------------
+PIPELINE CALL GRAPH (CURRENT)
+--------------------------------
+scripts/demo_friend.py
+ -> src/pipeline/analyse_video.py
+    -> src/vision/{detectors,ball_detector,court_detector,pose_estimator,court_fit_homography,...}
+    -> src/tracking/{bytetrack,ball_track,player_track,id_assign}
+    -> src/geometry/homography.py
+ -> src/pipeline/extract_strokes.py
+    -> src/spatial_logic/{events,landing_detector,hitter_detector,stroke_reasoner,pose_features,pose_quality}
+ -> src/pipeline/report_generator.py
+    -> src/analysis/{heatmap,timeline,tactical_stats}
+ -> optional src/ai_score/{action_feedback,teacher_mlx,student_mlx,scoring_engine}
+
+--------------------------------
+NOTES
+--------------------------------
+- reports/ was intentionally skipped per user instruction (historical artifacts).
+- A keynote file exists at /Users/chencheng/Library/Mobile Documents/com~apple~Keynote/Documents/未命名16.key, but .key internal iwa data is binary and not source-of-truth for runtime behavior.
+- Duplicate historical file src/vision/court_fit_homography_副本.py exists; active imports use src/vision/court_fit_homography.py.

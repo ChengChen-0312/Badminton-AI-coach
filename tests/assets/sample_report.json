@@ -1,0 +1,26 @@
+{
+  "label_space_version": "stroke_6class_v1",
+  "court_detection": {
+    "source": "auto",
+    "confidence": 0.76,
+    "reason": "OK"
+  },
+  "stroke_count": 2,
+  "strokes": [
+    {
+      "final_type": "forehand_drive",
+      "classifier_label": "forehand_drive",
+      "classifier_confidence": 0.82,
+      "confidence": 0.90,
+      "landing_region": "mid"
+    },
+    {
+      "final_type": "clear",
+      "classifier_label": null,
+      "classifier_confidence": 0.31,
+      "classifier_rejected_low_conf": true,
+      "confidence": 0.60,
+      "landing_region": "back"
+    }
+  ]
+}

@@ -97,6 +97,20 @@ def generate_markdown_report(
         lines.append(f"### Stroke {i + 1}")
         lines.append(f"- Predicted Type: **{s.get('final_type')}**")
         lines.append(f"- Classifier Label: {s.get('classifier_label')}")
+        if s.get("classifier_confidence") is not None:
+            lines.append(f"- Classifier Confidence: {float(s.get('classifier_confidence')):.2f}")
+        if bool(s.get("classifier_rejected_low_conf")):
+            lines.append("- Classifier Used: no (below min confidence threshold)")
+        if isinstance(s.get("classifier_topk"), list) and s.get("classifier_topk"):
+            top1 = s.get("classifier_topk")[0]
+            if isinstance(top1, dict):
+                try:
+                    top1_conf = float(top1.get("confidence", 0.0))
+                except Exception:
+                    top1_conf = 0.0
+                lines.append(
+                    f"- Classifier Top-1: {top1.get('label')} ({top1_conf:.2f})"
+                )
         lines.append(f"- Event Type (logic): {s.get('event_type')}")
         lines.append(
             f"- Hitter: **{s.get('hitter_role')}** (track_id={s.get('hitter_track_id')})"
