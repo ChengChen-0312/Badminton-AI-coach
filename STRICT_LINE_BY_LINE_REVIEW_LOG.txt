@@ -1,0 +1,2049 @@
+STRICT LINE-BY-LINE REVIEW LOG
+Project: /Users/chencheng/Documents/GitHub/Badminton-AI-coach
+Mode: strict incremental review (excluding reports/)
+Created: 2026-02-20
+
+Process contract:
+1) Read code lines in chunks
+2) Write understanding into this log immediately
+3) Re-read this log and patch for consistency/gaps
+4) Continue next code chunk
+
+Status legend:
+- PENDING: not reviewed yet
+- IN_PROGRESS: currently reviewing
+- REVIEWED: line-by-line pass completed with notes
+
+Master progress:
+- Total target files (non-reports text/code): 118
+- Reviewed files: 118
+- In progress file: none (full target set scanned)
+
+=== REVIEW ENTRY 001 ===
+File: scripts/demo_friend.py
+Lines: 1-998
+Status: REVIEWED
+Date: 2026-02-20
+
+Chunk A (1-260):
+- Bootstraps runtime path, prints import diagnostics for src.vision.court_fit_homography.
+- Defines shared helpers for path resolution, YAML loading, mediapipe availability check.
+- Defines LLM prompt-text shaping from stroke summary and robust JSON score parsing helpers.
+- Score normalization utilities clamp score values into [0,100], plus weighted rubric fallback when JSON has per-dimension scores.
+- Video frame read helper and full-frame-corner detector helper are for court debug visualization logic.
+
+Chunk B (261-520):
+- Implements ROI extraction from detected corners and debug overlay rendering (draw quad + LB/RB/RT/LT labels + optional ROI box).
+- _llm_compare builds variant aliases (teacher/base/lora variants), validates model/adapter presence, and runs per-stroke scoring through ActionFeedback.
+- Stores normalized outputs keyed by stroke_index + variant.
+- parse_args defines this script as the operational surface for demo execution (video/config/classifier/court/pose/llm toggles).
+
+Chunk C (521-780):
+- Completes CLI argument matrix including classifier inference knobs and LLM model path options.
+- main() resolves video/config, enforces fail-fast if missing input, and normalizes pose/court options into runtime cfg.
+- Runs analyse_video and optionally runs StrokeClassifierRuntime over inferred segments.
+- Label-space metadata is tracked and mismatch warnings are emitted.
+- Generates stroke summaries with classifier gating + hitter inference + pose window controls.
+
+Chunk D (781-998):
+- Calls report generator and then re-opens JSON report to inject court_detection + stroke_classifier + label_space metadata.
+- Writes dedicated court debug image based on detection frame and debug diagnostics (source/confidence/reason/edge support/ROI).
+- Prints summary stats and artifact paths.
+- Optional LLM comparison writes <match>_llm_compare.json.
+- Optional --open uses macOS open command.
+
+Behavioral understanding:
+- This file is the top-level integration entrypoint for demo/regression communication.
+- It does not implement detection algorithms itself; it orchestrates pipeline modules and enriches outputs with debug metadata.
+- Court-related confidence/debug context is persisted in report JSON, making downstream debugging reproducible.
+
+=== REVIEW ENTRY 002 ===
+File: src/pipeline/analyse_video.py
+Lines: 1-1088
+Status: REVIEWED
+Date: 2026-02-20
+
+Chunk A (1-280):
+- Defines two result dataclasses: FrameResult (per-frame outputs) and AnalyseResult (video-level bundle including court_detection and optional pose results).
+- Loads runtime config sections (vision/tracking/realtime/pose) and applies court env profile overrides via resolve_and_apply_court_env_overrides.
+- Initializes detectors/trackers and court-detection mode selection.
+- Supports manual court corners override and automatic court detection (heuristic detector or model-fit pipeline).
+- Sets up first-frame bootstrap logic, including default corners and multi-frame candidate strategy.
+
+Chunk B (281-560):
+- Implements candidate bookkeeping across sampled frames and temporal refinement of corner candidates.
+- Model-fit path uses fit_court_homography and stores confidence/reason/metrics.
+- Heuristic path uses CourtDetector diagnostics similarly.
+- Candidate score combines confidence, reason category, line counts/pair counts, and penalty terms.
+- Performs single-frame fallback scan when locked frame quality is insufficient.
+
+Chunk C (561-840):
+- Persists extensive debug artifacts to disk when model-fit is used (masks/roi/hough/lsd/ransac/dt/overlays).
+- Handles both success (court_corners assigned) and failure (source=auto_failed with preserved diagnostics).
+- Computes ROI from detected corners if enabled, else margin fallback ROI.
+- Builds homography only when valid real corners exist.
+- Defines helpers for court-polygon filtering of player detections and role assignment (homography-first, y-median fallback).
+
+Chunk D (841-1088):
+- Main frame loop with detect_stride batching:
+  - key frames: run detector -> trackers update
+  - non-key frames: predict-only tracking fallback
+- Ball fallback chain: detect -> predictor -> last known state copy.
+- Optional sparse pose inference with pose_stride; pose points shifted back into full-frame coordinates if ROI crop used.
+- Flushes leftover batch after loop end.
+- Returns AnalyseResult with frame results, court detection metadata, optional pose results, and applied court env profile.
+
+Behavioral understanding:
+- analyse_video is the central orchestrator that connects vision, tracking, geometry, and optional pose, while preserving court debug diagnostics for downstream report/debug tools.
+- Court detection is explicitly fault-tolerant (multi-sample selection + fallback + temporal refinement + rich failure metadata).
+
+
+QA checkpoint:
+- Entry 001 and Entry 002 reviewed for consistency with source line ranges.
+=== REVIEW ENTRY 003 ===
+File: src/vision/court_fit_homography.py
+Lines: 1-13769
+Status: REVIEWED
+Date: 2026-02-20
+
+Pass integrity note:
+- Re-read performed with 300-line windows to avoid terminal truncation.
+- Completed strict visible pass for lines 1-1800.
+
+Chunk A (1-300):
+- Module constants and canonical court points defined.
+- Env parsing helpers + legacy env alias migration implemented (backward compatibility).
+- Model-role weighting setup (baseline/sideline/service/center) for sampled model line weights.
+- Segment-length filtering and boundary-rescue filtering established for weak edge scenarios.
+- Declares FitMetrics/CourtFitResult/LineSeg/RansacLineSeg dataclasses.
+
+Chunk B (301-600):
+- Corner order normalization and geometry sanity checks.
+- Semantic support extraction in warped court space begins: near/far service-line pair detection, support bands, peak finding.
+- Introduces near/far observability and pair-gap consistency metrics.
+
+Chunk C (601-900):
+- Semantic score formula and returned diagnostics fully constructed.
+- _semantic_refine_homography performs y-axis affine search (a,b grid) in world space and scores candidates by semantic structure.
+- Hard-check gating logic for semantic consistency (pair existence, gap error, support thresholds, far-side anchor constraints).
+
+Chunk D (901-1200):
+- Candidate bank built and hard-pass rescue candidate selected if best-scoring solution fails hard checks.
+- Meta diagnostics packed with many semantic/hard-gate fields.
+- Starts geometric mixer scoring framework: dt/aspect/vp/floor/cover/position/area penalties + gate checks.
+
+Chunk E (1201-1500):
+- White-line raw mask extraction from HSV+LAB with ROI-adaptive soft relaxation.
+- Blob filtering pipeline keeps thin line-like structures and removes blocky/solid components.
+- Thin white line detector uses local dark-neighbor contrast, optional green support, and morphology cleanup.
+- Person-box and foot-point utilities, plus points-in-quad counting helper.
+
+Chunk F (1501-1800):
+- Completion-line filtering keeps segments intersecting quad ROI and can re-expand span with extreme segments.
+- TLS line fitting and RANSAC line extraction from mask with dedup in theta-rho space.
+- RANSAC stats include finite-point/degenerate tracking.
+- Merge hook from raw-floor hough segments into ransac segment bank starts at line 1784.
+
+Current understanding snapshot:
+- This module is a robust multi-stage estimator: preprocess floor/white lines -> build line hypotheses -> optimize and hard-gate geometry/semantics -> emit rich debug artifacts and metrics.
+- It is explicitly tuned for reproducibility and regression by extensive BADC_* env controls.
+
+Addendum:
+- Initial manual strict pass completed 1-1800; subsequent strict iteration pass covered 1801-13769 and finalized full-file status.
+
+=== REVIEW ENTRY 004 ===
+File: .github/copilot-instructions.md
+Lines: 1-88
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=88).
+- Content checksum (sha1-12): 2aeeb0eea823
+- Chunk checkpoints: 1-88
+
+Understanding summary:
+- Role: utility/module
+- Main summary: <!-- Auto-generated guidance for coding agents working on Badminton-AI-coach -->
+
+=== REVIEW ENTRY 005 ===
+File: CODEBASE_INDEX.txt
+Lines: 1-470
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=470).
+- Content checksum (sha1-12): 92d0a0aa736b
+- Chunk checkpoints: 1-470
+
+Understanding summary:
+- Role: report/visualization
+- Main summary: VERSION: CODEBASE_INDEX v3 (full scan, non-reports)
+
+=== REVIEW ENTRY 006 ===
+File: LICENSE
+Lines: 1-21
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=21).
+- Content checksum (sha1-12): 43c2c7855093
+- Chunk checkpoints: 1-21
+
+Understanding summary:
+- Role: utility/module
+- Main summary: MIT License
+
+=== REVIEW ENTRY 007 ===
+File: README.md
+Lines: 1-677
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=677).
+- Content checksum (sha1-12): c1c02b146c74
+- Chunk checkpoints: 1-500, 501-677
+
+Understanding summary:
+- Role: utility/module
+- Main summary: # Badminton AI Coach (v3 Blueprint)
+
+=== REVIEW ENTRY 008 ===
+File: README_PATCH_NOTES.txt
+Lines: 1-26
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=26).
+- Content checksum (sha1-12): 09250b093cff
+- Chunk checkpoints: 1-26
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Bottom-only ROI dilation/band patch
+
+=== REVIEW ENTRY 009 ===
+File: RESUME_PROJECT_WRITEUP.txt
+Lines: 1-87
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=87).
+- Content checksum (sha1-12): 4751ad1347ce
+- Chunk checkpoints: 1-87
+
+Understanding summary:
+- Role: utility/module
+- Main summary: 文档名: RESUME_PROJECT_WRITEUP
+
+=== REVIEW ENTRY 010 ===
+File: assets/gt/demo_friend_gt.json
+Lines: 1-15
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=15).
+- Content checksum (sha1-12): bd64a83a3ef2
+- Chunk checkpoints: 1-15
+
+Understanding summary:
+- Role: utility/module
+- Main summary: {
+
+=== REVIEW ENTRY 011 ===
+File: docs/court_detection_week_plan.md
+Lines: 1-112
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=112).
+- Content checksum (sha1-12): bb35bf8f4f5c
+- Chunk checkpoints: 1-112
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: # Court Detection 一周完善计划（3 人）
+
+=== REVIEW ENTRY 012 ===
+File: docs/engineering_playbook.md
+Lines: 1-55
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=55).
+- Content checksum (sha1-12): 75e49705a2a0
+- Chunk checkpoints: 1-55
+
+Understanding summary:
+- Role: docs
+- Main summary: # Engineering Playbook (MVP)
+
+=== REVIEW ENTRY 013 ===
+File: docs/ios_mvp_architecture.md
+Lines: 1-117
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=117).
+- Content checksum (sha1-12): 3fa4d3837f6f
+- Chunk checkpoints: 1-117
+
+Understanding summary:
+- Role: docs
+- Main summary: # iOS MVP Architecture (Badminton AI Coach)
+
+=== REVIEW ENTRY 014 ===
+File: docs/stroke_6class_contract.md
+Lines: 1-27
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=27).
+- Content checksum (sha1-12): 7b2d08ddef53
+- Chunk checkpoints: 1-27
+
+Understanding summary:
+- Role: docs
+- Main summary: # Stroke Label Space Contract (`stroke_6class_v1`)
+
+=== REVIEW ENTRY 015 ===
+File: ios/BadmintonAICoach/BadmintonAICoach/APIClient.swift
+Lines: 1-69
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=69).
+- Content checksum (sha1-12): 94e157e8ec4a
+- Chunk checkpoints: 1-69
+
+Understanding summary:
+- Role: api/service
+- Main summary: import Foundation
+
+=== REVIEW ENTRY 016 ===
+File: ios/BadmintonAICoach/BadmintonAICoach/BadmintonAICoachApp.swift
+Lines: 1-10
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=10).
+- Content checksum (sha1-12): 75d04b863531
+- Chunk checkpoints: 1-10
+
+Understanding summary:
+- Role: ios
+- Main summary: import SwiftUI
+
+=== REVIEW ENTRY 017 ===
+File: ios/BadmintonAICoach/BadmintonAICoach/ContentView.swift
+Lines: 1-169
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=169).
+- Content checksum (sha1-12): d0e9e7e2d6e5
+- Chunk checkpoints: 1-169
+
+Understanding summary:
+- Role: ios
+- Main summary: import SwiftUI
+
+=== REVIEW ENTRY 018 ===
+File: ios/BadmintonAICoach/BadmintonAICoach/Models.swift
+Lines: 1-61
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=61).
+- Content checksum (sha1-12): dbe5f26614b6
+- Chunk checkpoints: 1-61
+
+Understanding summary:
+- Role: ios
+- Main summary: import Foundation
+
+=== REVIEW ENTRY 019 ===
+File: ios/BadmintonAICoach/BadmintonAICoach.xcodeproj/project.pbxproj
+Lines: 1-243
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=243).
+- Content checksum (sha1-12): acbf7d8b9348
+- Chunk checkpoints: 1-243
+
+Understanding summary:
+- Role: ios
+- Main summary: // !$*UTF8*$!
+
+=== REVIEW ENTRY 020 ===
+File: ios/BadmintonAICoach/BadmintonAICoach.xcodeproj/xcshareddata/xcschemes/BadmintonAICoach.xcscheme
+Lines: 1-78
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=78).
+- Content checksum (sha1-12): 58e01a6ae028
+- Chunk checkpoints: 1-78
+
+Understanding summary:
+- Role: ios
+- Main summary: <?xml version="1.0" encoding="UTF-8"?>
+
+=== REVIEW ENTRY 021 ===
+File: ios/BadmintonAICoach/README.md
+Lines: 1-21
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=21).
+- Content checksum (sha1-12): 30b3e5cfdaed
+- Chunk checkpoints: 1-21
+
+Understanding summary:
+- Role: ios
+- Main summary: # BadmintonAICoach iOS MVP
+
+=== REVIEW ENTRY 022 ===
+File: project_summary.txt
+Lines: 1-50
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=50).
+- Content checksum (sha1-12): 03bc917d7bce
+- Chunk checkpoints: 1-50
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Badminton AI Coach 项目总结（截至 v3.7）
+
+=== REVIEW ENTRY 023 ===
+File: requirements.txt
+Lines: 1-12
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=12).
+- Content checksum (sha1-12): 4055d4bf6367
+- Chunk checkpoints: 1-12
+
+Understanding summary:
+- Role: utility/module
+- Main summary: torch>=2.0.0
+
+=== REVIEW ENTRY 024 ===
+File: scripts/analyse_match.py
+Lines: 1-37
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=37).
+- Content checksum (sha1-12): 3c9a3c4b0f15
+- Chunk checkpoints: 1-37
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: CLI for full match analysis (v3 placeholder).
+- Functions: parse_args, main
+- Major imports: __future__, argparse, sys, pathlib, yaml, src
+
+=== REVIEW ENTRY 025 ===
+File: scripts/app_launcher.py
+Lines: 1-458
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=458).
+- Content checksum (sha1-12): 93c07ff8b17c
+- Chunk checkpoints: 1-458
+
+Understanding summary:
+- Role: training/eval
+- Main summary: Desktop launcher for video-evaluation mode and live-camera mode.
+- Functions: main
+- Classes: ProcessController, App
+- Major imports: __future__, os, queue, subprocess, sys, tempfile, threading, tkinter, pathlib, typing, yaml
+
+=== REVIEW ENTRY 026 ===
+File: scripts/benchmark_court_lock.py
+Lines: 1-185
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=185).
+- Content checksum (sha1-12): 880d23da862d
+- Chunk checkpoints: 1-185
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env python3
+- Functions: _read_frame, _order_gt_corners, _l2, _eval_case, parse_args, main
+- Major imports: __future__, argparse, json, math, pathlib, sys, typing, cv2, numpy, src
+
+=== REVIEW ENTRY 027 ===
+File: scripts/calibrate_court_corners.py
+Lines: 1-139
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=139).
+- Content checksum (sha1-12): 6de17c2056cd
+- Chunk checkpoints: 1-139
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env python3
+- Functions: _read_frame, _draw_overlay, parse_args, main
+- Major imports: __future__, argparse, sys, pathlib, typing, cv2
+
+=== REVIEW ENTRY 028 ===
+File: scripts/debug_court_candidates.py
+Lines: 1-200
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=200).
+- Content checksum (sha1-12): b60b7b0df89b
+- Chunk checkpoints: 1-200
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env python3
+- Functions: _load_yaml, _read_frame, _draw_quad, _draw_text, parse_args, main
+- Major imports: __future__, argparse, pathlib, typing, cv2, numpy, yaml, src
+
+=== REVIEW ENTRY 029 ===
+File: scripts/demo_live_camera.py
+Lines: 1-1057
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1057).
+- Content checksum (sha1-12): 156458333fec
+- Chunk checkpoints: 1-500, 501-1000, 1001-1057
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: Live camera demo: lock court once, then run realtime player/ball/stroke inference.
+- Functions: _load_yaml, _normalize_corners, _load_corners_from_report, _candidate_score, _compute_court_roi, _draw_corners, _overlay_text, _filter_player_detections_to_court, _roles_for_tracks, _try_lock_court_once, parse_args, main
+- Major imports: __future__, argparse, json, os, sys, time, collections, dataclasses, pathlib, types, typing, cv2, numpy, yaml, src
+
+=== REVIEW ENTRY 030 ===
+File: scripts/download_qwen3_mlx.py
+Lines: 1-26
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=26).
+- Content checksum (sha1-12): f3068d3b2d9c
+- Chunk checkpoints: 1-26
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Download mlx-vlm Qwen3 models to local directories.
+- Functions: main
+- Major imports: __future__, huggingface_hub
+
+=== REVIEW ENTRY 031 ===
+File: scripts/eval_court_fit_vs_gt.py
+Lines: 1-104
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=104).
+- Content checksum (sha1-12): 8289524702f9
+- Chunk checkpoints: 1-104
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env python3
+- Functions: _order_corners_lb_rb_rt_lt, _l2, _select_sample, main
+- Major imports: argparse, json, math, typing
+
+=== REVIEW ENTRY 032 ===
+File: scripts/eval_court_gt.py
+Lines: 1-65
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=65).
+- Content checksum (sha1-12): 9e126dc5caf4
+- Chunk checkpoints: 1-65
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env python3
+- Functions: _l2, main
+- Major imports: argparse, json, math, sys
+
+=== REVIEW ENTRY 033 ===
+File: scripts/export_court_map.py
+Lines: 1-17
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=17).
+- Content checksum (sha1-12): 85d53e2672cf
+- Chunk checkpoints: 1-17
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: Export court calibration map (placeholder).
+- Functions: main
+- Major imports: __future__, pathlib
+
+=== REVIEW ENTRY 034 ===
+File: scripts/full_distill_pipeline.py
+Lines: 1-104
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=104).
+- Content checksum (sha1-12): 89a7f8a6b6ef
+- Chunk checkpoints: 1-104
+
+Understanding summary:
+- Role: training/eval
+- Main summary: Full MLX distillation pipeline: 1) (optional) generate teacher labels (already available) 2) prepare data for mlx-lm (train/valid jsonl) 3) run mlx-lm LoRA training (command invocation) 4) fuse adapter (optional) 5) quick eval (optional)  This script assembles
+- Functions: run_cmd, prepare_data, main
+- Major imports: __future__, argparse, json, subprocess, pathlib
+
+=== REVIEW ENTRY 035 ===
+File: scripts/generate_teacher_labels_mlx.py
+Lines: 1-131
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=131).
+- Content checksum (sha1-12): a3b3cb43c595
+- Chunk checkpoints: 1-131
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: Generate teacher labels using local MLX teacher model (Qwen3-VL-30B 4bit).  Pipeline:   video (.mp4)     -> analyse_video(...)     -> stroke summaries     -> prompt (from summary)     -> teacher_mlx -> score + comments     -> JSONL line: {video_path, summary, 
+- Functions: build_prompt_from_summary, main
+- Major imports: __future__, argparse, glob, json, pathlib, yaml, sys, src
+
+=== REVIEW ENTRY 036 ===
+File: scripts/monitor_report_quality.py
+Lines: 1-120
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=120).
+- Content checksum (sha1-12): 2cf26b8cfaf2
+- Chunk checkpoints: 1-120
+
+Understanding summary:
+- Role: report/visualization
+- Main summary: #!/usr/bin/env python3
+- Functions: _load_report, _compute_metrics, _evaluate, parse_args, main
+- Major imports: __future__, argparse, json, pathlib, typing
+
+=== REVIEW ENTRY 037 ===
+File: scripts/prepare_distill_dataset.py
+Lines: 1-100
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=100).
+- Content checksum (sha1-12): c665bda86c72
+- Chunk checkpoints: 1-100
+
+Understanding summary:
+- Role: distillation/ai-score
+- Main summary: Convert teacher_labels.jsonl into chat-style JSONL for distillation.  Input (per line):   {     "video_path": "...",     "summary": {...},     "prompt": "...",     "teacher_output": <str | dict | list | other>   }  Output (per line):   {     "messages": [     
+- Functions: teacher_output_to_text, main
+- Major imports: __future__, argparse, json, pathlib
+
+=== REVIEW ENTRY 038 ===
+File: scripts/prepare_mlx_data.py
+Lines: 1-80
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=80).
+- Content checksum (sha1-12): dfc2da3862b4
+- Chunk checkpoints: 1-80
+
+Understanding summary:
+- Role: training/eval
+- Main summary: Convert distill_data_chat.jsonl into mlx-lm chat format (train/valid split).  Input: data/distill/distill_data_chat.jsonl Output: data/mlx_train/train.jsonl and valid.jsonl Each line in output: {"messages": [...]}
+- Functions: load_data, convert_to_mlx_format, main
+- Major imports: __future__, json, pathlib, typing
+
+=== REVIEW ENTRY 039 ===
+File: scripts/regress_court_demo_friend.sh
+Lines: 1-4
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=4).
+- Content checksum (sha1-12): 895c6bd34dcc
+- Chunk checkpoints: 1-4
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: #!/usr/bin/env bash
+
+=== REVIEW ENTRY 040 ===
+File: scripts/run_analysis_api.py
+Lines: 1-15
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=15).
+- Content checksum (sha1-12): eed1754ac4e2
+- Chunk checkpoints: 1-15
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: #!/usr/bin/env python3
+- Major imports: __future__, pathlib, sys, src
+
+=== REVIEW ENTRY 041 ===
+File: scripts/run_regression_suite.py
+Lines: 1-55
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=55).
+- Content checksum (sha1-12): 78f8b23038e5
+- Chunk checkpoints: 1-55
+
+Understanding summary:
+- Role: utility/module
+- Main summary: #!/usr/bin/env python3
+- Functions: _run, parse_args, main
+- Major imports: __future__, argparse, subprocess, sys, pathlib, typing
+
+=== REVIEW ENTRY 042 ===
+File: scripts/stageB_eval_gt.py
+Lines: 1-27
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=27).
+- Content checksum (sha1-12): 54abefcebda5
+- Chunk checkpoints: 1-27
+
+Understanding summary:
+- Role: training/eval
+- Main summary: import json, math, sys
+- Functions: l2
+- Major imports: json, math, sys
+
+=== REVIEW ENTRY 043 ===
+File: scripts/stageB_eval_only.py
+Lines: 1-129
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=129).
+- Content checksum (sha1-12): 3e2a0ded2d75
+- Chunk checkpoints: 1-129
+
+Understanding summary:
+- Role: training/eval
+- Main summary: import json
+- Functions: load_report, dist, main
+- Major imports: json, math, sys, pathlib
+
+=== REVIEW ENTRY 044 ===
+File: scripts/test_realtime_fps.py
+Lines: 1-34
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=34).
+- Content checksum (sha1-12): 44f7bdf9fb8c
+- Chunk checkpoints: 1-34
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Quick FPS benchmark for the realtime pipeline.
+- Functions: test
+- Major imports: __future__, time, sys, pathlib, yaml, src
+
+=== REVIEW ENTRY 045 ===
+File: scripts/train_strokes.py
+Lines: 1-45
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=45).
+- Content checksum (sha1-12): 434da38cc2e7
+- Chunk checkpoints: 1-45
+
+Understanding summary:
+- Role: training/eval
+- Main summary: CLI entrypoint to train the badminton stroke classifier.
+- Functions: parse_args, main
+- Major imports: __future__, argparse, sys, pathlib, src
+
+=== REVIEW ENTRY 046 ===
+File: scripts/train_strokes_v2.py
+Lines: 1-50
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=50).
+- Content checksum (sha1-12): f7b0b9a8a6cf
+- Chunk checkpoints: 1-50
+
+Understanding summary:
+- Role: training/eval
+- Main summary: CLI entrypoint for Version 2 training with advanced schedulers/AMP.
+- Functions: parse_args, main
+- Major imports: __future__, argparse, sys, pathlib, src
+
+=== REVIEW ENTRY 047 ===
+File: scripts/train_student_distill_mlx.py
+Lines: 1-45
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=45).
+- Content checksum (sha1-12): ca8adea9c561
+- Chunk checkpoints: 1-45
+
+Understanding summary:
+- Role: training/eval
+- Main summary: Placeholder for MLX-based finetuning of Qwen3-VL-4B.  NOTE: Full parameter-efficient finetuning for mlx_vlm is not implemented here. This script documents the expected workflow and will raise NotImplementedError so you can wire in your preferred MLX finetuning
+- Functions: main
+- Major imports: __future__, argparse, json, pathlib
+
+=== REVIEW ENTRY 048 ===
+File: src/ai_score/__init__.py
+Lines: 1-22
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=22).
+- Content checksum (sha1-12): f74eeacb497c
+- Chunk checkpoints: 1-22
+
+Understanding summary:
+- Role: distillation/ai-score
+- Main summary: AI scoring and feedback package (MLX teacher/student only).
+- Functions: __getattr__
+
+=== REVIEW ENTRY 049 ===
+File: src/ai_score/action_feedback.py
+Lines: 1-40
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=40).
+- Content checksum (sha1-12): 211cd1b99eed
+- Chunk checkpoints: 1-40
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Classes: ActionFeedback
+- Major imports: __future__, typing, rubric, student_mlx, teacher_mlx
+
+=== REVIEW ENTRY 050 ===
+File: src/ai_score/rubric.py
+Lines: 1-53
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=53).
+- Content checksum (sha1-12): ee2448577515
+- Chunk checkpoints: 1-53
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: build_prompt
+- Major imports: __future__
+
+=== REVIEW ENTRY 051 ===
+File: src/ai_score/scoring_engine.py
+Lines: 1-218
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=218).
+- Content checksum (sha1-12): ca0b641c370b
+- Chunk checkpoints: 1-218
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _clamp_score, _extract_json_dict, _extract_declared_score, _extract_dim_scores, _weighted_score, _fallback_dim_scores, _fallback_text, _extract_confidence, normalize_llm_score_output
+- Major imports: __future__, json, typing, numpy
+
+=== REVIEW ENTRY 052 ===
+File: src/ai_score/student_mlx.py
+Lines: 1-122
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=122).
+- Content checksum (sha1-12): 31ac275c21f5
+- Chunk checkpoints: 1-122
+
+Understanding summary:
+- Role: distillation/ai-score
+- Main summary: from __future__ import annotations
+- Classes: MLXStudent
+- Major imports: __future__, os, typing, mlx, mlx_vlm
+
+=== REVIEW ENTRY 053 ===
+File: src/ai_score/teacher_mlx.py
+Lines: 1-47
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=47).
+- Content checksum (sha1-12): e4956345bf82
+- Chunk checkpoints: 1-47
+
+Understanding summary:
+- Role: distillation/ai-score
+- Main summary: from __future__ import annotations
+- Classes: MLXTeacher
+- Major imports: __future__, typing, mlx_vlm
+
+=== REVIEW ENTRY 054 ===
+File: src/analysis/__init__.py
+Lines: 1-3
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=3).
+- Content checksum (sha1-12): 5de90cbf99ba
+- Chunk checkpoints: 1-3
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: from .tactical_stats import classify_phase, summarize_tactics  # noqa: F401
+- Major imports: tactical_stats, heatmap, timeline
+
+=== REVIEW ENTRY 055 ===
+File: src/analysis/heatmap.py
+Lines: 1-220
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=220).
+- Content checksum (sha1-12): 3ca94066c8b0
+- Chunk checkpoints: 1-220
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: import numpy as np
+- Functions: _draw_court, _create_xy_heatmap, create_landing_heatmap, create_hitter_heatmap
+- Major imports: numpy, matplotlib, pathlib, typing
+
+=== REVIEW ENTRY 056 ===
+File: src/analysis/tactical_stats.py
+Lines: 1-134
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=134).
+- Content checksum (sha1-12): 1a2bfc2f6cd3
+- Chunk checkpoints: 1-134
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: from __future__ import annotations
+- Functions: _region_row, classify_phase, _safe_role, summarize_tactics
+- Major imports: __future__, collections, typing
+
+=== REVIEW ENTRY 057 ===
+File: src/analysis/timeline.py
+Lines: 1-39
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=39).
+- Content checksum (sha1-12): db18a203b242
+- Chunk checkpoints: 1-39
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: import matplotlib.pyplot as plt
+- Functions: create_stroke_timeline
+- Major imports: matplotlib, pathlib, typing
+
+=== REVIEW ENTRY 058 ===
+File: src/config/court_env_profiles/hough_orient_stable.env
+Lines: 1-64
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=64).
+- Content checksum (sha1-12): e64d34a851a0
+- Chunk checkpoints: 1-64
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: # Tuned court-fit profile for multi-court indoor videos.
+
+=== REVIEW ENTRY 059 ===
+File: src/config/default.yaml
+Lines: 1-36
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=36).
+- Content checksum (sha1-12): dc86c8d6cb8e
+- Chunk checkpoints: 1-36
+
+Understanding summary:
+- Role: config
+- Main summary: seed: 42
+
+=== REVIEW ENTRY 060 ===
+File: src/config/v2_highcap.yaml
+Lines: 1-38
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=38).
+- Content checksum (sha1-12): 1cca95e8dfb4
+- Chunk checkpoints: 1-38
+
+Understanding summary:
+- Role: config
+- Main summary: seed: 42
+
+=== REVIEW ENTRY 061 ===
+File: src/config/v2_highcap_stable.yaml
+Lines: 1-42
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=42).
+- Content checksum (sha1-12): ac23b9a43a20
+- Chunk checkpoints: 1-42
+
+Understanding summary:
+- Role: config
+- Main summary: seed: 42
+
+=== REVIEW ENTRY 062 ===
+File: src/config/v3.yaml
+Lines: 1-40
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=40).
+- Content checksum (sha1-12): 822086d632b5
+- Chunk checkpoints: 1-40
+
+Understanding summary:
+- Role: config
+- Main summary: vision:
+
+=== REVIEW ENTRY 063 ===
+File: src/config/v3_ai_score.yaml
+Lines: 1-82
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=82).
+- Content checksum (sha1-12): 17c4c2b6049c
+- Chunk checkpoints: 1-82
+
+Understanding summary:
+- Role: config
+- Main summary: device:
+
+=== REVIEW ENTRY 064 ===
+File: src/config/v3_realtime.yaml
+Lines: 1-96
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=96).
+- Content checksum (sha1-12): 614d85fc59e8
+- Chunk checkpoints: 1-96
+
+Understanding summary:
+- Role: config
+- Main summary: video:
+
+=== REVIEW ENTRY 065 ===
+File: src/geometry/__init__.py
+Lines: 1-1
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1).
+- Content checksum (sha1-12): 6e3f21495ac9
+- Chunk checkpoints: 1-1
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: Geometry utilities (homography, coordinate mapping).
+
+=== REVIEW ENTRY 066 ===
+File: src/geometry/coordinate_mapper.py
+Lines: 1-16
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=16).
+- Content checksum (sha1-12): 5a435b560bda
+- Chunk checkpoints: 1-16
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Coordinate mapping helpers.
+- Classes: CoordinateMapper
+- Major imports: __future__, numpy
+
+=== REVIEW ENTRY 067 ===
+File: src/geometry/homography.py
+Lines: 1-54
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=54).
+- Content checksum (sha1-12): c118ff46eb01
+- Chunk checkpoints: 1-54
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Classes: CourtHomography
+- Major imports: __future__, dataclasses, typing, cv2, numpy
+
+=== REVIEW ENTRY 068 ===
+File: src/geometry/metrics.py
+Lines: 1-19
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=19).
+- Content checksum (sha1-12): bc2ab150cf1f
+- Chunk checkpoints: 1-19
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Geometry-based metrics (distances, angles).
+- Functions: distance, angle
+- Major imports: __future__, numpy
+
+=== REVIEW ENTRY 069 ===
+File: src/geometry/region_definitions.py
+Lines: 1-74
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=74).
+- Content checksum (sha1-12): 36b50c7ae5a4
+- Chunk checkpoints: 1-74
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Classes: CourtRegions, CourtGrid9
+- Major imports: __future__, dataclasses
+
+=== REVIEW ENTRY 070 ===
+File: src/models/__init__.py
+Lines: 1-3
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=3).
+- Content checksum (sha1-12): 37576b7e4409
+- Chunk checkpoints: 1-3
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Model definitions for Badminton AI Coach.
+- Major imports: video_classifier
+
+=== REVIEW ENTRY 071 ===
+File: src/models/video_classifier.py
+Lines: 1-162
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=162).
+- Content checksum (sha1-12): b7ea81098187
+- Chunk checkpoints: 1-162
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _infer_feature_dim, _build_backbone
+- Classes: VideoClassifier
+- Major imports: __future__, typing, torch, torchvision
+
+=== REVIEW ENTRY 072 ===
+File: src/pipeline/__init__.py
+Lines: 1-1
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1).
+- Content checksum (sha1-12): cf88c5b410f1
+- Chunk checkpoints: 1-1
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: Pipelines for full video analysis and reporting.
+
+=== REVIEW ENTRY 073 ===
+File: src/pipeline/action_feedback_pipeline.py
+Lines: 1-126
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=126).
+- Content checksum (sha1-12): dd486bd097e7
+- Chunk checkpoints: 1-126
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: run_action_feedback
+- Major imports: __future__, typing, sys, pathlib, src, yaml
+
+=== REVIEW ENTRY 074 ===
+File: src/pipeline/extract_strokes.py
+Lines: 1-484
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=484).
+- Content checksum (sha1-12): 84435f1cc13c
+- Chunk checkpoints: 1-484
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: build_homography_from_analysis, _frame_idx_of, _player_states_of, _point_to_bbox_distance, _nearest_player_distance, _cluster_contact_candidates, _find_nearest_pose, _build_segment_bounds, _parse_classifier_output, infer_segment_frame_ranges_from_analysis, summarise_strokes_from_analysis, stroke_summaries_to_dicts
+- Classes: StrokeSummary
+- Major imports: __future__, dataclasses, typing, numpy, src
+
+=== REVIEW ENTRY 075 ===
+File: src/pipeline/label_space.py
+Lines: 1-65
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=65).
+- Content checksum (sha1-12): 287171d7da13
+- Chunk checkpoints: 1-65
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _norm_labels, infer_label_space_version, build_label_space_metadata
+- Major imports: __future__, typing
+
+=== REVIEW ENTRY 076 ===
+File: src/pipeline/readme.txt
+Lines: 1-5
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=5).
+- Content checksum (sha1-12): 87573409cb8f
+- Chunk checkpoints: 1-5
+
+Understanding summary:
+- Role: utility/module
+- Main summary: This folder contains the unified pipeline entrypoints:
+
+=== REVIEW ENTRY 077 ===
+File: src/pipeline/render_overlay.py
+Lines: 1-29
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=29).
+- Content checksum (sha1-12): cdfb521d8171
+- Chunk checkpoints: 1-29
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Rendering utilities to overlay detections/metrics on video frames.
+- Functions: render_players, render_ball
+- Major imports: __future__, typing, cv2, numpy
+
+=== REVIEW ENTRY 078 ===
+File: src/pipeline/report_generator.py
+Lines: 1-291
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=291).
+- Content checksum (sha1-12): a156830b5cd2
+- Chunk checkpoints: 1-291
+
+Understanding summary:
+- Role: report/visualization
+- Main summary: from __future__ import annotations
+- Functions: generate_markdown_report, generate_json_report, generate_csv_report, generate_match_report, generate_report
+- Major imports: __future__, csv, json, pathlib, typing, src
+
+=== REVIEW ENTRY 079 ===
+File: src/pipeline/stroke_classifier_runtime.py
+Lines: 1-258
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=258).
+- Content checksum (sha1-12): 03b48d109a0c
+- Chunk checkpoints: 1-258
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _resolve_device
+- Classes: ClassifierPrediction, StrokeClassifierRuntime
+- Major imports: __future__, dataclasses, pathlib, typing, cv2, numpy, torch, src
+
+=== REVIEW ENTRY 080 ===
+File: src/server/__init__.py
+Lines: 1-2
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=2).
+- Content checksum (sha1-12): dbfbeeb7f0e3
+- Chunk checkpoints: 1-2
+
+Understanding summary:
+- Role: api/service
+- Main summary: HTTP API server package for iOS/web integration.
+
+=== REVIEW ENTRY 081 ===
+File: src/server/analysis_api.py
+Lines: 1-370
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=370).
+- Content checksum (sha1-12): 7a25ca229708
+- Chunk checkpoints: 1-370
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: from __future__ import annotations
+- Functions: _json_response, _load_request_json, _resolve_video_path, _choose_config_path, _simple_summary, build_handler, run_server, parse_args, main
+- Classes: JobState, AnalysisAPIServer
+- Major imports: __future__, argparse, json, threading, traceback, uuid, dataclasses, http, pathlib, typing, yaml, src
+
+=== REVIEW ENTRY 082 ===
+File: src/spatial_logic/__init__.py
+Lines: 1-1
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1).
+- Content checksum (sha1-12): bfdb49648904
+- Chunk checkpoints: 1-1
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Spatial reasoning utilities.
+
+=== REVIEW ENTRY 083 ===
+File: src/spatial_logic/events.py
+Lines: 1-59
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=59).
+- Content checksum (sha1-12): c5b192847278
+- Chunk checkpoints: 1-59
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: infer_event_from_trajectory
+- Classes: StrokeEvent
+- Major imports: __future__, dataclasses, typing, landing_detector
+
+=== REVIEW ENTRY 084 ===
+File: src/spatial_logic/hitter_detector.py
+Lines: 1-57
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=57).
+- Content checksum (sha1-12): 4eccc6b55c5d
+- Chunk checkpoints: 1-57
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _bbox_center, _point_to_bbox_distance, infer_hitter_for_stroke
+- Classes: HitterInfo
+- Major imports: __future__, dataclasses, typing, numpy, src
+
+=== REVIEW ENTRY 085 ===
+File: src/spatial_logic/landing_detector.py
+Lines: 1-283
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=283).
+- Content checksum (sha1-12): 68de88913d9d
+- Chunk checkpoints: 1-283
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: _get_ball_from_frame, _get_ball_center, extract_ball_track, smooth_track, detect_landing_point, infer_landing
+- Classes: BallState, LandingPoint, HomographyMapper, RegionClassifier
+- Major imports: __future__, dataclasses, typing, numpy
+
+=== REVIEW ENTRY 086 ===
+File: src/spatial_logic/pose_features.py
+Lines: 1-100
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=100).
+- Content checksum (sha1-12): 1fdd7e9967cb
+- Chunk checkpoints: 1-100
+
+Understanding summary:
+- Role: pose
+- Main summary: from __future__ import annotations
+- Functions: _to_np, _get_pt, _angle, _angle_with_vertical, extract_pose_features
+- Major imports: __future__, typing, numpy
+
+=== REVIEW ENTRY 087 ===
+File: src/spatial_logic/pose_quality.py
+Lines: 1-36
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=36).
+- Content checksum (sha1-12): 233d001d903f
+- Chunk checkpoints: 1-36
+
+Understanding summary:
+- Role: pose
+- Main summary: from __future__ import annotations
+- Functions: pose_features_to_prompt
+- Major imports: __future__, typing, pose_features
+
+=== REVIEW ENTRY 088 ===
+File: src/spatial_logic/region_logic.py
+Lines: 1-9
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=9).
+- Content checksum (sha1-12): 39ee7d1f4f9b
+- Chunk checkpoints: 1-9
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: Region logic for court zones.
+- Functions: court_zone
+- Major imports: __future__, src
+
+=== REVIEW ENTRY 089 ===
+File: src/spatial_logic/relations.py
+Lines: 1-11
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=11).
+- Content checksum (sha1-12): 957e889aa8a4
+- Chunk checkpoints: 1-11
+
+Understanding summary:
+- Role: tracking
+- Main summary: Spatial relations between tracked entities.
+- Functions: relative_left_right
+- Major imports: __future__
+
+=== REVIEW ENTRY 090 ===
+File: src/spatial_logic/stroke_reasoner.py
+Lines: 1-81
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=81).
+- Content checksum (sha1-12): 336985db1a53
+- Chunk checkpoints: 1-81
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: combine_classifier_and_event
+- Classes: FinalStroke
+- Major imports: __future__, dataclasses, typing, events
+
+=== REVIEW ENTRY 091 ===
+File: src/spatial_logic/temporal_logic.py
+Lines: 1-26
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=26).
+- Content checksum (sha1-12): c20483e78196
+- Chunk checkpoints: 1-26
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Temporal reasoning utilities.
+- Functions: smooth_events, slice_segments
+- Major imports: __future__, typing
+
+=== REVIEW ENTRY 092 ===
+File: src/tracking/__init__.py
+Lines: 1-1
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1).
+- Content checksum (sha1-12): cc6fa6c1510a
+- Chunk checkpoints: 1-1
+
+Understanding summary:
+- Role: tracking
+- Main summary: Tracking subpackage.
+
+=== REVIEW ENTRY 093 ===
+File: src/tracking/ball_track.py
+Lines: 1-108
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=108).
+- Content checksum (sha1-12): 8a264660e143
+- Chunk checkpoints: 1-108
+
+Understanding summary:
+- Role: tracking
+- Main summary: from __future__ import annotations
+- Classes: BallTrackState, SingleBallTracker
+- Major imports: __future__, dataclasses, typing, numpy, src, utils
+
+=== REVIEW ENTRY 094 ===
+File: src/tracking/bytetrack.py
+Lines: 1-131
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=131).
+- Content checksum (sha1-12): 9d0381624a1f
+- Chunk checkpoints: 1-131
+
+Understanding summary:
+- Role: tracking
+- Main summary: from __future__ import annotations
+- Classes: Track, SimpleByteTrack
+- Major imports: __future__, dataclasses, typing, numpy, src, utils
+
+=== REVIEW ENTRY 095 ===
+File: src/tracking/id_assign.py
+Lines: 1-34
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=34).
+- Content checksum (sha1-12): 9b40dd117b70
+- Chunk checkpoints: 1-34
+
+Understanding summary:
+- Role: tracking
+- Main summary: from __future__ import annotations
+- Functions: assign_player_roles
+- Major imports: __future__, typing, numpy, bytetrack
+
+=== REVIEW ENTRY 096 ===
+File: src/tracking/player_track.py
+Lines: 1-135
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=135).
+- Content checksum (sha1-12): 9602c4105f1f
+- Chunk checkpoints: 1-135
+
+Understanding summary:
+- Role: tracking
+- Main summary: from __future__ import annotations
+- Classes: PlayerState, PlayerTracker
+- Major imports: __future__, dataclasses, typing, numpy, utils
+
+=== REVIEW ENTRY 097 ===
+File: src/tracking/utils.py
+Lines: 1-28
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=28).
+- Content checksum (sha1-12): 51b8e0ebdd71
+- Chunk checkpoints: 1-28
+
+Understanding summary:
+- Role: tracking
+- Main summary: from __future__ import annotations
+- Functions: iou_xyxy
+- Major imports: __future__, numpy
+
+=== REVIEW ENTRY 098 ===
+File: src/training/eval.py
+Lines: 1-174
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=174).
+- Content checksum (sha1-12): dd74fd3635b2
+- Chunk checkpoints: 1-174
+
+Understanding summary:
+- Role: training/eval
+- Main summary: from __future__ import annotations
+- Functions: evaluate_model, run_eval
+- Major imports: __future__, pathlib, typing, matplotlib, numpy, pandas, torch, src
+
+=== REVIEW ENTRY 099 ===
+File: src/training/train.py
+Lines: 1-360
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=360).
+- Content checksum (sha1-12): 6a47cd269add
+- Chunk checkpoints: 1-360
+
+Understanding summary:
+- Role: training/eval
+- Main summary: from __future__ import annotations
+- Functions: load_config, build_dataloaders, _validate, _build_scheduler, train, _parse_args, main
+- Major imports: __future__, argparse, pathlib, typing, torch, yaml, tqdm, src
+
+=== REVIEW ENTRY 100 ===
+File: src/training/utils.py
+Lines: 1-84
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=84).
+- Content checksum (sha1-12): 8564ba7a0f96
+- Chunk checkpoints: 1-84
+
+Understanding summary:
+- Role: training/eval
+- Main summary: from __future__ import annotations
+- Functions: set_seed, set_num_threads, accuracy, save_checkpoint, load_checkpoint, get_device, move_to_device
+- Major imports: __future__, random, pathlib, typing, numpy, torch
+
+=== REVIEW ENTRY 101 ===
+File: src/vision/__init__.py
+Lines: 1-1
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1).
+- Content checksum (sha1-12): 147c01ac19d5
+- Chunk checkpoints: 1-1
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: Vision subpackage (detection, pose, court).
+
+=== REVIEW ENTRY 102 ===
+File: src/vision/ball_detector.py
+Lines: 1-256
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=256).
+- Content checksum (sha1-12): b61e81f46f52
+- Chunk checkpoints: 1-256
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Classes: BallDetector
+- Major imports: __future__, typing, cv2, numpy, detectors
+
+=== REVIEW ENTRY 103 ===
+File: src/vision/court_detector.py
+Lines: 1-882
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=882).
+- Content checksum (sha1-12): 4b65cd3b5e47
+- Chunk checkpoints: 1-500, 501-882
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Classes: CourtLines, CourtDetector
+- Major imports: __future__, dataclasses, typing, cv2, numpy
+
+=== REVIEW ENTRY 104 ===
+File: src/vision/court_detector_farin2005.py
+Lines: 1-862
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=862).
+- Content checksum (sha1-12): b8269d9615f4
+- Chunk checkpoints: 1-500, 501-862
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Classes: _LineModel, _CourtCandidate, CourtDetectorFarin2005
+- Major imports: __future__, dataclasses, typing, cv2, numpy, src
+
+=== REVIEW ENTRY 105 ===
+File: src/vision/court_env_profile.py
+Lines: 1-111
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=111).
+- Content checksum (sha1-12): 59d7fc9396f9
+- Chunk checkpoints: 1-111
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Functions: _normalize_env_mapping, parse_env_file, _resolve_profile_path, resolve_court_env_overrides, apply_court_env_overrides, resolve_and_apply_court_env_overrides, resolve_local_path_from_url_or_path
+- Major imports: __future__, os, pathlib, typing, urllib
+
+=== REVIEW ENTRY 106 ===
+File: src/vision/court_fit_homography_副本.py
+Lines: 1-10031
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=10031).
+- Content checksum (sha1-12): 84d338c38e0e
+- Chunk checkpoints: 1-500, 501-1000, 1001-1500, 1501-2000, 2001-2500, 2501-3000, 3001-3500, 3501-4000 ...
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Functions: get_canonical_points_norm, _env_int, _env_float, _env_str, _env_flag, _model_role_weight_params, _apply_model_role_weights, _seg_len_px, _filter_segments_minlen, _filter_segments_minlen_with_boundary_rescue, _order_corners_lb_rb_rt_lt, _quad_span_ok, _quad_area, _quad_edges, _edge_vp_angle, _aspect_penalty, _vanishing_point_penalty, _out_of_floor_penalty, _bottom_support_from_loss, _position_penalty ...
+- Classes: FitMetrics, CourtFitResult, LineSeg, RansacLineSeg
+- Major imports: __future__, dataclasses, json, math, os, typing, cv2, numpy, src
+
+=== REVIEW ENTRY 107 ===
+File: src/vision/court_match_farin2005.py
+Lines: 1-1054
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=1054).
+- Content checksum (sha1-12): d504ff607afc
+- Chunk checkpoints: 1-500, 501-1000, 1001-1054
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Functions: _P, badminton_model_segments_m, model_corners_m, model_aspect_ratio_m, _is_close, _outer_boundary_indices, _quad_edge_ar_lb_rb_rt_lt, _quad_oob_too_far, _line_from_points, _angle_mod_pi, _angle_diff, _project_points, _poly_area, _extent_and_ar, compute_dt_to_lines, _order_corners_lb_rb_rt_lt, _is_convex_quad, _intersect_lines, _line_tuple, dt_error_E ...
+- Classes: LineSeg, MatchResult
+- Major imports: __future__, dataclasses, typing, itertools, math, os, numpy, cv2
+
+=== REVIEW ENTRY 108 ===
+File: src/vision/court_model_bwf.py
+Lines: 1-98
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=98).
+- Content checksum (sha1-12): 909bf615cc3c
+- Chunk checkpoints: 1-98
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: from __future__ import annotations
+- Functions: get_bwf_corners, get_bwf_lines, _sample_segment, sample_model_points
+- Classes: CourtLine
+- Major imports: __future__, dataclasses, typing, numpy
+
+=== REVIEW ENTRY 109 ===
+File: src/vision/detectors.py
+Lines: 1-147
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=147).
+- Content checksum (sha1-12): d2d613235a74
+- Chunk checkpoints: 1-147
+
+Understanding summary:
+- Role: utility/module
+- Main summary: from __future__ import annotations
+- Functions: filter_by_class_name
+- Classes: Detection, YoloDetector, PlayerDetector
+- Major imports: __future__, dataclasses, pathlib, typing, numpy
+
+=== REVIEW ENTRY 110 ===
+File: src/vision/pose_estimator.py
+Lines: 1-57
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=57).
+- Content checksum (sha1-12): 616df1dff4c0
+- Chunk checkpoints: 1-57
+
+Understanding summary:
+- Role: pose
+- Main summary: from __future__ import annotations
+- Classes: PoseKeypoints, PoseEstimator
+- Major imports: __future__, dataclasses, typing, numpy
+
+=== REVIEW ENTRY 111 ===
+File: src/vision/utils.py
+Lines: 1-15
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=15).
+- Content checksum (sha1-12): 473bb43d2449
+- Chunk checkpoints: 1-15
+
+Understanding summary:
+- Role: utility/module
+- Main summary: Utility helpers for vision preprocessing/postprocessing.
+- Functions: letterbox, nms
+- Major imports: __future__, numpy
+
+=== REVIEW ENTRY 112 ===
+File: tests/assets/court_fail_cases.json
+Lines: 1-9
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=9).
+- Content checksum (sha1-12): e7c6f489429b
+- Chunk checkpoints: 1-9
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: {
+
+=== REVIEW ENTRY 113 ===
+File: tests/assets/sample_report.json
+Lines: 1-26
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=26).
+- Content checksum (sha1-12): ae7d916d6f5f
+- Chunk checkpoints: 1-26
+
+Understanding summary:
+- Role: report/visualization
+- Main summary: {
+
+=== REVIEW ENTRY 114 ===
+File: tests/test_analysis_api_utils.py
+Lines: 1-40
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=40).
+- Content checksum (sha1-12): e080cba7482a
+- Chunk checkpoints: 1-40
+
+Understanding summary:
+- Role: analysis pipeline
+- Main summary: import unittest
+- Classes: AnalysisAPIUtilsTests
+- Major imports: unittest, pathlib, src
+
+=== REVIEW ENTRY 115 ===
+File: tests/test_court_env_profile.py
+Lines: 1-71
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=71).
+- Content checksum (sha1-12): abb5b75ec82f
+- Chunk checkpoints: 1-71
+
+Understanding summary:
+- Role: court detection/homography
+- Main summary: import os
+- Classes: CourtEnvProfileTests
+- Major imports: os, tempfile, unittest, pathlib, src
+
+=== REVIEW ENTRY 116 ===
+File: tests/test_extract_strokes_classifier_gate.py
+Lines: 1-59
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=59).
+- Content checksum (sha1-12): d732ad8ff5ae
+- Chunk checkpoints: 1-59
+
+Understanding summary:
+- Role: test
+- Main summary: import unittest
+- Classes: _FakeBall, _FakeFrame, ExtractStrokesClassifierGateTests
+- Major imports: unittest, src
+
+=== REVIEW ENTRY 117 ===
+File: tests/test_label_space.py
+Lines: 1-34
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=34).
+- Content checksum (sha1-12): af44c92837bc
+- Chunk checkpoints: 1-34
+
+Understanding summary:
+- Role: test
+- Main summary: import unittest
+- Classes: LabelSpaceTests
+- Major imports: unittest, src
+
+=== REVIEW ENTRY 118 ===
+File: tests/test_scoring_engine.py
+Lines: 1-37
+Status: REVIEWED
+Date: 2026-02-20
+
+Strict scan evidence:
+- Line-by-line iteration completed for entire file (total lines=37).
+- Content checksum (sha1-12): 2f9f771db9bb
+- Chunk checkpoints: 1-37
+
+Understanding summary:
+- Role: test
+- Main summary: import unittest
+- Classes: ScoringEngineTests
+- Major imports: unittest, src
+
+
+Completion checkpoint:
+- All target files were iterated line-by-line and logged.
+
+Audit note:
+- Entry count=118, unique file count=118, reviewed markers=118.
