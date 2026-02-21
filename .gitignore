@@ -216,9 +216,16 @@ runs/
 reports/
 outputs/_tmp*/
 outputs/_tmp_*/
-archive/**/*.mp4
-archive/**/*.mov
-archive/**/*.mkv
+archive/
+data/distill/
+data/mlx_train/
+outputs/lora_adapters_*/
+image.png
+image-1.png
+image-2.png
+image-3.png
+src/vision/*副本*.py
+src/vision/*历史*.zip
 
 # Model weights - too large for GitHub
 *.pt
