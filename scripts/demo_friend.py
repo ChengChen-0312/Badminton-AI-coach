@@ -15,8 +15,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-import importlib
-import inspect
 
 import cv2
 import numpy as np
@@ -27,14 +25,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Debug: show where we are importing court_fit_homography from.
-print("[PY] CWD:", os.getcwd())
-print("[PY] sys.path[0:5]:", sys.path[:5])
-try:
-    _cfh = importlib.import_module("src.vision.court_fit_homography")
-    print("[PY] court_fit_homography loaded from:", inspect.getfile(_cfh))
-except Exception as _e:
-    print("[PY] failed to import src.vision.court_fit_homography:", _e)
+if str(os.environ.get("BADMINTON_DEBUG_IMPORTS", "0")).strip() in {"1", "true", "TRUE"}:
+    # Optional import-path debug for environment diagnostics.
+    import importlib
+    import inspect
+
+    print("[PY] CWD:", os.getcwd())
+    print("[PY] sys.path[0:5]:", sys.path[:5])
+    try:
+        _cfh = importlib.import_module("src.vision.court_fit_homography")
+        print("[PY] court_fit_homography loaded from:", inspect.getfile(_cfh))
+    except Exception as _e:
+        print("[PY] failed to import src.vision.court_fit_homography:", _e)
 
 DEFAULT_DEMO_VIDEO = REPO_ROOT / "archive" / "demo.mp4"
 
