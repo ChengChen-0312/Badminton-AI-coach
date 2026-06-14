@@ -818,6 +818,12 @@ def main() -> None:
             sample_frame_indices = None
             sample_frame_count = None
             fallback_used = None
+            fit_reason = None
+            profile_retry_used = None
+            profile_retry_path = None
+            final_reject_min_conf = None
+            final_reject_min_score = None
+            fit_backend = None
             if isinstance(det, dict):
                 source = det.get("source")
                 confidence = det.get("confidence")
@@ -829,6 +835,12 @@ def main() -> None:
                 sample_frame_indices = det.get("sample_frame_indices")
                 sample_frame_count = det.get("sample_frame_count")
                 fallback_used = det.get("fallback_used")
+                fit_reason = det.get("fit_reason")
+                profile_retry_used = det.get("profile_retry_used")
+                profile_retry_path = det.get("profile_retry_path")
+                final_reject_min_conf = det.get("final_reject_min_conf")
+                final_reject_min_score = det.get("final_reject_min_score")
+                fit_backend = det.get("fit_backend")
             if source not in ("manual", "auto", "auto_failed"):
                 source = "auto" if corners is not None else "auto_failed"
             report_data["court_detection"] = {
@@ -836,12 +848,18 @@ def main() -> None:
                 "corners": corners,
                 "confidence": confidence,
                 "reason": reason,
+                "fit_reason": fit_reason,
+                "fit_backend": fit_backend,
                 "frame_idx": frame_idx,
                 "detect_mode": detect_mode,
                 "lock_enabled": lock_enabled,
                 "sample_frame_indices": sample_frame_indices,
                 "sample_frame_count": sample_frame_count,
                 "fallback_used": fallback_used,
+                "profile_retry_used": profile_retry_used,
+                "profile_retry_path": profile_retry_path,
+                "final_reject_min_conf": final_reject_min_conf,
+                "final_reject_min_score": final_reject_min_score,
                 "last_metrics": last_metrics,
             }
             report_data["stroke_classifier"] = {

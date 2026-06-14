@@ -1,0 +1,423 @@
+[
+  {
+    "backend": "modern",
+    "reason": "OK",
+    "confidence": 0.6707123996669982,
+    "candidate_score": 192.2828023844037,
+    "corners": [
+      [
+        413.505859375,
+        1020.22900390625
+      ],
+      [
+        1410.248779296875,
+        992.72119140625
+      ],
+      [
+        1236.38916015625,
+        554.2169189453125
+      ],
+      [
+        625.4972534179688,
+        560.5537719726562
+      ]
+    ],
+    "p90_dist_px": 23.875045776367188,
+    "mean_dist_px": 7.310068607330322,
+    "cost_total": 30.789407482470402,
+    "area_ratio": 0.2261654301700008,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": {
+      "enabled": true,
+      "applied": true,
+      "warp_ppm": 120.0,
+      "initial_score": 3.4917915401728004,
+      "final_score": 5.019114820418641,
+      "improved": true,
+      "ysnap_a": 0.96,
+      "ysnap_b_m": 0.35,
+      "min_gain": 0.04,
+      "hard_enable": true,
+      "hard_require_pair": true,
+      "hard_require_pair_conditional": true,
+      "hard_require_dls_support": false,
+      "hard_reject_near_lower_stronger": true,
+      "hard_require_far_pair": false,
+      "hard_require_far_baseline_support": true,
+      "hard_require_far_baseline_anchor": true,
+      "hard_require_far_conditional": true,
+      "hard_pass": true,
+      "hard_reason": null,
+      "hard_rescue_used": false,
+      "hard_rescue_reason": null,
+      "hard_min_baseline_support": 0.025,
+      "hard_min_dls_support": 0.012,
+      "hard_min_far_baseline_support": 0.01,
+      "hard_pair_min_dls_support": 0.015,
+      "hard_far_gap_min_dls_support": 0.015,
+      "hard_max_gap_err_m": 0.4,
+      "hard_max_far_gap_err_m": 0.4,
+      "hard_max_far_baseline_y_m": 0.55,
+      "hard_max_far_dls_y_m": 1.45,
+      "support_near_baseline": 0.29489007592201233,
+      "support_near_dls": 0.016178067318132466,
+      "near_observable": true,
+      "near_peak": 0.29489007592201233,
+      "support_far_baseline": 0.0981270358306189,
+      "support_far_dls": 0.09261672095548316,
+      "near_pair_found": true,
+      "near_pair_soft_fallback": true,
+      "near_pair_gap_m": 0.7583333333333333,
+      "near_pair_gap_err_m": 0.0016666666666667052,
+      "near_pair_baseline_y_m": 13.391666666666667,
+      "near_pair_dls_y_m": 12.633333333333333,
+      "near_lower_stronger": false,
+      "near_lower_stronger_margin": 0.0,
+      "far_pair_found": true,
+      "far_pair_gap_m": 0.65,
+      "far_pair_gap_err_m": 0.10999999999999999,
+      "far_pair_baseline_y_m": 0.08333333333333333,
+      "far_pair_dls_y_m": 0.7333333333333333,
+      "far_observable": true,
+      "far_peak": 0.13862735033035278
+    },
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": 5.019114820418641,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 35,
+    "strict_machine_good": false,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_lift_040/forehand_lift_040_rank01_f035_modern_debug.jpg"
+  },
+  {
+    "backend": "modern",
+    "reason": "OK",
+    "confidence": 0.5831649286100641,
+    "candidate_score": 141.64162073832674,
+    "corners": [
+      [
+        495.99908447265625,
+        1028.771728515625
+      ],
+      [
+        1414.435302734375,
+        1006.1382446289062
+      ],
+      [
+        1291.223388671875,
+        692.2302856445312
+      ],
+      [
+        626.2765502929688,
+        692.3964233398438
+      ]
+    ],
+    "p90_dist_px": 34.38006591796875,
+    "mean_dist_px": 7.470127582550049,
+    "cost_total": 41.46979312027805,
+    "area_ratio": 0.30659733829548236,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": {
+      "enabled": true,
+      "applied": true,
+      "warp_ppm": 120.0,
+      "initial_score": 6.849416293728984,
+      "final_score": 8.455740192984226,
+      "improved": true,
+      "ysnap_a": 1.04,
+      "ysnap_b_m": 0.25,
+      "min_gain": 0.04,
+      "hard_enable": true,
+      "hard_require_pair": true,
+      "hard_require_pair_conditional": true,
+      "hard_require_dls_support": false,
+      "hard_reject_near_lower_stronger": true,
+      "hard_require_far_pair": false,
+      "hard_require_far_baseline_support": true,
+      "hard_require_far_baseline_anchor": true,
+      "hard_require_far_conditional": true,
+      "hard_pass": true,
+      "hard_reason": null,
+      "hard_rescue_used": false,
+      "hard_rescue_reason": null,
+      "hard_min_baseline_support": 0.025,
+      "hard_min_dls_support": 0.012,
+      "hard_min_far_baseline_support": 0.01,
+      "hard_pair_min_dls_support": 0.015,
+      "hard_far_gap_min_dls_support": 0.015,
+      "hard_max_gap_err_m": 0.4,
+      "hard_max_far_gap_err_m": 0.4,
+      "hard_max_far_baseline_y_m": 0.55,
+      "hard_max_far_dls_y_m": 1.45,
+      "support_near_baseline": 0.9049521684646606,
+      "support_near_dls": 0.7523344191096634,
+      "near_observable": true,
+      "near_peak": 0.9049521684646606,
+      "support_far_baseline": 0.05415309446254072,
+      "support_far_dls": 0.009771986970684038,
+      "near_pair_found": true,
+      "near_pair_soft_fallback": true,
+      "near_pair_gap_m": 0.7583333333333333,
+      "near_pair_gap_err_m": 0.0016666666666667052,
+      "near_pair_baseline_y_m": 12.65,
+      "near_pair_dls_y_m": 11.891666666666667,
+      "near_lower_stronger": false,
+      "near_lower_stronger_margin": 0.0,
+      "far_pair_found": true,
+      "far_pair_gap_m": 0.8166666666666667,
+      "far_pair_gap_err_m": 0.05666666666666664,
+      "far_pair_baseline_y_m": 0.44166666666666665,
+      "far_pair_dls_y_m": 1.2583333333333333,
+      "far_observable": true,
+      "far_peak": 0.1793503314256668
+    },
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": 8.455740192984226,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 15,
+    "strict_machine_good": false,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_lift_040/forehand_lift_040_rank02_f015_modern_debug.jpg"
+  },
+  {
+    "backend": "legacy",
+    "reason": "R_fit_poor",
+    "confidence": 0.20954866758592303,
+    "candidate_score": -49.47658756551991,
+    "corners": [
+      [
+        404.5826416015625,
+        1038.581787109375
+      ],
+      [
+        417.83026123046875,
+        1006.82958984375
+      ],
+      [
+        461.6271667480469,
+        929.534912109375
+      ],
+      [
+        450.6273193359375,
+        956.5341186523438
+      ]
+    ],
+    "p90_dist_px": 4.107879638671875,
+    "mean_dist_px": 1.167204737663269,
+    "cost_total": 32.88374203639615,
+    "area_ratio": 0.00033790608299009376,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 50,
+    "strict_machine_good": false,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_lift_040/forehand_lift_040_rank03_f050_legacy_debug.jpg"
+  },
+  {
+    "backend": "modern",
+    "reason": "R_fit_poor",
+    "confidence": 0.2046015717394313,
+    "candidate_score": -50.066666808528915,
+    "corners": [
+      [
+        404.5826416015625,
+        1038.581787109375
+      ],
+      [
+        418.7803039550781,
+        1009.1188354492188
+      ],
+      [
+        462.2159729003906,
+        930.7205810546875
+      ],
+      [
+        450.26507568359375,
+        955.7651977539062
+      ]
+    ],
+    "p90_dist_px": 4.648590087890625,
+    "mean_dist_px": 1.2165660858154297,
+    "cost_total": 33.01529674840892,
+    "area_ratio": 0.00015336507302028546,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 55,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_fit_poor",
+    "confidence": 0.20047517570174295,
+    "candidate_score": -50.80119534894236,
+    "corners": [
+      [
+        404.5826416015625,
+        1038.581787109375
+      ],
+      [
+        419.8240966796875,
+        1011.634033203125
+      ],
+      [
+        463.0966796875,
+        932.4939575195312
+      ],
+      [
+        450.1024169921875,
+        955.4198608398438
+      ]
+    ],
+    "p90_dist_px": 4.7750091552734375,
+    "mean_dist_px": 1.4930909872055054,
+    "cost_total": 33.67986070425083,
+    "area_ratio": 3.6859172429663234e-05,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 50,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "legacy",
+    "reason": "R_fit_poor",
+    "confidence": 0.10161128318234447,
+    "candidate_score": -61.84942707684551,
+    "corners": [
+      [
+        404.65069580078125,
+        1038.615966796875
+      ],
+      [
+        430.406494140625,
+        1037.00390625
+      ],
+      [
+        467.073974609375,
+        940.4107055664062
+      ],
+      [
+        443.9385070800781,
+        942.237548828125
+      ]
+    ],
+    "p90_dist_px": 9.585052490234375,
+    "mean_dist_px": 3.0449938774108887,
+    "cost_total": 37.200046107632915,
+    "area_ratio": 0.002191149762014567,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 55,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_fit_poor",
+    "confidence": 0.0005765946857823386,
+    "candidate_score": -99.8297024708823,
+    "corners": [
+      [
+        404.5826416015625,
+        1038.581787109375
+      ],
+      [
+        488.9397277832031,
+        1038.1199951171875
+      ],
+      [
+        498.8959045410156,
+        1004.7286376953125
+      ],
+      [
+        416.9175720214844,
+        1004.6303100585938
+      ]
+    ],
+    "p90_dist_px": 16.108612060546875,
+    "mean_dist_px": 6.729669570922852,
+    "cost_total": 56.83442766682789,
+    "area_ratio": 0.0026736373234549317,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 40,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_fit_poor",
+    "confidence": 0.0006932754044050962,
+    "candidate_score": -100.23521254853182,
+    "corners": [
+      [
+        406.9662170410156,
+        1033.0908203125
+      ],
+      [
+        489.87066650390625,
+        1033.5391845703125
+      ],
+      [
+        497.9544372558594,
+        1005.6671752929688
+      ],
+      [
+        416.2705383300781,
+        1006.8695068359375
+      ]
+    ],
+    "p90_dist_px": 15.85577392578125,
+    "mean_dist_px": 6.896780014038086,
+    "cost_total": 57.16015479826259,
+    "area_ratio": 0.002123456520207564,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_lift_040",
+    "video": "archive/forehand_lift/040.mp4",
+    "frame_idx": 25,
+    "strict_machine_good": false
+  }
+]

@@ -1,0 +1,341 @@
+[
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.9868421052631579,
+    "candidate_score": 290.3572763882648,
+    "corners": [
+      [
+        446.7103271484375,
+        999.9631958007812
+      ],
+      [
+        1489.2613525390625,
+        997.9879150390625
+      ],
+      [
+        1313.422607421875,
+        469.8525695800781
+      ],
+      [
+        628.998291015625,
+        467.4710998535156
+      ]
+    ],
+    "p90_dist_px": 0.9550018310546875,
+    "mean_dist_px": 0.46321117877960205,
+    "cost_total": 1.2308958354749198,
+    "area_ratio": 0.535362940609693,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 70,
+    "strict_machine_good": true,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_drive_060/forehand_drive_060_rank01_f070_legacy_debug.jpg"
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.9826869806094183,
+    "candidate_score": 289.3661313625623,
+    "corners": [
+      [
+        442.9937744140625,
+        999.93017578125
+      ],
+      [
+        1489.983154296875,
+        996.9247436523438
+      ],
+      [
+        1314.2303466796875,
+        469.7685546875
+      ],
+      [
+        630.4749145507812,
+        467.4898376464844
+      ]
+    ],
+    "p90_dist_px": 0.9550018310546875,
+    "mean_dist_px": 0.4503830373287201,
+    "cost_total": 1.4386520681618984,
+    "area_ratio": 0.5860398139339036,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 5,
+    "strict_machine_good": true,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_drive_060/forehand_drive_060_rank02_f005_legacy_debug.jpg"
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.9833795013850416,
+    "candidate_score": 286.94318508013595,
+    "corners": [
+      [
+        444.27532958984375,
+        999.9212036132812
+      ],
+      [
+        1489.7620849609375,
+        998.4507446289062
+      ],
+      [
+        1313.6444091796875,
+        469.7845153808594
+      ],
+      [
+        631.35498046875,
+        467.48089599609375
+      ]
+    ],
+    "p90_dist_px": 0.9550018310546875,
+    "mean_dist_px": 0.4242027997970581,
+    "cost_total": 1.4040260293807325,
+    "area_ratio": 0.5334787483786614,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 0,
+    "strict_machine_good": true,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_drive_060/forehand_drive_060_rank03_f000_legacy_debug.jpg"
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.8355263157894737,
+    "candidate_score": 277.229117955168,
+    "corners": [
+      [
+        444.36944580078125,
+        1000.798583984375
+      ],
+      [
+        1489.576416015625,
+        996.8364868164062
+      ],
+      [
+        1320.88134765625,
+        489.3541259765625
+      ],
+      [
+        623.5376586914062,
+        488.014892578125
+      ]
+    ],
+    "p90_dist_px": 12.415023803710938,
+    "mean_dist_px": 2.4269518852233887,
+    "cost_total": 15.672698492752879,
+    "area_ratio": 0.5196259439900696,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 45,
+    "strict_machine_good": true
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.8358725761772853,
+    "candidate_score": 275.36183715893924,
+    "corners": [
+      [
+        443.36505126953125,
+        1000.08447265625
+      ],
+      [
+        1485.7041015625,
+        998.1665649414062
+      ],
+      [
+        1323.532470703125,
+        489.3571472167969
+      ],
+      [
+        623.5686645507812,
+        488.0505065917969
+      ]
+    ],
+    "p90_dist_px": 13.370025634765625,
+    "mean_dist_px": 2.5754380226135254,
+    "cost_total": 16.22838657199511,
+    "area_ratio": 0.5198508558539429,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 50,
+    "strict_machine_good": true
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.8254847645429363,
+    "candidate_score": 272.4325460152677,
+    "corners": [
+      [
+        451.7835388183594,
+        993.646240234375
+      ],
+      [
+        1491.5909423828125,
+        1001.7542724609375
+      ],
+      [
+        1320.710693359375,
+        489.222900390625
+      ],
+      [
+        621.4273681640625,
+        488.0577087402344
+      ]
+    ],
+    "p90_dist_px": 15.280029296875,
+    "mean_dist_px": 2.6433401107788086,
+    "cost_total": 17.893779350978186,
+    "area_ratio": 0.5178924487423364,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 20,
+    "strict_machine_good": true
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.8310249307479224,
+    "candidate_score": 269.03678680694946,
+    "corners": [
+      [
+        443.666748046875,
+        1000.4032592773438
+      ],
+      [
+        1486.3133544921875,
+        996.8257446289062
+      ],
+      [
+        1322.7034912109375,
+        489.238525390625
+      ],
+      [
+        623.8563232421875,
+        488.0143737792969
+      ]
+    ],
+    "p90_dist_px": 16.235031127929688,
+    "mean_dist_px": 2.5560152530670166,
+    "cost_total": 18.189772139361693,
+    "area_ratio": 0.5191598180758163,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 25,
+    "strict_machine_good": true
+  },
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.8331024930747922,
+    "candidate_score": 268.01349681078455,
+    "corners": [
+      [
+        444.2208251953125,
+        1000.2716674804688
+      ],
+      [
+        1489.0052490234375,
+        997.013916015625
+      ],
+      [
+        1319.8765869140625,
+        489.3238525390625
+      ],
+      [
+        624.1209106445312,
+        488.03656005859375
+      ]
+    ],
+    "p90_dist_px": 14.787762641906738,
+    "mean_dist_px": 2.4501898288726807,
+    "cost_total": 17.21753293140443,
+    "area_ratio": 0.5188547996421885,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_drive_060",
+    "video": "archive/forehand_drive/060.mp4",
+    "frame_idx": 60,
+    "strict_machine_good": true
+  }
+]

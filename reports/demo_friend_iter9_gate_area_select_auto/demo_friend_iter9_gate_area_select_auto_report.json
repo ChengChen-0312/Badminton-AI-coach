@@ -1,0 +1,947 @@
+{
+  "strokes": [
+    {
+      "frame_range": [
+        8,
+        55
+      ],
+      "final_type": "forehand_lift",
+      "confidence": 0.65,
+      "hitter_role": "near",
+      "hitter_x": 3.0629444122314453,
+      "hitter_y": 4.5194292068481445,
+      "landing_region": "mid_front",
+      "landing_x": 3.8676271438598633,
+      "landing_y": 3.0387306213378906,
+      "contact_x": 871.1195520000001,
+      "contact_y": 582.2026559999999,
+      "landing_frame": 55,
+      "contact_frame": 8,
+      "landing_predicted": true,
+      "contact_region": "mid_mid",
+      "classifier_label": "forehand_lift",
+      "classifier_confidence": 0.6442793011665344,
+      "classifier_topk": [
+        {
+          "label": "forehand_lift",
+          "confidence": 0.6442793011665344
+        },
+        {
+          "label": "forehand_drive",
+          "confidence": 0.34288647770881653
+        },
+        {
+          "label": "backhand_net_shot",
+          "confidence": 0.008876489475369453
+        }
+      ],
+      "classifier_rejected_low_conf": false,
+      "event_type": "net_shot",
+      "hitter_track_id": 2,
+      "hitter_distance": 0.0,
+      "pose_landmarks": null,
+      "pose_features": null
+    },
+    {
+      "frame_range": [
+        55,
+        64
+      ],
+      "final_type": "forehand_lift",
+      "confidence": 0.65,
+      "hitter_role": "near",
+      "hitter_x": 2.415658473968506,
+      "hitter_y": 1.9110643863677979,
+      "landing_region": "out",
+      "landing_x": -3.808973550796509,
+      "landing_y": -22.324886322021484,
+      "contact_x": 1067.826423540413,
+      "contact_y": 761.5091277608765,
+      "landing_frame": 64,
+      "contact_frame": 55,
+      "landing_predicted": false,
+      "contact_region": "mid_front",
+      "classifier_label": "forehand_lift",
+      "classifier_confidence": 0.9766552448272705,
+      "classifier_topk": [
+        {
+          "label": "forehand_lift",
+          "confidence": 0.9766552448272705
+        },
+        {
+          "label": "forehand_drive",
+          "confidence": 0.01861877366900444
+        },
+        {
+          "label": "backhand_net_shot",
+          "confidence": 0.002681105863302946
+        }
+      ],
+      "classifier_rejected_low_conf": false,
+      "event_type": "smash",
+      "hitter_track_id": 1,
+      "hitter_distance": 0.0,
+      "pose_landmarks": null,
+      "pose_features": null
+    }
+  ],
+  "court_detection": {
+    "source": "auto",
+    "corners": [
+      [
+        825.8533935546875,
+        1751.5533447265625
+      ],
+      [
+        1646.214111328125,
+        790.9407958984375
+      ],
+      [
+        709.864013671875,
+        627.9432373046875
+      ],
+      [
+        224.7823028564453,
+        655.9249877929688
+      ]
+    ],
+    "confidence": 0.6521497405485545,
+    "reason": "OK",
+    "fit_reason": null,
+    "fit_backend": "legacy",
+    "frame_idx": 0,
+    "detect_mode": "single_frame_with_fallback",
+    "lock_enabled": true,
+    "sample_frame_indices": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      25,
+      30,
+      35,
+      40,
+      45,
+      50,
+      55,
+      60,
+      64
+    ],
+    "sample_frame_count": 14,
+    "fallback_used": true,
+    "profile_retry_used": null,
+    "profile_retry_path": null,
+    "final_reject_min_conf": null,
+    "final_reject_min_score": null,
+    "last_metrics": {
+      "model": "bwf_standard_v1",
+      "person_box_count": 0,
+      "foot_points": [],
+      "canonical_points_norm": {
+        "y_net": 0.5,
+        "y_short_near": 0.352239,
+        "y_short_far": 0.647761,
+        "x_center": 0.5,
+        "x_singles_L": 0.07541,
+        "x_singles_R": 0.92459,
+        "SSN_L_out": [
+          0.0,
+          0.352239
+        ],
+        "SSN_R_out": [
+          1.0,
+          0.352239
+        ],
+        "SSF_L_out": [
+          0.0,
+          0.647761
+        ],
+        "SSF_R_out": [
+          1.0,
+          0.647761
+        ],
+        "C_SSN": [
+          0.5,
+          0.352239
+        ],
+        "C_SSF": [
+          0.5,
+          0.647761
+        ],
+        "NetPost_L": [
+          0.0,
+          0.5
+        ],
+        "NetPost_R": [
+          1.0,
+          0.5
+        ],
+        "NetMid": [
+          0.5,
+          0.5
+        ],
+        "SSN_L_in": [
+          0.07541,
+          0.352239
+        ],
+        "SSN_R_in": [
+          0.92459,
+          0.352239
+        ],
+        "SSF_L_in": [
+          0.07541,
+          0.647761
+        ],
+        "SSF_R_in": [
+          0.92459,
+          0.647761
+        ],
+        "corners_lb_rb_rt_lt": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "service_short_sideline_intersections": [
+          [
+            0.0,
+            0.352238806
+          ],
+          [
+            1.0,
+            0.352238806
+          ],
+          [
+            0.0,
+            0.647761194
+          ],
+          [
+            1.0,
+            0.647761194
+          ]
+        ],
+        "service_short_center_intersections": [
+          [
+            0.5,
+            0.352238806
+          ],
+          [
+            0.5,
+            0.647761194
+          ]
+        ],
+        "net_posts": [
+          [
+            0.0,
+            0.5
+          ],
+          [
+            1.0,
+            0.5
+          ]
+        ],
+        "net_mid": [
+          0.5,
+          0.5
+        ]
+      },
+      "component_id": null,
+      "component_bbox": null,
+      "component_area": null,
+      "selected_component_id": 0,
+      "component_stats_top3": [],
+      "manual_override": false,
+      "manual_present": false,
+      "manual_pairs_added": false,
+      "anchor_prior_enabled": false,
+      "used_anchor_prior": false,
+      "used_manual_anchors": false,
+      "dt_from": "white_mask_raw_floor",
+      "white_mask_sum": 38687,
+      "white_mask_ratio": 0.018656925154320988,
+      "white_mask_raw_sum": 896014,
+      "white_mask_raw_ratio": 0.43210551697530863,
+      "white_mask_raw_full_sum": 896014,
+      "white_mask_raw_full_ratio": 0.43210551697530863,
+      "white_mask_raw_floor_sum": 57810,
+      "white_mask_raw_floor_ratio": 0.027879050925925925,
+      "white_mask_raw_floor_preblob_ratio": 0.027879050925925925,
+      "white_mask_raw_floor_postblob_ratio": 0.02412615740740741,
+      "white_mask_raw_floor_postblob_sum": 50028,
+      "white_mask_raw_floor_noblob_sum": 40643,
+      "white_mask_raw_floor_noblob_ratio": 0.019600212191358025,
+      "white_mask_clean_sum": 38687,
+      "white_mask_clean_ratio": 0.018656925154320988,
+      "mask_raw_ratio": 0.027879050925925925,
+      "mask_clean_ratio": 0.018656925154320988,
+      "max_cc_area": 14845,
+      "floor_bbox": [
+        118,
+        591,
+        1886,
+        1079
+      ],
+      "floor_roi_ratio": 0.3340986689814815,
+      "floor_roi_source": "green_flood",
+      "floor_roi_green_ratio": 0.6777777777777778,
+      "white_mask_blob_removed_count": 1634,
+      "white_mask_blob_removed_topk": [
+        {
+          "area": 19.0,
+          "aspect": 6.0,
+          "fill": 0.7916666666666666,
+          "bbox_w": 2.0,
+          "bbox_h": 12.0,
+          "kind": "speckle"
+        },
+        {
+          "area": 19.0,
+          "aspect": 1.6,
+          "fill": 0.475,
+          "bbox_w": 8.0,
+          "bbox_h": 5.0,
+          "kind": "speckle"
+        },
+        {
+          "area": 19.0,
+          "aspect": 4.0,
+          "fill": 0.5277777777777778,
+          "bbox_w": 3.0,
+          "bbox_h": 12.0,
+          "kind": "speckle"
+        },
+        {
+          "area": 18.0,
+          "aspect": 3.0,
+          "fill": 0.6666666666666666,
+          "bbox_w": 9.0,
+          "bbox_h": 3.0,
+          "kind": "speckle"
+        },
+        {
+          "area": 18.0,
+          "aspect": 1.5,
+          "fill": 0.75,
+          "bbox_w": 4.0,
+          "bbox_h": 6.0,
+          "kind": "speckle"
+        }
+      ],
+      "white_raw_full_bbox": [
+        0,
+        0,
+        1919,
+        1076
+      ],
+      "fallback_floor_roi": false,
+      "fallback_mode": "lab_seed",
+      "floor_y_cut": 550,
+      "floor_x_tightened": true,
+      "floor_x_range": [
+        38,
+        1919
+      ],
+      "floor_x_support_ratio": 1.0,
+      "floor_x_reject_reason": null,
+      "floor_cc_scores": [
+        {
+          "idx": 1,
+          "area": 575782.0,
+          "support": 452346.0,
+          "score": 1028128.0
+        }
+      ],
+      "floor_strip_thr": 1.0,
+      "floor_strip_y0": 1006,
+      "lab_seed_ok": true,
+      "lab_seed_bbox": [
+        117,
+        544,
+        1892,
+        1079
+      ],
+      "lab_seed_y0": 432,
+      "dt_min": 0.0,
+      "dt_mean": 229.61941528320312,
+      "dt_p90": 557.053955078125,
+      "dt_rand_mean": 41.80579376220703,
+      "dt_rand_p90": 90.82280731201172,
+      "debug_image_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_debug.jpg",
+      "white_mask_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_clean.png",
+      "white_mask_raw_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_full.png",
+      "white_mask_clean_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_clean.png",
+      "lsd_dirA_path": null,
+      "lsd_dirB_path": null,
+      "ori_maskA_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_ori_maskA.png",
+      "ori_maskB_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_ori_maskB.png",
+      "hough_lines_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_hough_lines.png",
+      "debug_init_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_init_overlay.jpg",
+      "dt_debug_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_dt.png",
+      "linepix_green_only_used": false,
+      "max_inside_count": 0,
+      "selection_reason": "not_selected",
+      "model_role_weights": {
+        "baseline": 1.0,
+        "sideline_d": 1.0,
+        "service_short": 1.0,
+        "service_long": 1.0,
+        "sideline_s": 1.0,
+        "center": 1.0
+      },
+      "score_base": 16.94754135898206,
+      "score_total": 19.3454169491809,
+      "inside_count": 0,
+      "inside_bonus": 0.0,
+      "pix_white_mask_raw_floor_noblob": 40643,
+      "pix_linepix_base_before_roi": 40643,
+      "pix_linepix_after_roi": 40643,
+      "linepix_green_only_env": "0",
+      "linepix_green_only_effective": false,
+      "linepix_green_only_defaulted_off_due_to_roi": false,
+      "linepix_green_only_defaulted_off_due_to_direct_noblob": false,
+      "green_keep_ratio": 1.0,
+      "green_linepix_before": 40643,
+      "green_linepix_after": 40643,
+      "pix_linepix_before_green": 40643,
+      "pix_linepix_after_green": 40643,
+      "pix_linepix_final": 40643,
+      "ransac_mask_source": "noblob",
+      "ransac_mask_nz": 40643,
+      "linepix_mask_nz": 40643,
+      "linepix_pre_gate_nz": 40643,
+      "white_mask_raw_floor_noblob_nz": 40643,
+      "num_linepix_points": 40643,
+      "num_linepix_points_pre_person": 40643,
+      "num_linepix_points_post_floor": 40643,
+      "num_linepix_points_post_person": 40643,
+      "linepix_source": "direct_noblob",
+      "linepix_green_gate_mode": "dilate",
+      "linepix_green_keep_min": 0.3,
+      "linepix_green_erode_k": 7,
+      "linepix_green_dilate_k": 13,
+      "linepix_green_gate_applied": false,
+      "linepix_green_keep_ratio": 1.0,
+      "linepix_floor_gate_applied": false,
+      "linepix_floor_gate_disabled": false,
+      "linepix_floor_gate_keep_ratio": 1.0,
+      "linepix_ratio": 0.019600212191358025,
+      "linepix_left_ratio": 0.5850207907880816,
+      "linepix_right_ratio": 0.4149792092119184,
+      "linepix_top_ratio": 0.4122481116059346,
+      "linepix_bottom_ratio": 0.5877518883940654,
+      "num_ransac_lines": 14,
+      "top10_line_lengths": [
+        1150.4468236340203,
+        1124.6760992176712,
+        1102.488766145645,
+        764.0320181739881,
+        723.3601936882712,
+        598.9192878401875,
+        596.6435178879238,
+        595.3853217425051,
+        479.3336389750885,
+        452.7453539351806
+      ],
+      "debug_right_rescue_enabled": false,
+      "debug_right_rescue_used": true,
+      "debug_right_rescue_mode": "baseline",
+      "debug_right_rescue_num_lines": 1,
+      "debug_right_rescue_mask_source": "preblob",
+      "debug_right_rescue_strip": [
+        1532,
+        396,
+        1886,
+        1079
+      ],
+      "debug_right_rescue_target_theta_deg": 4.307547761304751,
+      "right_rescue_apply_to_fit_enabled": true,
+      "right_rescue_applied_to_fit": true,
+      "right_rescue_fit_added": 1,
+      "reject_mid_outside": 0,
+      "num_hough_lines": 15,
+      "tls_num_input_pts": 15186,
+      "tls_num_finite_pts": 15186,
+      "tls_skipped_degenerate": 0,
+      "num_hough_lines_a": 7,
+      "num_hough_lines_b": 8,
+      "ori_center1_deg": 16.499998751607038,
+      "ori_center2_deg": 176.49999751218837,
+      "ori_band_deg": 28.0,
+      "ori_band_soft_deg": 42.0,
+      "ori_soft_minlen_frac": 0.45,
+      "ori_soft_minlen_max_px": 300.0,
+      "ori_assign_nearest": false,
+      "ori_enable_soft_assign": false,
+      "ori_soft_keep_boundary": true,
+      "ori_boundary_fallback": true,
+      "ori_boundary_fallback_max_angle_deg": 42.0,
+      "ori_force_nearest_remaining": true,
+      "ori_force_nearest_max_add": 6,
+      "ori_force_nearest_minlen_frac": 0.2,
+      "ori_force_nearest_max_angle_deg": 58.0,
+      "ori_nearest_added": 0,
+      "ori_soft_added": 0,
+      "ori_boundary_fallback_added": 0,
+      "ori_force_nearest_added": 6,
+      "ori_unassigned_initial": 6,
+      "ori_unassigned_final": 0,
+      "num_selected_left": 0,
+      "num_selected_bottom": 0,
+      "vp_left_error": null,
+      "vp_bottom_error": null,
+      "num_hough_pairs_a": 7,
+      "num_hough_pairs_b": 4,
+      "role_prior_enabled": false,
+      "role_prior_mask": "linepix",
+      "court_ratio_verify_enabled": false,
+      "court_ratio_verify_hard_gate": false,
+      "court_ratio_verify_weight": 10.0,
+      "court_ratio_verify_min_score": 0.56,
+      "court_ratio_verify_min_h_lines": 4,
+      "court_ratio_verify_min_v_lines": 3,
+      "court_ratio_verify_expand": true,
+      "court_ratio_verify_expand_scales": [
+        1.0,
+        1.03,
+        0.97,
+        1.06,
+        0.94
+      ],
+      "reject_roi_corner": 0,
+      "reject_manual_anchor": 0,
+      "reject_area_ratio_low": 14,
+      "reject_ymax_ratio_low": 0,
+      "reject_degenerate_bbox": 0,
+      "reject_degenerate_min_edge": 0,
+      "reject_aspect_ratio": 3,
+      "relaxed_pass": 0,
+      "top3_mainfield": [
+        {
+          "score_final": 19.3454169491809,
+          "score_total": 19.3454169491809,
+          "area_ratio": 0.11389042130727359,
+          "ymax_ratio": 1.0,
+          "bottom_support": 1.0,
+          "inside_count": 0,
+          "ratio_struct_score": 0.0
+        },
+        {
+          "score_final": 18.338589048940207,
+          "score_total": 18.338589048940207,
+          "area_ratio": 0.11209085478061123,
+          "ymax_ratio": 1.0,
+          "bottom_support": 1.0,
+          "inside_count": 0,
+          "ratio_struct_score": 0.0
+        },
+        {
+          "score_final": 12.287679436194166,
+          "score_total": 12.287679436194166,
+          "area_ratio": 0.13657748765125027,
+          "ymax_ratio": 1.0,
+          "bottom_support": 1.0,
+          "inside_count": 0,
+          "ratio_struct_score": 0.0
+        }
+      ],
+      "selected_area_ratio": 0.11389042130727359,
+      "selected_ymax_ratio": 1.0,
+      "selected_bottom_support": 1.0,
+      "mixer_dt": 20.133958339691162,
+      "mixer_aspect": 0.05852255362330464,
+      "mixer_vp": 0.0013635345912963474,
+      "mixer_floor": 0.10041551246537395,
+      "mixer_cover": 0.40246248557137365,
+      "mixer_pos": 0.0,
+      "mixer_area": 0.0,
+      "mixer_score": 21.187214145958947,
+      "role_prior_bonus": 0.0,
+      "role_prior_meta": null,
+      "court_ratio_refine_used": false,
+      "court_ratio_bonus": 0.0,
+      "court_ratio_meta": null,
+      "score_final": 16.94754135898206,
+      "score_breakdown": {
+        "base": 16.94754135898206,
+        "inside_bonus": 0.0,
+        "score_total": 19.3454169491809
+      },
+      "completion_bottom_extra_px": 107.36,
+      "completion_bottom_lines_before": 8,
+      "completion_bottom_lines_after": 7,
+      "corner_completion_used": true,
+      "completed_LB": [
+        591.1904907226562,
+        1323.8114013671875
+      ],
+      "completed_RB": [
+        1510.2491455078125,
+        767.2723388671875
+      ],
+      "completed_RT": [
+        709.864013671875,
+        627.9432373046875
+      ],
+      "completed_LT": [
+        224.7823028564453,
+        655.9249877929688
+      ],
+      "baseline_line": [
+        -0.5179843627177276,
+        -0.855390086440046,
+        1438.6025970337066
+      ],
+      "left_sideline_line": [
+        -0.8767305644696317,
+        0.4809818263975896,
+        -118.41447196785198
+      ],
+      "right_sideline_line": [
+        -0.1714985106494685,
+        0.9851843791113488,
+        -496.89922552149613
+      ],
+      "top_line": [
+        -0.05758886722582987,
+        -0.9983403840232277,
+        667.7813362108928
+      ],
+      "baseline_line_meta": {
+        "theta_deg": 148.80285660342673,
+        "length": 596.6435178879238,
+        "support": 0.9666666666666667,
+        "line_id": 1,
+        "score": 586.6994592564585
+      },
+      "left_sideline_meta": {
+        "theta_deg": 61.25045370616511,
+        "length": 479.3336389750885,
+        "support": 0.9333333333333333,
+        "line_id": 3,
+        "score": 463.3558510092522,
+        "perp_err_deg": 19.408762178800217
+      },
+      "right_sideline_meta": {
+        "theta_deg": 9.87495706549839,
+        "length": 1072.8956146801982,
+        "support": 0.0,
+        "line_id": 14,
+        "score": 536.4478073400991,
+        "perp_err_deg": 70.78425881946693
+      },
+      "top_line_meta": {
+        "theta_deg": 176.69857439264166,
+        "length": 438.7128098828194,
+        "support": 0.7,
+        "line_id": 12,
+        "score": 372.90588840039646
+      },
+      "postfit_baseline_verify_used": true,
+      "postfit_baseline_verify_meta": {
+        "enabled": true,
+        "used": true,
+        "reason": "pair_0.76m",
+        "candidates": [
+          {
+            "y_m": -0.8780210018157959,
+            "mid_y_img": 934.1691243675217,
+            "support": 0.9583333333333334,
+            "score": 0.6554702592026341,
+            "len_m": 4.1723382356645065
+          },
+          {
+            "y_m": -0.8713997006416321,
+            "mid_y_img": 962.0421072694953,
+            "support": 1.0,
+            "score": 0.4396756750638368,
+            "len_m": 2.6821194684916714
+          },
+          {
+            "y_m": -0.8554039001464844,
+            "mid_y_img": 933.4846251092986,
+            "support": 1.0,
+            "score": 0.6859729329093558,
+            "len_m": 4.184481911710306
+          },
+          {
+            "y_m": 2.1535606720135547e-07,
+            "mid_y_img": 922.9901337264249,
+            "support": 0.9791666666666666,
+            "score": 0.7989998625927284,
+            "len_m": 4.977599143981942
+          },
+          {
+            "y_m": 4.4194817543029785,
+            "mid_y_img": 758.9181679763071,
+            "support": 0.75,
+            "score": 0.6556665506519255,
+            "len_m": 5.332866080113165
+          },
+          {
+            "y_m": 8.62749195098877,
+            "mid_y_img": 675.3853239723844,
+            "support": 0.7083333333333334,
+            "score": 0.7083333333333334,
+            "len_m": 8.816666269267573
+          },
+          {
+            "y_m": 12.638758659362793,
+            "mid_y_img": 647.5921256733191,
+            "support": 0.7916666666666666,
+            "score": 0.6920452521798389,
+            "len_m": 5.332948705573699
+          },
+          {
+            "y_m": 13.400005340576172,
+            "mid_y_img": 642.877754378587,
+            "support": 0.6666666666666666,
+            "score": 0.5841486571265049,
+            "len_m": 5.344960212717814
+          }
+        ],
+        "num_candidates": 8,
+        "chosen_y_model": -0.8554039001464844,
+        "chosen_mid_y_img": 933.4846251092986,
+        "chosen_support": 1.0,
+        "current_bottom_mid_y": 1045.5418701171875,
+        "current_ref_mid_y": 922.9901337264249,
+        "current_near_y_model": 2.1535606720135547e-07,
+        "target_gap_m": 0.76,
+        "gap_tol_m": 0.22
+      },
+      "legacy_semantic_refine_used": false,
+      "legacy_semantic_refine_meta": {
+        "enabled": true,
+        "available": true,
+        "attempted": false
+      },
+      "quad_bbox_w": 1421.4318084716797,
+      "quad_bbox_h": 1123.610107421875,
+      "quad_min_edge": 485.88812255859375,
+      "degenerate_predicted_corners_bbox": [
+        1421.4317626953125,
+        1123.610107421875
+      ],
+      "degenerate_predicted_corners_min_edge": 485.88812255859375,
+      "corners_outside_floor_roi": true,
+      "H": [
+        1270.2402705859322,
+        103.01104550432012,
+        825.8533935546875,
+        388.20784025822957,
+        349.71960719676525,
+        1751.5533447265625,
+        0.6899192881492194,
+        0.657823578109484,
+        1.0
+      ],
+      "cost_total": 10.534358320526056,
+      "confidence": 0.6521497405485545,
+      "s_inlier": 0.9788429048780812,
+      "s_cover": 0.9757627761816019,
+      "s_p90": 0.8653255621268934,
+      "s_area": 0.599148698236601,
+      "inlier_ratio": 0.8695329873980726,
+      "mean_dist_px": 2.5093891620635986,
+      "p90_dist_px": 6.6850128173828125,
+      "num_inliers": 2346,
+      "num_valid_samples": 2698,
+      "num_samples": 2888,
+      "dt_oob_count": 190,
+      "dt_oob_ratio": 0.06578947368421052,
+      "tau_px": 6.0,
+      "l_dist": 5.118076801300049,
+      "l_cover": 16.68766975402832,
+      "l_reg": 8.581479839619716,
+      "area_ratio": 0.9164951755904166,
+      "cover_ratio": 0.8695329873980726,
+      "sample_dist_p90": 6.6850128173828125,
+      "predicted_corners": [
+        {
+          "label": "LB",
+          "x": 825.8533935546875,
+          "y": 1751.5533447265625,
+          "visible": false
+        },
+        {
+          "label": "RB",
+          "x": 1646.214111328125,
+          "y": 790.9407958984375,
+          "visible": true
+        },
+        {
+          "label": "RT",
+          "x": 709.864013671875,
+          "y": 627.9432373046875,
+          "visible": true
+        },
+        {
+          "label": "LT",
+          "x": 224.7823028564453,
+          "y": 655.9249877929688,
+          "visible": true
+        }
+      ],
+      "err_LT": null,
+      "err_RT": null,
+      "err_RB": null,
+      "confidence_auto": 0.49518946527548824,
+      "confidence_final": 0.6521497405485545,
+      "conf_geom": 1.0,
+      "conf_support": 0.8695329873980726,
+      "conf_visible": 0.75,
+      "best_anchor_score": null,
+      "method_used": "hough_orient",
+      "fit_backend": "legacy",
+      "white_mask_raw_full_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_full.png",
+      "white_mask_raw_floor_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_floor.png",
+      "white_mask_raw_floor_preblob_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_floor_preblob.png",
+      "white_mask_raw_floor_postblob_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_floor_postblob.png",
+      "white_mask_raw_floor_noblob_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_white_mask_raw_floor_noblob.png",
+      "floor_roi_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_floor_roi.png",
+      "floor_roi_overlay_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_floor_roi_overlay.jpg",
+      "seed_bottom_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_seed_bottom_mask.png",
+      "green_mask_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_green_mask.png",
+      "largest_cc_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_largest_cc_mask.png",
+      "raw_floor_hough_lines_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_hough_lines.png",
+      "raw_floor_hough_lines_a_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_hough_lines_A.png",
+      "raw_floor_hough_lines_b_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_hough_lines_B.png",
+      "raw_floor_dt_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_dt.png",
+      "raw_floor_preprocessed_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_preprocessed.png",
+      "raw_floor_edges_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_edges.png",
+      "linepix_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_linepix.png",
+      "linepix_overlay_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_linepix_overlay.jpg",
+      "linepix_mask_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_linepix.png",
+      "ransac_lines_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_ransac_lines.jpg",
+      "raw_floor_top5_overlay_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_top5_candidate_overlays.png",
+      "raw_floor_overlay_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/reports/demo_friend_iter9_gate_area_select_auto/demo_court_fit_raw_floor_overlay.png"
+    }
+  },
+  "stroke_classifier": {
+    "enabled": true,
+    "checkpoint": "runs/v2_highcap_stable/best_model.pt",
+    "mode": "auto",
+    "device": "auto",
+    "topk": 3,
+    "min_confidence": 0.45,
+    "label_space": {
+      "version": "stroke_6class_v1",
+      "num_classes": 6,
+      "class_names": [
+        "backhand_drive",
+        "backhand_net_shot",
+        "forehand_clear",
+        "forehand_drive",
+        "forehand_lift",
+        "forehand_net_shot"
+      ],
+      "expected_num_classes": 6,
+      "expected_class_names": [
+        "backhand_drive",
+        "backhand_net_shot",
+        "forehand_clear",
+        "forehand_drive",
+        "forehand_lift",
+        "forehand_net_shot"
+      ],
+      "mismatch": false,
+      "mismatch_reasons": []
+    }
+  },
+  "label_space_version": "stroke_6class_v1",
+  "court_env": {
+    "profile_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/src/config/court_env_profiles/hough_orient_stable.env",
+    "num_vars": 74,
+    "applied": {
+      "BADC_ADV_POSTBLOB": "1",
+      "BADC_FLOOR_ROI_GREEN_CLOSE": "5",
+      "BADC_FLOOR_ROI_GREEN_DILATE": "10",
+      "BADC_FLOOR_ROI_GREEN_DILATE_ITERS": "1",
+      "BADC_FLOOR_ROI_FLOOR_BAND_PX": "30",
+      "BADC_FLOOR_ROI_DILATE_BOTTOM_ONLY": "1",
+      "BADC_FLOOR_ROI_DILATE_Y_FRAC": "0.35",
+      "BADC_FLOOR_ROI_BAND_BOTTOM_ONLY": "1",
+      "BADC_FLOOR_ROI_BAND_ALLOW_OUTSIDE_ORIG_BOTTOM": "1",
+      "BADC_LINEPIX_MASK_BASE": "noblob",
+      "BADC_LINEPIX_APPLY_FLOOR_ROI_TO_MASK": "0",
+      "BADC_LINEPIX_BYPASS_CLEANUP": "1",
+      "BADC_DISABLE_FLOOR_GATE": "0",
+      "BADC_LINEPIX_GREEN_ONLY": "0",
+      "BADC_RANSAC_MASK_SOURCE": "noblob",
+      "BADC_RAW_FLOOR_FORCE_RANSAC_AB": "0",
+      "BADC_RAW_FLOOR_MERGE_SEGS": "0",
+      "BADC_GREEN_GATE_MODE": "dilate",
+      "BADC_GREEN_DILATE_K": "13",
+      "BADC_GREEN_KEEP_MIN": "0.30",
+      "BADC_ORI_BAND_DEG": "28",
+      "BADC_ORI_BAND_SOFT_DEG": "42",
+      "BADC_ORI_SOFT_MINLEN_FRAC": "0.45",
+      "BADC_LINEPIX_FLOOR_BBOX_PAD_PX": "60",
+      "BADC_REP_MAX_ANGLE_SIDELINE_DEG": "45",
+      "BADC_REP_MAX_ANGLE_BASELINE_DEG": "25",
+      "BADC_QUAD_AREA_PRIOR_W": "3.0",
+      "BADC_QUAD_AREA_PRIOR_MIN": "0.12",
+      "BADC_RAW_FLOOR_ANGLE_RESPLIT": "0",
+      "BADC_RAW_FLOOR_ANGLE_RESPLIT_MIN_KEEP": "8",
+      "BADC_RAW_FLOOR_ANGLE_RESPLIT_MIN_SEP_DEG": "55",
+      "BADC_ORI_USE_PEAK_CENTERS": "1",
+      "BADC_ORI_PEAK_RESPLIT": "1",
+      "BADC_ORI_USE_LEGACY_HV_SPLIT": "1",
+      "BADC_ORI_ASSIGN_NEAREST": "0",
+      "BADC_ORI_ENABLE_SOFT_ASSIGN": "0",
+      "BADC_LINEPIX_DIRECT_NO_BLOB": "1",
+      "BADC_LINEPIX_OVERLAY_MASK": "linepix",
+      "BADC_RANSAC_MAX_LINES": "30",
+      "BADC_RANSAC_MIN_INLIERS": "220",
+      "BADC_RANSAC_MIN_LENGTH_RATIO": "0.07",
+      "BADC_RANSAC_RIGHT_RESCUE": "1",
+      "BADC_RANSAC_RIGHT_RESCUE_MARGIN_PX": "120",
+      "BADC_RANSAC_RIGHT_RESCUE_STRIP_FRAC": "0.20",
+      "BADC_RANSAC_RIGHT_MAX_LINES": "14",
+      "BADC_RANSAC_RIGHT_ITERS": "1800",
+      "BADC_RANSAC_RIGHT_INLIER_THR": "3.0",
+      "BADC_RANSAC_RIGHT_MIN_INLIERS": "30",
+      "BADC_RANSAC_RIGHT_MIN_LENGTH_RATIO": "0.02",
+      "BADC_RANSAC_DISABLE_FLOOR_GATE": "0",
+      "BADC_RAW_FLOOR_MERGE_RANSAC": "0",
+      "BADC_ORI_EXTREME_MAX_ANGLE_DEG": "28",
+      "BADC_RANSAC_RIGHT_RESCUE_MASK_SOURCE": "preblob",
+      "BADC_RANSAC_RIGHT_RESCUE_TOP_EXPAND_FRAC": "0.40",
+      "BADC_RANSAC_RIGHT_RESCUE_ANGLE_TOL_DEG": "28",
+      "BADC_RANSAC_RIGHT_RESCUE_DEDUP_TOL_PX": "1.2",
+      "BADC_RANSAC_RIGHT_RESCUE_INLIER_THR": "1.8",
+      "BADC_RANSAC_RIGHT_RESCUE_MIN_INLIERS": "35",
+      "BADC_RANSAC_RIGHT_RESCUE_MIN_LENGTH_RATIO": "0.02",
+      "BADC_ORI_FORCE_NEAREST_MAX_ADD": "6",
+      "BADC_ORI_FORCE_NEAREST_MINLEN_FRAC": "0.20",
+      "BADC_FIT_MIN_BOTTOM_CORNERS_IN_IMAGE": "1",
+      "BADC_FIT_REQUIRE_BOTTOM_IN_FLOOR": "0",
+      "BADC_FINAL_QUALITY_MIN_CONF": "0.35",
+      "BADC_FINAL_QUALITY_MIN_SEMANTIC_SCORE": "5.0",
+      "BADC_FINAL_QUALITY_SEMANTIC_MAX_CONF": "0.90",
+      "BADC_FINAL_QUALITY_MAX_DLS_BASE_MARGIN": "0.25",
+      "BADC_FINAL_QUALITY_MIN_DLS_SUPPORT": "0.30",
+      "BADC_LEGACY_SEMANTIC_REFINE_ENABLE": "1",
+      "BADC_LEGACY_SEMANTIC_REFINE_TRIGGER_P90": "18.0",
+      "BADC_LEGACY_SEMANTIC_REFINE_MIN_P90_GAIN": "5.0",
+      "BADC_LEGACY_SEMANTIC_REFINE_MAX_MEAN_INCREASE": "0.25",
+      "BADC_LEGACY_SEMANTIC_REFINE_MIN_AREA_KEEP": "0.85",
+      "BADC_LEGACY_SEMANTIC_REFINE_MAX_FAR_GAP_ERR_M": "0.25"
+    },
+    "retry_profile_path": "/Users/chencheng/Documents/GitHub/Badminton-AI-coach/src/config/court_env_profiles/hough_orient_stable.env",
+    "retry_num_vars": 74
+  }
+}

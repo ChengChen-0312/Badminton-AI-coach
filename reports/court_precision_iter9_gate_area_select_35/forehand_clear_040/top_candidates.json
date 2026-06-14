@@ -1,0 +1,313 @@
+[
+  {
+    "backend": "legacy",
+    "reason": "OK",
+    "confidence": 0.7143351800554016,
+    "candidate_score": 244.34952653731355,
+    "corners": [
+      [
+        404.0501708984375,
+        1043.5020751953125
+      ],
+      [
+        1499.1767578125,
+        1013.0115356445312
+      ],
+      [
+        1304.5235595703125,
+        589.0772705078125
+      ],
+      [
+        612.871337890625,
+        589.5084838867188
+      ]
+    ],
+    "p90_dist_px": 14.325027465820312,
+    "mean_dist_px": 3.911351203918457,
+    "cost_total": 22.878257476722105,
+    "area_ratio": 0.5878133146649709,
+    "legacy_semantic_refine_used": false,
+    "legacy_semantic_refine_meta": {
+      "enabled": true,
+      "available": true,
+      "attempted": false
+    },
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 75,
+    "strict_machine_good": true,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_clear_040/forehand_clear_040_rank01_f075_legacy_debug.jpg"
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -131.26381027868842,
+    "corners": [
+      [
+        -1370.9591064453125,
+        1051.7113037109375
+      ],
+      [
+        1790.151123046875,
+        1004.2420043945312
+      ],
+      [
+        0.21320407092571259,
+        -1.1734869480133057
+      ],
+      [
+        -1.6097930669784546,
+        -0.05696343258023262
+      ]
+    ],
+    "p90_dist_px": 825.3959350585938,
+    "mean_dist_px": 13.985326766967773,
+    "cost_total": 94.1418006193076,
+    "area_ratio": 1.5590695762354942,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 85,
+    "strict_machine_good": false,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_clear_040/forehand_clear_040_rank02_f085_modern_debug.jpg"
+  },
+  {
+    "backend": "modern",
+    "reason": "R_fit_poor",
+    "confidence": 2.6866005252135085e-07,
+    "candidate_score": -132.4113687631859,
+    "corners": [
+      [
+        1486.2674560546875,
+        1012.0775756835938
+      ],
+      [
+        1558.4417724609375,
+        1130.8966064453125
+      ],
+      [
+        418.6193542480469,
+        987.5158081054688
+      ],
+      [
+        415.63531494140625,
+        996.622802734375
+      ]
+    ],
+    "p90_dist_px": 32.470062255859375,
+    "mean_dist_px": 8.985491752624512,
+    "cost_total": 63.45166731726319,
+    "area_ratio": 0.06491809278466378,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 90,
+    "strict_machine_good": false,
+    "debug_image": "reports/court_precision_iter9_gate_area_select_35/forehand_clear_040/forehand_clear_040_rank03_f090_modern_debug.jpg"
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -135.78863143920898,
+    "corners": [
+      [
+        4761.19189453125,
+        -122221.1953125
+      ],
+      [
+        974.6027221679688,
+        8019.72509765625
+      ],
+      [
+        974.6027221679688,
+        8019.72509765625
+      ],
+      [
+        4761.19189453125,
+        -122221.1953125
+      ]
+    ],
+    "p90_dist_px": 576.8622436523438,
+    "mean_dist_px": 11.197157859802246,
+    "cost_total": 257.0794198245878,
+    "area_ratio": 27.204693225868255,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 75,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -137.95410643082425,
+    "corners": [
+      [
+        -105.70143127441406,
+        1230.953857421875
+      ],
+      [
+        955.72509765625,
+        965.0863037109375
+      ],
+      [
+        0.1644163280725479,
+        0.16465911269187927
+      ],
+      [
+        0.14938826858997345,
+        -1.6917380094528198
+      ]
+    ],
+    "p90_dist_px": 826.3509521484375,
+    "mean_dist_px": 14.964300155639648,
+    "cost_total": 95.64629822229035,
+    "area_ratio": 0.6107424380335111,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 30,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -140.13330803746274,
+    "corners": [
+      [
+        360.46661376953125,
+        231.197265625
+      ],
+      [
+        1501.628173828125,
+        967.29443359375
+      ],
+      [
+        857.8638305664062,
+        -200.60476684570312
+      ],
+      [
+        341.7070617675781,
+        -81.10728454589844
+      ]
+    ],
+    "p90_dist_px": 625.1241455078125,
+    "mean_dist_px": 14.599344253540039,
+    "cost_total": 90.70025699625585,
+    "area_ratio": 0.4883835447459001,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 20,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -142.0,
+    "corners": [
+      [
+        955.5882568359375,
+        -196.6731414794922
+      ],
+      [
+        955.5882568359375,
+        -196.6731414794922
+      ],
+      [
+        -144845.8125,
+        44231.55859375
+      ],
+      [
+        -144845.8125,
+        44231.55859375
+      ]
+    ],
+    "p90_dist_px": 826.3509521484375,
+    "mean_dist_px": 15.0,
+    "cost_total": 150.9742821628962,
+    "area_ratio": 6.583141223159997,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 60,
+    "strict_machine_good": false
+  },
+  {
+    "backend": "modern",
+    "reason": "R_dt_oob",
+    "confidence": 0.0,
+    "candidate_score": -142.0,
+    "corners": [
+      [
+        783.5645751953125,
+        60911.49609375
+      ],
+      [
+        1528.9549560546875,
+        12322.8037109375
+      ],
+      [
+        1495.3614501953125,
+        1011.9324340820312
+      ],
+      [
+        701.5357666015625,
+        -112.07969665527344
+      ]
+    ],
+    "p90_dist_px": 278.72650146484375,
+    "mean_dist_px": 14.99658203125,
+    "cost_total": 272.06470406022254,
+    "area_ratio": 27.90495323743591,
+    "legacy_semantic_refine_used": null,
+    "legacy_semantic_refine_meta": null,
+    "semantic_refine_meta": null,
+    "final_quality_reject_reason": null,
+    "final_quality_semantic_score": null,
+    "exception": null,
+    "case": "forehand_clear_040",
+    "video": "archive/forehand_clear/040.mp4",
+    "frame_idx": 70,
+    "strict_machine_good": false
+  }
+]

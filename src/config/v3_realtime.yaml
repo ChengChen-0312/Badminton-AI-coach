@@ -8,7 +8,7 @@ device:
 vision:
   yolo_imgsz: 512
   yolo_conf: 0.25
-  # Optional reproducible BADC_* profile (removes need for manual `export` before each run).
+  # Reproducible BADC_* profile for the legacy wide indoor-court auto fit.
   court_env_file: "court_env_profiles/hough_orient_stable.env"
   edge_top_min: 0.20
   edge_bottom_min: 0.18
@@ -21,8 +21,17 @@ vision:
   court_detect_frame_idx: 0
   court_detect_fallback_on_fail: true
   court_detect_fallback_samples: 24
-  court_detect_fallback_stride: 10
-  court_detect_temporal_refine: true
+  court_detect_fallback_stride: 5
+  court_detect_precision_max_p90: 18.0
+  court_detect_precision_max_mean: 4.5
+  court_detect_precision_joint_mean_min: 0.0
+  court_detect_precision_joint_p90_min: 0.0
+  court_detect_precision_max_far_gap_err_m: 0.25
+  court_detect_hybrid_modern: true
+  court_detect_hybrid_always_scan: true
+  court_detect_profile_retry_on_fail: true
+  court_detect_profile_retry_file: "court_env_profiles/hough_orient_stable.env"
+  court_detect_temporal_refine: false
   court_detect_temporal_refine_topk: 5
   court_detect_temporal_refine_drift_ref_px: 18.0
   court_detect_temporal_refine_weight: 30.0

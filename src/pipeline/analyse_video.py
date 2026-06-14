@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,9 +16,14 @@ from src.tracking.player_track import PlayerState
 from src.vision.ball_detector import BallDetector
 from src.vision.court_detector import CourtDetector
 from src.vision.court_fit_homography import fit_court_homography
-from src.vision.court_env_profile import resolve_and_apply_court_env_overrides
+from src.vision.court_env_profile import resolve_and_apply_court_env_overrides, resolve_court_env_overrides
 from src.vision.detectors import PlayerDetector
 from src.vision.pose_estimator import PoseEstimator, PoseKeypoints
+
+try:
+    from src.vision.court_fit_homography_modern import fit_court_homography as fit_court_homography_modern
+except Exception:  # pragma: no cover - optional hybrid backend
+    fit_court_homography_modern = None
 
 
 @dataclass
@@ -58,6 +64,17 @@ def analyse_video(
     cfg_base_raw = cfg.get("__config_dir__")
     cfg_base_dir = Path(str(cfg_base_raw)).expanduser() if isinstance(cfg_base_raw, str) and cfg_base_raw else None
     court_env = resolve_and_apply_court_env_overrides(vision_cfg, base_dir=cfg_base_dir)
+    profile_retry_enabled = bool(vision_cfg.get("court_detect_profile_retry_on_fail", False))
+    profile_retry_overrides: Dict[str, str] = {}
+    profile_retry_path: Optional[str] = None
+    profile_retry_raw = vision_cfg.get("court_detect_profile_retry_file")
+    if profile_retry_enabled and isinstance(profile_retry_raw, str) and profile_retry_raw.strip():
+        profile_retry_overrides, profile_retry_path = resolve_court_env_overrides(
+            {"court_env_file": profile_retry_raw.strip()},
+            base_dir=cfg_base_dir,
+        )
+        court_env["retry_profile_path"] = profile_retry_path
+        court_env["retry_num_vars"] = int(len(profile_retry_overrides))
 
     detect_stride = tracking_cfg.get("detect_stride", 1)
     batch_size = realtime_cfg.get("batch_size", 1)
@@ -186,6 +203,15 @@ def analyse_video(
             detect_fallback_stride = int(vision_cfg.get("court_detect_fallback_stride", 10))
             detect_fallback_min_conf = float(vision_cfg.get("court_detect_fallback_min_conf", 0.45))
             detect_fallback_min_score = float(vision_cfg.get("court_detect_fallback_min_score", 120.0))
+            detect_precision_max_p90 = float(vision_cfg.get("court_detect_precision_max_p90", 18.0))
+            detect_precision_max_mean = float(vision_cfg.get("court_detect_precision_max_mean", 4.5))
+            detect_precision_joint_mean_min = float(
+                vision_cfg.get("court_detect_precision_joint_mean_min", 0.0)
+            )
+            detect_precision_joint_p90_min = float(vision_cfg.get("court_detect_precision_joint_p90_min", 0.0))
+            detect_precision_max_far_gap_err = float(
+                vision_cfg.get("court_detect_precision_max_far_gap_err_m", 0.25)
+            )
             detect_fallback_samples = max(2, detect_fallback_samples)
             detect_fallback_stride = max(1, detect_fallback_stride)
             detect_temporal_refine = bool(vision_cfg.get("court_detect_temporal_refine", True))
@@ -194,6 +220,9 @@ def analyse_video(
                 vision_cfg.get("court_detect_temporal_refine_drift_ref_px", 18.0)
             )
             detect_temporal_refine_weight = float(vision_cfg.get("court_detect_temporal_refine_weight", 30.0))
+            detect_hybrid_modern = bool(vision_cfg.get("court_detect_hybrid_modern", False))
+            detect_hybrid_modern = bool(detect_hybrid_modern and fit_court_homography_modern is not None)
+            detect_hybrid_always_scan = bool(vision_cfg.get("court_detect_hybrid_always_scan", detect_hybrid_modern))
             sample_frame_indices = (
                 [max(0, int(court_detect_frame_idx))]
                 if court_detect_once
@@ -221,6 +250,18 @@ def analyse_video(
 
             def _candidate_score(conf: float, reason: str, metrics: Optional[Dict[str, Any]]) -> float:
                 m = metrics if isinstance(metrics, dict) else {}
+
+                def _num(value: Any) -> Optional[float]:
+                    try:
+                        if value is None:
+                            return None
+                        out = float(value)
+                    except (TypeError, ValueError):
+                        return None
+                    if not np.isfinite(out):
+                        return None
+                    return out
+
                 score = 100.0 * float(conf)
                 r = str(reason or "")
                 if r == "OK":
@@ -248,12 +289,76 @@ def analyse_video(
                 score -= 2.0 * float(m.get("reject_aspect_ratio", 0) or 0)
                 score -= 0.8 * float(m.get("reject_area_ratio_low", 0) or 0)
                 score -= 0.6 * float(m.get("reject_degenerate_min_edge", 0) or 0)
+
+                p90_px = _num(m.get("p90_dist_px") or m.get("sample_dist_p90"))
+                mean_px = _num(m.get("mean_dist_px") or m.get("sample_dist_mean"))
+                cost_total = _num(m.get("cost_total"))
+                area_ratio = _num(
+                    m.get("selected_area_ratio_guard")
+                    or m.get("area_ratio")
+                    or m.get("raw_floor_selected_area_ratio")
+                )
+                if p90_px is not None:
+                    score -= min(70.0, 2.0 * max(0.0, p90_px - 12.0))
+                if mean_px is not None:
+                    score -= min(35.0, 4.0 * max(0.0, mean_px - 4.0))
+                if cost_total is not None:
+                    score -= min(45.0, 0.45 * max(0.0, cost_total - 18.0))
+                if area_ratio is not None and area_ratio < 0.18:
+                    score -= min(80.0, 160.0 * (0.18 - area_ratio))
+                if area_ratio is not None and area_ratio > 0.0:
+                    score += min(28.0, 36.0 * area_ratio)
                 return float(score)
 
             def _candidate_good(meta: Dict[str, Any]) -> bool:
                 conf_i = float(meta.get("confidence", 0.0) or 0.0)
                 score_i = float(meta.get("candidate_score", -1e9) or -1e9)
                 reason_i = str(meta.get("reason", ""))
+                metrics_i = meta.get("metrics") if isinstance(meta.get("metrics"), dict) else {}
+
+                def _num_good(value: Any) -> Optional[float]:
+                    try:
+                        if value is None:
+                            return None
+                        out = float(value)
+                    except (TypeError, ValueError):
+                        return None
+                    if not np.isfinite(out):
+                        return None
+                    return out
+
+                p90_px = _num_good(metrics_i.get("p90_dist_px") or metrics_i.get("sample_dist_p90"))
+                mean_px = _num_good(metrics_i.get("mean_dist_px") or metrics_i.get("sample_dist_mean"))
+                if detect_precision_max_p90 > 0.0 and p90_px is not None and p90_px > detect_precision_max_p90:
+                    return False
+                if detect_precision_max_mean > 0.0 and mean_px is not None and mean_px > detect_precision_max_mean:
+                    return False
+                if (
+                    detect_precision_joint_mean_min > 0.0
+                    and detect_precision_joint_p90_min > 0.0
+                    and mean_px is not None
+                    and p90_px is not None
+                    and mean_px > detect_precision_joint_mean_min
+                    and p90_px > detect_precision_joint_p90_min
+                ):
+                    return False
+
+                semantic_meta = None
+                legacy_refine_meta = metrics_i.get("legacy_semantic_refine_meta")
+                if isinstance(legacy_refine_meta, dict) and isinstance(legacy_refine_meta.get("semantic_meta"), dict):
+                    semantic_meta = legacy_refine_meta.get("semantic_meta")
+                elif isinstance(metrics_i.get("semantic_refine_meta"), dict):
+                    semantic_meta = metrics_i.get("semantic_refine_meta")
+                if isinstance(semantic_meta, dict) and detect_precision_max_far_gap_err > 0.0:
+                    far_gap_err = _num_good(semantic_meta.get("far_pair_gap_err_m"))
+                    if (
+                        far_gap_err is not None
+                        and bool(semantic_meta.get("far_observable", False))
+                        and bool(semantic_meta.get("far_pair_found", False))
+                        and far_gap_err > detect_precision_max_far_gap_err
+                    ):
+                        return False
+
                 return bool(reason_i == "OK" and conf_i >= detect_fallback_min_conf and score_i >= detect_fallback_min_score)
 
             best = None  # (score, confidence, corners, meta, fit)
@@ -271,6 +376,12 @@ def analyse_video(
             ) -> None:
                 nonlocal best, best_fail
                 if corners_i is None:
+                    if best_fail is None or score_i > float(best_fail[0]) or (
+                        score_i == float(best_fail[0]) and conf_i > float(best_fail[1])
+                    ):
+                        best_fail = (score_i, conf_i, meta_i, fit_i)
+                    return
+                if not _candidate_good(meta_i):
                     if best_fail is None or score_i > float(best_fail[0]) or (
                         score_i == float(best_fail[0]) and conf_i > float(best_fail[1])
                     ):
@@ -302,6 +413,101 @@ def analyse_video(
                 except Exception:
                     return None
 
+            def _run_model_fit(
+                bgr_i: np.ndarray,
+                *,
+                use_profile_retry: bool = False,
+                backend: str = "legacy",
+            ) -> Any:
+                fit_fn = fit_court_homography
+                if backend == "modern":
+                    if fit_court_homography_modern is None:
+                        raise RuntimeError("modern court-fit backend is not available")
+                    fit_fn = fit_court_homography_modern
+                if not use_profile_retry:
+                    return fit_fn(
+                        bgr_i,
+                        method=model_fit_method,
+                        allow_fallback_lsd=allow_fallback_lsd,
+                    )
+                badc_snapshot = {k: v for k, v in os.environ.items() if k.startswith("BADC_")}
+                try:
+                    for key in list(os.environ):
+                        if key.startswith("BADC_"):
+                            os.environ.pop(key, None)
+                    os.environ.update(profile_retry_overrides)
+                    return fit_fn(
+                        bgr_i,
+                        method=model_fit_method,
+                        allow_fallback_lsd=allow_fallback_lsd,
+                    )
+                finally:
+                    for key in list(os.environ):
+                        if key.startswith("BADC_"):
+                            os.environ.pop(key, None)
+                    os.environ.update(badc_snapshot)
+
+            def _submit_model_fit(
+                fi: int,
+                fit_i: Any,
+                *,
+                profile_retry_used: bool = False,
+                backend: str = "legacy",
+            ) -> Optional[List[List[float]]]:
+                label_bits = ["FIT"]
+                if backend != "legacy":
+                    label_bits.append(backend)
+                if profile_retry_used:
+                    label_bits.append("profile_retry")
+                label = "[" + ":".join(label_bits) + "]"
+                print(label, "method_used =", fit_i.method_used, "reason =", fit_i.reason)
+                metrics_i = fit_i.metrics if isinstance(fit_i.metrics, dict) else {}
+                metrics_i = dict(metrics_i)
+                metrics_i["fit_backend"] = str(backend)
+                if profile_retry_used:
+                    metrics_i["profile_retry_used"] = True
+                    metrics_i["profile_retry_path"] = profile_retry_path
+                fit_i.metrics = metrics_i
+                print(
+                    label,
+                    "raw_full_ratio=",
+                    metrics_i.get("white_mask_raw_full_ratio"),
+                    "raw_floor_ratio=",
+                    metrics_i.get("white_mask_raw_floor_ratio"),
+                    "clean_ratio=",
+                    metrics_i.get("white_mask_clean_ratio"),
+                    "floor_roi_ratio=",
+                    metrics_i.get("floor_roi_ratio"),
+                    "floor_bbox=",
+                    metrics_i.get("floor_bbox"),
+                    "fallback_floor_roi=",
+                    metrics_i.get("fallback_floor_roi"),
+                    "fallback_mode=",
+                    metrics_i.get("fallback_mode"),
+                    "floor_y_cut=",
+                    metrics_i.get("floor_y_cut"),
+                )
+                conf_i = float(fit_i.confidence)
+                reason_i = str(fit_i.reason)
+                score_i = _candidate_score(conf_i, reason_i, metrics_i)
+                meta_i = {
+                    "source": "auto",
+                    "confidence": conf_i,
+                    "reason": reason_i,
+                    "frame_idx": int(fi),
+                    "detect_mode": detect_mode,
+                    "lock_enabled": bool(court_detect_once),
+                    "metrics": fit_i.metrics,
+                    "candidate_score": float(score_i),
+                    "fit_backend": str(backend),
+                }
+                if profile_retry_used:
+                    meta_i["profile_retry_used"] = True
+                    meta_i["profile_retry_path"] = profile_retry_path
+                corners_i = fit_i.corners.tolist() if fit_i.corners is not None else None
+                _maybe_update_best(score_i, conf_i, corners_i, meta_i, fit_i)
+                return corners_i
+
             def _eval_candidates(indices: List[int]) -> None:
                 for fi in indices:
                     if fi in checked_indices:
@@ -315,46 +521,36 @@ def analyse_video(
                         if not ok_i or bgr_i is None:
                             continue
                     if use_model_fit:
-                        fit_i = fit_court_homography(
-                            bgr_i,
-                            method=model_fit_method,
-                            allow_fallback_lsd=allow_fallback_lsd,
-                        )
-                        print("[FIT] method_used =", fit_i.method_used, "reason =", fit_i.reason)
-                        metrics_i = fit_i.metrics if isinstance(fit_i.metrics, dict) else {}
-                        print(
-                            "[FIT] raw_full_ratio=",
-                            metrics_i.get("white_mask_raw_full_ratio"),
-                            "raw_floor_ratio=",
-                            metrics_i.get("white_mask_raw_floor_ratio"),
-                            "clean_ratio=",
-                            metrics_i.get("white_mask_clean_ratio"),
-                            "floor_roi_ratio=",
-                            metrics_i.get("floor_roi_ratio"),
-                            "floor_bbox=",
-                            metrics_i.get("floor_bbox"),
-                            "fallback_floor_roi=",
-                            metrics_i.get("fallback_floor_roi"),
-                            "fallback_mode=",
-                            metrics_i.get("fallback_mode"),
-                            "floor_y_cut=",
-                            metrics_i.get("floor_y_cut"),
-                        )
-                        conf_i = float(fit_i.confidence)
-                        reason_i = str(fit_i.reason)
-                        score_i = _candidate_score(conf_i, reason_i, metrics_i)
-                        meta_i = {
-                            "source": "auto",
-                            "confidence": conf_i,
-                            "reason": reason_i,
-                            "frame_idx": int(fi),
-                            "detect_mode": detect_mode,
-                            "lock_enabled": bool(court_detect_once),
-                            "metrics": fit_i.metrics,
-                            "candidate_score": float(score_i),
-                        }
-                        corners_i = fit_i.corners.tolist() if fit_i.corners is not None else None
-                        _maybe_update_best(score_i, conf_i, corners_i, meta_i, fit_i)
+                        fit_i = _run_model_fit(bgr_i, backend="legacy")
+                        corners_i = _submit_model_fit(int(fi), fit_i, backend="legacy")
+                        if detect_hybrid_modern:
+                            modern_fit = _run_model_fit(bgr_i, backend="modern")
+                            modern_corners_i = _submit_model_fit(int(fi), modern_fit, backend="modern")
+                            if modern_corners_i is not None:
+                                corners_i = modern_corners_i
+                        if (
+                            corners_i is None
+                            and profile_retry_enabled
+                            and profile_retry_overrides
+                            and profile_retry_path
+                        ):
+                            retry_fit = _run_model_fit(bgr_i, use_profile_retry=True, backend="legacy")
+                            retry_corners_i = _submit_model_fit(
+                                int(fi),
+                                retry_fit,
+                                profile_retry_used=True,
+                                backend="legacy",
+                            )
+                            if detect_hybrid_modern:
+                                modern_retry_fit = _run_model_fit(bgr_i, use_profile_retry=True, backend="modern")
+                                modern_retry_corners_i = _submit_model_fit(
+                                    int(fi),
+                                    modern_retry_fit,
+                                    profile_retry_used=True,
+                                    backend="modern",
+                                )
+                                if modern_retry_corners_i is not None:
+                                    retry_corners_i = modern_retry_corners_i
                     else:
                         rgb = cv2.cvtColor(bgr_i, cv2.COLOR_BGR2RGB)
                         lines = court_detector.detect_court(rgb) if court_detector is not None else None
@@ -390,7 +586,7 @@ def analyse_video(
             # Single-frame mode fallback: if target frame is weak, scan more frames and pick the best.
             if court_detect_once and detect_fallback_on_fail:
                 best_meta = best[3] if best is not None else None
-                if best_meta is None or not _candidate_good(best_meta):
+                if detect_hybrid_always_scan or best_meta is None or not _candidate_good(best_meta):
                     fallback_indices: List[int] = [0]
                     fallback_indices.extend([int(i * detect_fallback_stride) for i in range(detect_fallback_samples)])
                     swing = max(2, detect_fallback_samples // 4)
@@ -456,6 +652,26 @@ def analyse_video(
                             dict(best_refined.get("meta", {})),
                             best_refined.get("fit"),
                         )
+
+            if best is not None and not _candidate_good(best[3]):
+                score_i, conf_i, _corners_i, meta_i, fit_i = best
+                meta_i = dict(meta_i)
+                original_reason = str(meta_i.get("reason", ""))
+                meta_i["fit_reason"] = original_reason
+                meta_i["reason"] = "R_candidate_below_threshold"
+                meta_i["final_reject_min_conf"] = float(detect_fallback_min_conf)
+                meta_i["final_reject_min_score"] = float(detect_fallback_min_score)
+                metrics_i = meta_i.get("metrics")
+                if isinstance(metrics_i, dict):
+                    metrics_i["final_reject_reason"] = "R_candidate_below_threshold"
+                    metrics_i["final_reject_fit_reason"] = original_reason
+                    metrics_i["final_reject_min_conf"] = float(detect_fallback_min_conf)
+                    metrics_i["final_reject_min_score"] = float(detect_fallback_min_score)
+                if best_fail is None or score_i > float(best_fail[0]) or (
+                    score_i == float(best_fail[0]) and conf_i > float(best_fail[1])
+                ):
+                    best_fail = (score_i, conf_i, meta_i, fit_i)
+                best = None
 
             if best is not None:
                 _score, conf, corners_i, meta_i, fit = best
